@@ -1,0 +1,22 @@
+[package]
+name = "mirage-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Embeddable Mirage client library: a single dependency that any application (browser ext, mobile, TUN device, sidecar) can pull in to gain Mirage tunnel capability"
+
+[dependencies]
+mirage-crypto = { workspace = true }
+mirage-discovery = { workspace = true }
+mirage-session = { workspace = true }
+mirage-transport = { workspace = true }
+mirage-transport-obfs = { workspace = true }
+mirage-transport-reality = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+getrandom = "0.3"
+
+[lints]
+workspace = true

@@ -1,0 +1,4 @@
+# Mirage code formatting. Keep this minimal: defaults are good enough
+# and CI enforces `cargo fmt --check`, so divergence is caught early.
+max_width = 100
+edition = "2021"

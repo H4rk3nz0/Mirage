@@ -1,0 +1,25 @@
+# cargo-audit configuration - the single source of truth for triaged advisories.
+#
+# Every entry below is an advisory we have assessed as not-actionable for Mirage
+# (unreachable trigger, GUI/build-time-only dep, or an MSRV-blocked fix), with a
+# one-line rationale. cargo-audit auto-discovers this file relative to the CWD,
+# which is brittle across runners/containers, so the CI `audit` job reads this
+# list and passes the IDs as explicit `--ignore` flags (see .github/workflows/ci.yml).
+# A bare local `cargo audit` from the repo root picks them up automatically.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0009",  # time RFC-2822 DoS: patched only in 0.3.47 (needs rustc 1.88 > MSRV); trigger path (RFC 2822 parse of adversary input) is unreachable - we use ASN.1 date parsing, not RFC 2822.
+    "RUSTSEC-2026-0119",  # hickory-proto encode DoS: we only encode self-constructed query names.
+    "RUSTSEC-2026-0194",  # quick-xml: build-time only (wayland-scanner), trusted input.
+    "RUSTSEC-2026-0195",  # quick-xml: same build-time-only path.
+    "RUSTSEC-2024-0416",  # gtk3 unmaintained: desktop GUI crate only, not on any network path.
+    "RUSTSEC-2024-0418",  # gtk3/atk unmaintained: GUI-only.
+    "RUSTSEC-2024-0420",  # gtk3/gdk unmaintained: GUI-only.
+    "RUSTSEC-2026-0192",  # ttf-parser: GUI font rendering only.
+    "RUSTSEC-2025-0141",  # bincode: pulled by webrtc, not used to decode adversary-controlled frames.
+    "RUSTSEC-2026-0097",  # rand unsound: not the pattern we use; no custom RNG path.
+    "RUSTSEC-2026-0190",  # anyhow unsound: transitive, error-path only.
+    "RUSTSEC-2026-0186",  # memmap2 unsound: GUI transitive (font mmap), no attacker-mapped files.
+    "RUSTSEC-2024-0436",  # paste unmaintained: Slint GUI transitive (image/exr decode), macro-only, GUI-only.
+    "RUSTSEC-2026-0206",  # rustybuzz unmaintained: Slint GUI text-shaping transitive, GUI-only, no network path.
+]

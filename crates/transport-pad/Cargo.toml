@@ -1,0 +1,18 @@
+[package]
+name = "mirage-transport-pad"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Frame-padding and timing-jitter transport layer for Mirage - defeats T3 ML flow-fingerprinting attacks by bucketing frame sizes and randomising inter-frame gaps"
+
+[dependencies]
+mirage-transport = { workspace = true }
+tokio = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

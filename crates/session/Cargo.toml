@@ -1,0 +1,46 @@
+[package]
+name = "mirage-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Noise-XX + hybrid PQ KEM + ratcheting session layer for Mirage"
+
+[dependencies]
+mirage-common = { workspace = true }
+mirage-spec = { workspace = true }
+mirage-crypto = { workspace = true }
+mirage-discovery = { workspace = true }
+snow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+tokio = { workspace = true }
+# Padme padding fills its tail with CSPRNG bytes (defense in depth
+# behind the AEAD). v0.1u kept this in dev-dependencies because the
+# encoder used zero-fill; v0.1x switched to fail-closed CSPRNG fill.
+getrandom = "0.3"
+
+[dev-dependencies]
+proptest = { workspace = true }
+mirage-crypto = { workspace = true }
+mirage-discovery = { workspace = true }
+tokio = { workspace = true }
+
+# Gate for the `_danger_no_token_*` constructors that bypass capability-token
+# verification. Used only by state-machine tests, fuzz harnesses, and
+# external integration-test crates. Enabling this feature in a release
+# binary is a protocol-level footgun - build.rs refuses to compile when
+# both `debug_assertions` is off and this feature is on.
+
+[features]
+default = []
+# NOT a user-facing feature - a TEST-ONLY safety gate, and the only cargo
+# feature in the whole workspace. It exposes the `_danger_*` handshake
+# constructors that bypass capability-token verification, so that DOWNSTREAM
+# integration tests (crates/bridge dev-dependencies) can build token-less
+# handshakes; plain `cfg(test)` cannot do this because it does not propagate to
+# other crates' tests. `src/lib.rs` emits a `compile_error!` if this is ever
+# enabled in a release profile, so it cannot reach a shipped binary.
+danger-no-token = []
+

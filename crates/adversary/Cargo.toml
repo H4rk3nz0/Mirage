@@ -1,0 +1,32 @@
+[package]
+name = "mirage-adversary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Canonical censorship attacks against Mirage's defenses. Every defense MUST be exercised by an adversary in this crate - Mirage's claim is 'continuously verified defenses,' not 'documented defenses.'"
+
+[dependencies]
+mirage-circuit = { workspace = true }
+mirage-common = { workspace = true }
+mirage-crypto = { workspace = true }
+mirage-discovery = { workspace = true }
+mirage-session = { workspace = true }
+mirage-transport = { workspace = true }
+mirage-transport-obfs = { workspace = true }
+mirage-transport-reality = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+getrandom = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+# Live-QUIC validation: build a real quinn client Initial and prove the
+# `quic_initial` oracle decrypts + fingerprints it (measuring the quinn-vs-Chrome gap).
+quinn = { workspace = true }
+rustls = { workspace = true }
+
+[lints]
+workspace = true

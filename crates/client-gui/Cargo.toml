@@ -1,0 +1,50 @@
+[package]
+name = "mirage-client-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Mirage client GUI - desktop management interface for the Mirage privacy proxy"
+
+[[bin]]
+name = "mirage-client-gui"
+path = "src/main.rs"
+
+[dependencies]
+# Slint is pinned to =1.9.2 ON PURPOSE. From 1.10 onward Slint's text stack moved
+# to parley/fontique, which pulls `yeslogic-fontconfig-sys` + system freetype and
+# emits `cargo:rustc-link-lib=fontconfig` - reintroducing a build-time system-lib
+# requirement (the exact GTK-class problem we removed here). 1.9.2 uses a
+# pure-Rust font stack (fontdb + fontconfig-parser), so the GUI builds with plain
+# `cargo build` and links only the standard C runtime (libc/libm/libgcc_s/-ldl).
+# `renderer-software` = CPU framebuffer (softbuffer), no OpenGL. See build.rs.
+slint = { version = "=1.9.2", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "backend-winit",
+    "renderer-software",
+] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# NOT imported directly - this pins a TRANSITIVE dep of Slint's build toolchain
+# (i-slint-compiler -> smol_str). smol_str >= 0.3.3 requires rustc >= 1.89 (or
+# uses unstable features), which would break the workspace's 1.86 toolchain pin.
+# 0.3.2 is the newest smol_str that i-slint-compiler 1.9.2 accepts AND compiles
+# on 1.86. Keep this `=` pin until the workspace MSRV moves past 1.89.
+smol_str = "=0.3.2"
+# Copy-to-clipboard for the SOCKS bind address. default-features=false drops the
+# heavy `image` crate (image-data feature); on Linux arboard uses x11rb +
+# smithay-clipboard (Wayland) - no GTK, no build-time system lib.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+# NOTE: the "Browse" button uses a self-contained in-app file browser (rendered
+# in Slint) - ZERO extra crates, works on every system with no dependency on a
+# desktop file-dialog tool. A Rust dialog crate (rfd) was rejected: its xdg-portal
+# backend drags in zbus 5.x, which needs rustc 1.87 (> the workspace's 1.86 floor).
+
+# Linux only: PR_SET_PDEATHSIG so the mirage-client child is killed by the
+# kernel if the GUI dies (including hard kills that skip the Drop cleanup).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+slint-build = "=1.9.2"

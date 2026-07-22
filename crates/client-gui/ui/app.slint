@@ -1,0 +1,439 @@
+// Mirage client GUI — Slint markup.
+//
+// Rendered by the software renderer (no GPU/GL). The Rust side (src/main.rs)
+// owns process supervision and pushes live daemon state into the `in` properties
+// here via a background poll thread (upgrade_in_event_loop).
+
+import { VerticalBox, HorizontalBox, ScrollView, LineEdit, TextEdit } from "std-widgets.slint";
+
+// One row of the bridges table, mirrored from the daemon's /api/bridges JSON.
+export struct BridgeRow {
+    addr: string,
+    transport: string,
+    transport-color: color,
+    latency: string,
+    latency-color: color,
+    tokens: string,
+    mux: string,
+    healthy: bool,
+    port: string,
+    id-color: color,   // stable per-bridge colour (derived from the address)
+}
+
+// One entry in the built-in file browser (Rust lists the directory).
+export struct BrowserEntry {
+    name: string,
+    is-dir: bool,
+}
+
+export component AppWindow inherits Window {
+    title: "Mirage";
+    icon: @image-url("../assets/icon.png");
+    default-font-size: 14px;
+    preferred-width: 640px;
+    preferred-height: 800px;
+    min-width: 480px;
+    min-height: 560px;
+    background: #0b0f14;
+
+    // ---- Inputs driven from Rust ----
+    in-out property <string> invite;                 // pasted mirage:// invite
+    in-out property <string> config-path;            // optional client.json path
+    in property <string> daemon-state: "stopped";    // stopped|starting|running|error
+    in property <string> error-text;
+    in property <string> bind-addr;
+    in property <string> sessions;                   // "active / total"
+    in property <string> uptime;
+    in property <string> mux;                        // "carriers x streams"
+    in property <string> version;
+    in property <[BridgeRow]> bridges;
+    in property <string> log-text;                   // full log, joined; selectable
+    in property <bool> copied;                       // brief "copied!" flash
+
+    // ---- Built-in file browser state (driven from Rust) ----
+    in-out property <bool> show-browser: false;
+    in property <string> browser-path;
+    in property <[BrowserEntry]> browser-entries;
+
+    // ---- Events to Rust ----
+    callback start();
+    callback stop();
+    callback copy-bind();
+    callback clear-log();
+    callback browse();
+    callback browser-enter(string);   // navigate into a dir (or "..")
+    callback browser-pick(string);    // choose a file
+    callback browser-cancel();
+
+    property <bool> running: root.daemon-state == "running";
+    property <bool> starting: root.daemon-state == "starting";
+    property <bool> stopped: root.daemon-state == "stopped" || root.daemon-state == "error";
+    property <color> accent: #10b981;
+    property <color> card-bg: #131a22;
+    property <color> muted: #7d8896;
+
+    VerticalBox {
+        padding-left: 26px;
+        padding-right: 26px;
+        padding-top: 28px;
+        padding-bottom: 22px;
+        spacing: 20px;
+
+        // ===== Header =====
+        HorizontalBox {
+            spacing: 14px;
+            padding-top: 4px;
+            padding-bottom: 10px;
+            Rectangle {
+                width: 14px;
+                height: 14px;
+                border-radius: 7px;
+                background: root.running ? root.accent
+                    : root.starting ? #eab308
+                    : root.daemon-state == "error" ? #ef4444
+                    : #3a4653;
+            }
+            VerticalLayout {
+                spacing: 3px;
+                Text {
+                    text: "Mirage";
+                    font-size: 27px;
+                    font-weight: 800;
+                    color: white;
+                }
+                Text {
+                    text: root.running ? "SOCKS5 proxy on " + root.bind-addr
+                        : root.starting ? "Establishing tunnel…"
+                        : root.daemon-state == "error" ? "Disconnected"
+                        : "Not connected";
+                    font-size: 12px;
+                    color: root.muted;
+                }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            // Disconnect lives in the header once connected, so the big connect
+            // card can disappear and free the space for bridges + log.
+            if root.running || root.starting: Rectangle {
+                height: 32px;
+                border-radius: 8px;
+                background: disc-touch.pressed ? #3a181c : #2a1a1e;
+                disc-touch := TouchArea { clicked => { root.stop(); } }
+                HorizontalLayout {
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    Text {
+                        text: "Disconnect";
+                        color: #fca5a5;
+                        font-size: 12px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            Rectangle {
+                height: 32px;
+                border-radius: 16px;
+                background: root.running ? #10331f
+                    : root.daemon-state == "error" ? #2a1416
+                    : #1a232e;
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    Text {
+                        text: root.running ? "CONNECTED"
+                            : root.starting ? "CONNECTING…"
+                            : root.daemon-state == "error" ? "ERROR"
+                            : "OFFLINE";
+                        font-size: 11px;
+                        font-weight: 700;
+                        color: root.running ? root.accent
+                            : root.daemon-state == "error" ? #fca5a5
+                            : root.muted;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // ===== Connect card (only while stopped — hidden once connected so the
+        // bridges + log get the vertical space) =====
+        if root.stopped: Rectangle {
+            border-radius: 12px;
+            background: root.card-bg;
+            VerticalBox {
+                padding: 18px;
+                spacing: 12px;
+                Text { text: "Connection"; font-weight: 700; color: white; }
+                Text {
+                    text: "Paste an invite (mirage://…) or point to a client.json.";
+                    color: root.muted; font-size: 12px; wrap: word-wrap;
+                }
+                invite-edit := LineEdit {
+                    placeholder-text: "mirage://…";
+                    text <=> root.invite;
+                    enabled: root.stopped;
+                }
+                HorizontalBox {
+                    spacing: 8px;
+                    path-edit := LineEdit {
+                        placeholder-text: "…or select a client.json";
+                        text <=> root.config-path;
+                        enabled: root.stopped;
+                        horizontal-stretch: 1;
+                    }
+                    Rectangle {
+                        width: 92px;
+                        border-radius: 9px;
+                        background: browse-touch.pressed ? #1a232e : #26313d;
+                        browse-touch := TouchArea {
+                            enabled: root.stopped;
+                            clicked => { root.browse(); }
+                        }
+                        Text {
+                            text: "Browse…";
+                            color: root.stopped ? white : root.muted;
+                            font-size: 13px;
+                        }
+                    }
+                }
+                Rectangle {
+                    height: 44px;
+                    border-radius: 9px;
+                    background: touch.pressed ? root.accent.darker(0.2) : root.accent;
+                    opacity: (root.invite != "" || root.config-path != "") ? 1.0 : 0.5;
+                    touch := TouchArea {
+                        clicked => {
+                            if (root.invite != "" || root.config-path != "") {
+                                root.start();
+                            }
+                        }
+                    }
+                    Text { text: "Connect"; color: #04120c; font-weight: 700; }
+                }
+            }
+        }
+
+        // ===== Error banner =====
+        if root.error-text != "": Rectangle {
+            border-radius: 9px;
+            background: #2a1416;
+            border-width: 1px;
+            border-color: #7f1d1d;
+            VerticalBox {
+                padding: 12px;
+                Text { text: root.error-text; color: #fca5a5; font-size: 12px; wrap: word-wrap; }
+            }
+        }
+
+        // ===== Status card (only when connected) =====
+        if root.running: Rectangle {
+            border-radius: 12px;
+            background: root.card-bg;
+            VerticalBox {
+                padding: 16px;
+                spacing: 8px;
+                HorizontalBox {
+                    Text { text: "SOCKS5 proxy"; color: root.muted; font-size: 12px; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text {
+                        text: root.copied ? "copied!" : root.bind-addr;
+                        color: root.copied ? root.accent : white;
+                        font-weight: 600;
+                    }
+                    Rectangle {
+                        width: 58px; height: 24px; border-radius: 6px; background: #26313d;
+                        TouchArea { clicked => { root.copy-bind(); } }
+                        Text { text: "copy"; color: root.muted; font-size: 11px; }
+                    }
+                }
+                HorizontalBox {
+                    Text { text: "Sessions"; color: root.muted; font-size: 12px; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text { text: root.sessions; color: white; }
+                }
+                HorizontalBox {
+                    Text { text: "Uptime"; color: root.muted; font-size: 12px; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text { text: root.uptime; color: white; }
+                }
+                HorizontalBox {
+                    Text { text: "Mux"; color: root.muted; font-size: 12px; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text { text: root.mux; color: white; }
+                }
+            }
+        }
+
+        // ===== Bridges table =====
+        if root.running && root.bridges.length > 0: Rectangle {
+            vertical-stretch: 1;
+            border-radius: 12px;
+            background: root.card-bg;
+            VerticalBox {
+                padding: 16px;
+                spacing: 8px;
+                Text { text: "Bridges"; font-weight: 700; color: white; }
+                ScrollView {
+                    VerticalBox {
+                        spacing: 6px;
+                        for b in root.bridges: Rectangle {
+                            height: 42px;
+                            border-radius: 8px;
+                            background: #0f151c;
+                            HorizontalBox {
+                                padding-left: 0px;
+                                padding-right: 12px;
+                                spacing: 10px;
+                                // Stable per-bridge colour swatch (a vertical bar
+                                // on the left) so each bridge is identifiable at a
+                                // glance, independent of transport/health colour.
+                                Rectangle {
+                                    width: 5px;
+                                    background: b.id-color;
+                                    border-top-left-radius: 8px;
+                                    border-bottom-left-radius: 8px;
+                                }
+                                Rectangle {
+                                    width: 9px; height: 9px; border-radius: 5px;
+                                    background: b.healthy ? root.accent : #ef4444;
+                                }
+                                Text {
+                                    text: b.addr + (b.port != "" ? ":" + b.port : "");
+                                    color: white; font-size: 13px;
+                                    overflow: elide; horizontal-stretch: 1;
+                                }
+                                Rectangle {
+                                    border-radius: 5px;
+                                    background: b.transport-color;
+                                    HorizontalBox {
+                                        padding-left: 8px; padding-right: 8px;
+                                        Text { text: b.transport; color: white; font-size: 10px; }
+                                    }
+                                }
+                                Text { text: b.latency; color: b.latency-color; font-size: 11px; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ===== Log panel =====
+        Rectangle {
+            // When connected, share the freed space with the bridges panel
+            // (bridges stretch 1 : log stretch 2). When idle, the log fills.
+            vertical-stretch: root.running ? 2 : 1;
+            min-height: 150px;
+            border-radius: 12px;
+            background: #05080b;
+            VerticalBox {
+                padding: 14px;
+                spacing: 8px;
+                HorizontalBox {
+                    Text { text: "Log"; font-weight: 700; color: root.muted; font-size: 12px; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Rectangle {
+                        width: 52px; height: 24px; border-radius: 5px; background: #131a22;
+                        TouchArea { clicked => { root.clear-log(); } }
+                        Text { text: "clear"; color: root.muted; font-size: 10px; }
+                    }
+                }
+                // Read-only TextEdit => the log is selectable and Ctrl+C-copyable,
+                // with its own scrolling.
+                TextEdit {
+                    read-only: true;
+                    wrap: no-wrap;
+                    font-size: 12px;
+                    text: root.log-text;
+                }
+            }
+        }
+
+        // ===== Footer =====
+        if root.version != "": Text {
+            text: "mirage-client " + root.version;
+            color: root.muted; font-size: 10px;
+            horizontal-alignment: center;
+        }
+    }
+
+    // ===== Built-in file browser (modal overlay) =====
+    // A self-contained picker so no system file-dialog tool is required.
+    if root.show-browser: Rectangle {
+        background: #000000cc;
+        // Click the dimmed backdrop to dismiss.
+        TouchArea { clicked => { root.browser-cancel(); } }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(parent.width - 40px, 400px);
+            height: min(parent.height - 60px, 460px);
+            background: root.card-bg;
+            border-radius: 14px;
+            // Absorb clicks inside the panel so they don't hit the backdrop.
+            TouchArea {}
+
+            VerticalBox {
+                padding: 16px;
+                spacing: 10px;
+                Text { text: "Select a client.json"; font-weight: 700; color: white; }
+                Text {
+                    text: root.browser-path;
+                    color: root.muted; font-size: 11px; overflow: elide;
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: #0f151c;
+                    border-radius: 8px;
+                    ScrollView {
+                        VerticalLayout {
+                            alignment: LayoutAlignment.start;
+                            padding: 6px;
+                            spacing: 2px;
+                            for e in root.browser-entries: Rectangle {
+                                height: 30px;
+                                border-radius: 6px;
+                                background: row-touch.has-hover ? #1a232e : transparent;
+                                row-touch := TouchArea {
+                                    clicked => {
+                                        if (e.is-dir) {
+                                            root.browser-enter(e.name);
+                                        } else {
+                                            root.browser-pick(e.name);
+                                        }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    padding-left: 9px;
+                                    padding-right: 9px;
+                                    spacing: 9px;
+                                    Rectangle {
+                                        width: 8px; height: 8px; border-radius: 2px;
+                                        y: (parent.height - self.height) / 2;
+                                        background: e.is-dir ? root.accent : root.muted;
+                                    }
+                                    Text {
+                                        text: e.is-dir ? e.name + "/" : e.name;
+                                        color: white; font-size: 13px; overflow: elide;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    Rectangle {
+                        width: 92px; height: 34px; border-radius: 8px;
+                        background: cancel-touch.pressed ? #1a232e : #26313d;
+                        cancel-touch := TouchArea { clicked => { root.browser-cancel(); } }
+                        Text { text: "Cancel"; color: root.muted; }
+                    }
+                }
+            }
+        }
+    }
+}

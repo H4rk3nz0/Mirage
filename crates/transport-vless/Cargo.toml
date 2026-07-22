@@ -1,0 +1,23 @@
+[package]
+name = "mirage-transport-vless"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "VLESS framing transport for Mirage - UUID-auth over Reality TLS or WebSocket"
+
+[dependencies]
+mirage-transport = { workspace = true }
+mirage-discovery = { workspace = true }
+mirage-crypto = { workspace = true }
+async-trait = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

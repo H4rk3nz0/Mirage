@@ -1,0 +1,27 @@
+[package]
+name = "mirage-transport-reality"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "REALITY-v2 transport for Mirage - PSK-gated TLS with cover-service fallback"
+
+[dependencies]
+mirage-common = { workspace = true }
+mirage-spec = { workspace = true }
+mirage-crypto = { workspace = true }
+mirage-transport = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+tokio = { workspace = true }
+
+getrandom = "0.3"
+# ECDSA P-256 identity for the Reality ephemeral cert + CertVerify, so the
+# advertised signature_algorithms match real Chrome/Firefox/Safari (JA4 parity)
+# - Ed25519 (0x0807) is a tell no desktop browser produces.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

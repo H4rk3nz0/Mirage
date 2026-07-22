@@ -1,0 +1,32 @@
+[package]
+name = "mirage-transport-ws"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "HTTP/WebSocket tunnel transport for Mirage - enables CDN-fronted bridge deployment"
+
+[dependencies]
+mirage-common = { workspace = true }
+mirage-crypto = { workspace = true }
+mirage-discovery = { workspace = true }
+mirage-transport = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+blake3 = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+# sha1 = "0.10" - required by the WebSocket RFC (Sec-WebSocket-Accept);
+# the only use of SHA-1 in this crate. Not used for any security-sensitive
+# operation; SHA-1 is mandated by RFC 6455 §4.2.2 for the accept-key HMAC.
+sha1 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

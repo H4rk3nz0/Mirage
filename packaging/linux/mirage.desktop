@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Mirage
+GenericName=Anti-censorship proxy
+Comment=Connect through the Mirage anti-censorship network
+Exec=mirage-client-gui
+Icon=mirage
+Terminal=false
+Categories=Network;Security;
+Keywords=proxy;vpn;privacy;censorship;
+StartupWMClass=Mirage

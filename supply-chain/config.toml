@@ -1,0 +1,99 @@
+# cargo-vet configuration for Mirage.
+#
+# cargo-vet lets us track which third-party crates have been audited for
+# supply-chain safety (malicious code, undefined behavior, crypto
+# correctness) and enforce that unaudited versions do not enter the
+# dependency graph. See https://mozilla.github.io/cargo-vet/.
+#
+# Policy posture for Mirage:
+#   - Every crypto crate in `Cargo.toml` workspace deps MUST have a
+#     `safe-to-deploy` audit before a tagged release. Pinned exact versions
+#     (R14/R18) make this tractable.
+#   - "Trusted" publishers (rustsec, dtolnay, rust-lang, tokio-rs) are
+#     imported from the RustCrypto and Mozilla audit sets rather than
+#     re-audited locally.
+#   - New dependencies require either (a) an import match, or
+#     (b) a local audit recorded in `supply-chain/audits.toml`.
+#
+# To bootstrap on a fresh checkout:
+#   cargo install cargo-vet
+#   cargo vet          # reports unaudited crates against this policy
+#   cargo vet check    # fails CI if unaudited crates exist
+#
+# To add a new audit:
+#   cargo vet certify <crate> <version>
+#
+# To trust an upstream audit source:
+#   cargo vet add-exemption <crate> <version>   # temporary, time-bounded
+#   cargo vet import <source-url>               # permanent
+
+[cargo-vet]
+version = "0.10"
+
+# Imports: third-party audit sets we trust.
+# These are well-maintained public audit repos. Pulling them in lets us
+# inherit audits for broadly-used crates (serde, tokio, etc.) without
+# duplicating effort. If any of these become compromised, the signed
+# `imports.lock` will diverge - review it on every update.
+
+[imports.bytecode-alliance]
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/main/supply-chain/audits.toml"
+
+[imports.google]
+url = "https://raw.githubusercontent.com/google/supply-chain/main/audits.toml"
+
+[imports.isrg]
+url = "https://raw.githubusercontent.com/divviup/libprio-rs/main/supply-chain/audits.toml"
+
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+
+[imports.zcash]
+url = "https://raw.githubusercontent.com/zcashfoundation/zcash/main/supply-chain/audits.toml"
+
+# Policy: what each first-party crate requires from its dependency graph.
+# `safe-to-deploy` means "suitable for running in production under the
+# Mirage threat model" - no known backdoors, no unsoundness without
+# mitigation, no known-broken crypto primitives. `safe-to-run` is the
+# weaker guarantee suitable for build.rs and proc-macros (won't
+# compromise the build host).
+
+[policy.mirage-common]
+audit-as-crates-io = false
+
+[policy.mirage-spec]
+audit-as-crates-io = false
+
+[policy.mirage-crypto]
+audit-as-crates-io = false
+criteria = "safe-to-deploy"
+# Every transitive dep of `mirage-crypto` is in the hot crypto path and
+# must carry a stronger-than-default audit status.
+
+[policy.mirage-session]
+audit-as-crates-io = false
+criteria = "safe-to-deploy"
+
+[policy.mirage-discovery]
+audit-as-crates-io = false
+criteria = "safe-to-deploy"
+
+[policy.mirage-discovery-nostr]
+audit-as-crates-io = false
+criteria = "safe-to-deploy"
+
+[policy.mirage-transport]
+audit-as-crates-io = false
+
+[policy.mirage-transport-reality]
+audit-as-crates-io = false
+criteria = "safe-to-deploy"
+
+# Exemptions: deps we HAVE NOT audited but are letting slide for v0.1.
+# This section must shrink to empty before v1.0. Every entry is tech
+# debt with a name attached.
+
+# Populate by running `cargo vet regenerate exemptions` after the first
+# `cargo vet` pass; do not hand-edit. Scaffolded empty so `cargo vet`
+# produces a reviewable diff of the entire current dependency set.
+[exemptions]

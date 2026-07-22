@@ -1,0 +1,41 @@
+/target
+
+# Editor / OS noise
+**/*.rs.bk
+*.swp
+*.swo
+*~
+.DS_Store
+.direnv/
+result
+
+# Atomic-write / patch leftovers (e.g. foo.rs.tmp.<pid>.<hash>, foo.rs.orig)
+*.tmp
+*.tmp.*
+*.orig
+*.rej
+
+# ---------------------------------------------------------------------------
+# SECRETS — never commit. Generated runtime configs embed the bridge's private
+# keys (bridge_ed25519_sk_hex, bridge_x25519_sk_hex), PSKs, and client invites.
+# Committing them to a public repo leaks the keys that authenticate the bridge.
+# ---------------------------------------------------------------------------
+/bridge.json
+/client.json
+*.bridge.json
+*.client.json
+*.key
+*.pem
+!third_party/**/*.pem   # upstream test fixtures are intentionally checked in
+
+# Local scratch files (not part of the project).
+error.txt
+*.log
+
+# Python bytecode cache (from tools/shaper-eval).
+__pycache__/
+*.pyc
+
+# Proteus cover-source library - recorded real-traffic profiles (regenerate via
+# mirage-cover-record). Large + environment-specific; not committed.
+tools/cover-sources/library/

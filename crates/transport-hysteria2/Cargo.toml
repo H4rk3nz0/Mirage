@@ -1,0 +1,31 @@
+[package]
+name = "mirage-transport-hysteria2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Hysteria2 (QUIC + BRUTAL congestion) transport for Mirage (v0.2)"
+
+[dependencies]
+mirage-transport = { workspace = true }
+mirage-discovery = { workspace = true }
+mirage-crypto = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+blake3 = { workspace = true }
+tracing = { workspace = true }
+quinn = { workspace = true }
+# Already in the tree transitively via quinn; a direct dep so we can implement a
+# real BRUTAL congestion controller (quinn_proto::congestion::Controller). M3.
+quinn-proto = "0.11"
+mirage-quic-obfs = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+getrandom = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

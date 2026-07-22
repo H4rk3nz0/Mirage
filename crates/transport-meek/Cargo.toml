@@ -1,0 +1,25 @@
+[package]
+name = "mirage-transport-meek"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Meek (domain-fronted HTTP) transport for Mirage - CDN-proxied anti-censorship"
+
+[dependencies]
+mirage-common = { workspace = true }
+mirage-crypto = { workspace = true }
+mirage-discovery = { workspace = true }
+mirage-transport = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+blake3 = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,30 @@
+[package]
+name = "mirage-transport-mux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Protocol multiplexer for Mirage: single-port dispatch across all supported transports"
+
+[dependencies]
+mirage-common = { workspace = true }
+mirage-crypto = { workspace = true }
+mirage-transport = { workspace = true }
+mirage-transport-obfs = { workspace = true }
+mirage-transport-shadowsocks = { path = "../transport-shadowsocks" }
+mirage-transport-vless = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "net", "io-util", "time"] }
+mirage-transport-shadowsocks = { workspace = true }
+mirage-transport-vless = { workspace = true }
+mirage-transport = { workspace = true }
+mirage-crypto = { workspace = true }
+
+[lints]
+workspace = true

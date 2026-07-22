@@ -1,0 +1,31 @@
+[package]
+name = "mirage-discovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Epoch-rotated rendezvous discovery layer for Mirage"
+
+[dependencies]
+mirage-common = { workspace = true }
+mirage-spec = { workspace = true }
+mirage-crypto = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+base64 = { workspace = true }
+# RT-CN-11 (sign_token_jittered): production-side CSPRNG for
+# expiry jitter. Previously dev-only.
+getrandom = "0.3"
+# RT-FR-1: advisory file locking for FileRevealStore so two
+# processes can't double-open the same MRRS file and corrupt
+# each other's reveal-cap accounting.
+fs2 = "0.4"
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = "3"
+

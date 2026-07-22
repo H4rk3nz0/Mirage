@@ -1,0 +1,24 @@
+# Self-driving Proteus cover recorder - keeps the replay library fresh on its own.
+# Install: edit the paths/User below, then
+#   sudo cp mirage-cover-recorder.service /etc/systemd/system/
+#   sudo systemctl enable --now mirage-cover-recorder
+# Point the bridge/client at the library dir it fills:
+#   reality_pace: "replay", reality_pace_profile: "/opt/mirage/library/peertube"
+# Self-contained: mirage-cover-record needs no external tools or extra capabilities.
+[Unit]
+Description=Proteus cover-source recorder (refreshes the real-traffic replay library)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mirage
+WorkingDirectory=/opt/mirage
+# Every 30 min: record 2 fresh random traces, keep the newest 40.
+ExecStart=/usr/local/bin/mirage-cover-record /opt/mirage/library --loop 30 --count 2 --max 40
+Restart=on-failure
+RestartSec=60
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

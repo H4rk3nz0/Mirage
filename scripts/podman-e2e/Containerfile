@@ -1,0 +1,9 @@
+# Minimal runtime image for Mirage end-to-end Podman tests.
+# Arch base matches the host glibc (binaries are built on the host, not in-image).
+# curl/iptables/iproute2 are for driving traffic + simulating transport blocks.
+FROM docker.io/library/archlinux:latest
+RUN pacman -Sy --noconfirm --needed curl iptables iproute2 socat python \
+    && pacman -Scc --noconfirm
+COPY mirage-bridge mirage-client mirage-keygen /usr/local/bin/
+COPY udp_socks_test.py /usr/local/bin/udp_socks_test.py
+ENV RUST_LOG=info

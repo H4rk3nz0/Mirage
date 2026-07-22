@@ -1,0 +1,77 @@
+[package]
+name = "mirage-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Mirage client daemon: accepts local TCP connections and tunnels them to a bridge"
+
+[[bin]]
+name = "mirage-client"
+path = "src/bin/mirage-client.rs"
+
+[[bin]]
+name = "mirage-cohort-refresh"
+path = "src/bin/mirage-cohort-refresh.rs"
+
+[[bin]]
+name = "mirage-pt-client"
+path = "src/bin/mirage-pt-client.rs"
+
+[dependencies]
+mirage-circuit = { workspace = true }
+mirage-common = { workspace = true }
+mirage-crypto = { workspace = true }
+mirage-discovery = { workspace = true }
+mirage-runtime = { workspace = true }
+mirage-mux = { workspace = true }
+mirage-session = { workspace = true }
+mirage-socks5 = { workspace = true }
+# `net` feature: the HTTPS-Date time source for the clock-skew pin (below).
+mirage-time = { workspace = true }
+mirage-transport = { workspace = true }
+mirage-transport-reality = { workspace = true }
+mirage-transport-shadowsocks = { workspace = true }
+mirage-transport-ws = { workspace = true }
+mirage-transport-hysteria2 = { workspace = true }
+mirage-transport-masque = { workspace = true }
+mirage-transport-dnstt = { workspace = true }
+mirage-quic-obfs = { workspace = true }
+mirage-transport-vless = { workspace = true }
+mirage-transport-meek = { workspace = true }
+mirage-transport-webrtc = { workspace = true }
+mirage-transport-doh = { workspace = true }
+mirage-transport-pad = { workspace = true }
+tokio = { workspace = true }
+# CancellationToken for the embeddable (mobile FFI) TUN entry point, so the host
+# app can stop the tunnel cleanly. Already in the tree via mirage-tun.
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+getrandom = "0.3"
+# Client-originated TLS for the meek/DoH/WS carriers (red-team #4): wraps the
+# carrier TCP in a real browser-rooted TLS session so the HTTP rides encrypted
+# to a TLS-terminating front (CDN / nginx). Same stack mirage-time already uses.
+tokio-rustls = { workspace = true }
+webpki-roots = "0.26"
+# TCP keepalive on long-lived mux carriers: keeps a carrier alive through
+# on-path NAT/firewall idle timeouts and detects a dead bridge. Already in the
+# tree transitively (tokio/quinn); pinned to the resolved minor here.
+socket2 = "0.6"
+mirage-discovery-nostr = { workspace = true }
+mirage-discovery-dns-txt = { workspace = true }
+mirage-discovery-dht = { workspace = true }
+# Transparent system-wide VPN (TUN) mode. Always compiled into the client, so a
+# single binary is both a SOCKS5 proxy and a full-device VPN. Turning it on is a
+# RUNTIME choice (`"tun_enabled": true`), which additionally needs CAP_NET_ADMIN
+# on Linux/macOS or Administrator on Windows.
+mirage-tun = { workspace = true }
+
+[dev-dependencies]
+# Self-signed cert for the carrier-TLS (#4) loopback roundtrip test.
+rcgen = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

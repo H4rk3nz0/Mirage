@@ -1,0 +1,52 @@
+name: JA3 fingerprint drift
+
+# A26: detect drift between Mirage's pinned ClientHello fingerprint
+# templates (Chrome / Firefox / Safari) and current real-world
+# browser JA3 strings. If Chrome releases a stable version that
+# changes its wire fingerprint, the `chrome-desktop` template
+# becomes a standing signature for Mirage clients - operators
+# need to know.
+#
+# This job runs on a weekly schedule (plus manual dispatch). It asserts the
+# committed pinned-JA3 regression tests still pass and that the fingerprint
+# templates don't collide with each other - reproducible, fail-loud, in-tree
+# (zero external data).
+
+on:
+  schedule:
+    # 09:00 UTC every Monday - ahead of the week's operational load.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  pinned_regression:
+    name: Pinned JA3 strings match source
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run the pinned JA3 tests
+        run: |
+          cargo test -p mirage-transport-reality --lib tls_fingerprint:: -- --nocapture
+
+  no_overlap:
+    name: Templates do not collide
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Three templates must have three distinct JA3 strings
+        run: cargo test -p mirage-transport-reality --lib templates_have_distinct_ja3

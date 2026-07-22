@@ -1,0 +1,20 @@
+[package]
+name = "mirage-migration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Connection-migration primitives for Mirage. CID + PATH_CHALLENGE/PATH_RESPONSE for UDP-transport survivability across IP changes."
+
+[dependencies]
+mirage-common = { workspace = true }
+mirage-crypto = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+getrandom = "0.3"
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

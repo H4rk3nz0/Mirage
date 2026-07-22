@@ -1,0 +1,27 @@
+[package]
+name = "mirage-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Async wrappers for Mirage state machines: drives CircuitBuilder, CircuitPool, and split-exit over real I/O"
+
+[dependencies]
+zeroize = { workspace = true }
+mirage-circuit = { workspace = true }
+mirage-router = { workspace = true }
+mirage-session = { workspace = true }
+mirage-transport = { workspace = true }
+mirage-discovery = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+mirage-crypto = { workspace = true }
+getrandom = "0.3"
+
+[lints]
+workspace = true

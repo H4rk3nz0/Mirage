@@ -1,0 +1,21 @@
+[package]
+name = "mirage-circuit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Multi-hop telescoping circuits with hybrid PQ at every hop. Mirage's L5."
+
+[dependencies]
+mirage-common = { workspace = true }
+mirage-crypto = { workspace = true }
+mirage-spec = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+getrandom = "0.3"
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

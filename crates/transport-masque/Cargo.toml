@@ -1,0 +1,28 @@
+[package]
+name = "mirage-transport-masque"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "MASQUE / HTTP-3 (QUIC) transport for Mirage: carries the Mirage session inside HTTP/3 DATA frames over quinn, so the wire looks like HTTP/3 web traffic."
+
+[dependencies]
+mirage-common = { workspace = true }
+mirage-crypto = { workspace = true }
+mirage-discovery = { workspace = true }
+mirage-transport = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+getrandom = "0.3"
+rcgen = { workspace = true }
+mirage-quic-obfs = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

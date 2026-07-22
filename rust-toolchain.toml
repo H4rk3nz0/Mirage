@@ -1,0 +1,29 @@
+# Pinned Rust toolchain for reproducible Mirage builds (I7).
+#
+# `cargo` + `rustc` invocations anywhere in the workspace read this
+# file (via rustup) and use exactly the toolchain specified. Pair
+# this with `flake.nix`, which locks the toolchain for Nix-native
+# workflows; both files point at the same version so
+# `cargo build` under either runner produces bit-identical output
+# given the same source tree.
+#
+# The pin is a **floor, not a ceiling**: `channel = "1.86"` selects
+# the latest 1.86.* stable (rustup's default semantics for channel
+# without a patch). Cargo.lock pins the transitive dep tree;
+# rustc 1.86 is the effective floor: edition-2024 transitive crates
+# need 1.85, and several pinned deps (icu 2.x, time 0.3.45) need 1.86.
+#
+# Bumping the pin:
+# 1. Update `channel` below to the new stable release.
+# 2. Also bump `rust-version` in the workspace Cargo.toml (MSRV).
+# 3. Update `flake.nix` (the `toolchain =
+#    pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml`
+#    line reads THIS file, so only one file needs editing in the
+#    common case).
+# 4. Run `cargo test --workspace --all-targets` locally and let CI
+#    confirm.
+
+[toolchain]
+channel = "1.86"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

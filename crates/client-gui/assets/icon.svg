@@ -1,0 +1,9 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <rect width="512" height="512" rx="115" fill="#0b0f14"/>
+  <!-- protective shield outline (Mirage green) -->
+  <path d="M256 92 L390 150 V276 C390 356 330 408 256 434 C182 408 122 356 122 276 V150 Z"
+        fill="none" stroke="#10b981" stroke-width="30" stroke-linejoin="round"/>
+  <!-- inner mark: a solid dot over a soft ring (a shrouded point = 'mirage') -->
+  <circle cx="256" cy="252" r="86" fill="none" stroke="#10b981" stroke-width="14" opacity="0.35"/>
+  <circle cx="256" cy="252" r="46" fill="#10b981"/>
+</svg>

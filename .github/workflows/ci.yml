@@ -1,0 +1,209 @@
+name: CI
+
+# Defense-in-depth: CI is load-bearing for the "no regression of any shipped
+# invariant" property. Every check here corresponds to a specific invariant
+# or audit finding. If you add a test locally, it MUST be
+# exercised in CI - local-only green is not green.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Avoid redundant runs on force-push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUSTDOCFLAGS: "-D warnings"
+  # Matches the `unwind` panic policy in Cargo.toml release profile (A27).
+  # Tests run debug by default; this env is informational.
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # ------------------------------------------------------------------
+  # Build + test on stable Rust, Linux. Primary safety net.
+  # ------------------------------------------------------------------
+  test:
+    name: Test (stable / ubuntu-latest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # No system libraries needed: mirage-client-gui uses Slint's software
+      # renderer (pinned 1.9.2, pure-Rust font stack) — it links only the
+      # standard C runtime, no GTK/fontconfig/GL.
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Verify workspace builds (debug)
+        run: cargo build --workspace --all-targets
+
+      - name: Run full test suite
+        run: cargo test --workspace --all-targets
+
+      - name: Run doctests
+        run: cargo test --workspace --doc
+
+  # ------------------------------------------------------------------
+  # Windows TUN (Wintun) build guard. The transparent-VPN device + routing
+  # backends are platform-specific — Wintun (wintun-bindings) + netsh routing on
+  # Windows vs /dev/net/tun + iproute2 on Linux — and TUN is ALWAYS compiled into
+  # the client (no feature flag), so a Unix-green build does NOT prove the Windows
+  # port compiles. This job keeps the Windows client build from silently
+  # regressing. (Runtime validation of the Wintun adapter + route installation
+  # needs a real Windows host with Administrator + wintun.dll and is out of CI
+  # scope.)
+  # ------------------------------------------------------------------
+  windows-tun:
+    name: Windows client build (Wintun TUN backend)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-tun-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: cargo check (client with the Wintun TUN backend)
+        run: cargo check -p mirage-client
+
+  # ------------------------------------------------------------------
+  # Reproducibility of committed test vectors.
+  # Protects against silent drift in:
+  # - discovery derivation test vectors (A13)
+  # If these change unexpectedly, fail loudly.
+  # ------------------------------------------------------------------
+  vectors:
+    name: Test vectors are stable
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Discovery + Nostr test vectors must pass unchanged
+        run: cargo test -p mirage-discovery --test vectors -- --nocapture
+
+  # ------------------------------------------------------------------
+  # Lint + format. Zero warnings allowed.
+  # ------------------------------------------------------------------
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # No GTK/system libs: the GUI now renders via Slint's software backend.
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (all warnings = errors)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  # ------------------------------------------------------------------
+  # Security audit of dependency tree.
+  # Runs against the RustSec advisory database - any known CVE in a
+  # dependency fails the job.
+  # ------------------------------------------------------------------
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        # Pin to the last release that supports our MSRV (1.86); 0.22.2+ needs
+        # rustc 1.88. Bump this together with the toolchain pin.
+        run: cargo install --locked cargo-audit --version 0.22.1
+      - name: Audit
+        # Advisories triaged as not-actionable for Mirage (unreachable trigger,
+        # GUI/build-time-only dep, or a fix that exceeds our 1.86 MSRV). The list
+        # is HARDCODED here on purpose: the job must be self-contained and cannot
+        # depend on any file being present/committed at run time. The same IDs,
+        # with full per-advisory rationale, live in `.cargo/audit.toml` for local
+        # `cargo audit` runs — keep the two in sync when you add/remove an entry.
+        run: |
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2026-0009 \
+            --ignore RUSTSEC-2026-0119 \
+            --ignore RUSTSEC-2026-0194 \
+            --ignore RUSTSEC-2026-0195 \
+            --ignore RUSTSEC-2024-0416 \
+            --ignore RUSTSEC-2024-0418 \
+            --ignore RUSTSEC-2024-0420 \
+            --ignore RUSTSEC-2026-0192 \
+            --ignore RUSTSEC-2025-0141 \
+            --ignore RUSTSEC-2026-0097 \
+            --ignore RUSTSEC-2026-0190 \
+            --ignore RUSTSEC-2026-0186 \
+            --ignore RUSTSEC-2024-0436 \
+            --ignore RUSTSEC-2026-0206
+
+  # ------------------------------------------------------------------
+  # `unsafe` sweep. We `#![forbid(unsafe_code)]` at every crate root;
+  # this job double-checks that no `unsafe` slipped in via a build-script
+  # or conditional cfg.
+  # ------------------------------------------------------------------
+  no_unsafe:
+    name: No unsafe code
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - name: Grep for unsafe blocks in Mirage crates
+        run: |
+          # `#![forbid(unsafe_code)]` holds for every protocol/crypto crate. Two
+          # crates are excepted because they cross an unavoidable unsafe FFI
+          # boundary: mirage-client-gui (one documented pre_exec PR_SET_PDEATHSIG)
+          # and mirage-mobile-ffi (the JNI + C-ABI surface for Android/iOS). Both
+          # set `#![deny(unsafe_code)]` and scope every `unsafe` block narrowly.
+          # Match real `unsafe` CODE constructs, not the word inside string
+          # literals (e.g. "DNS-unsafe", "private/unsafe next-hop").
+          if grep -rnE --include='*.rs' \
+                '\bunsafe[[:space:]]*(\{|fn|impl|trait|extern)' crates/ \
+              | grep -v 'crates/client-gui/' \
+              | grep -v 'crates/mobile-ffi/' \
+              | grep -v '#!\[forbid(unsafe_code)\]' \
+              | grep -v '//.*unsafe' \
+              | grep .; then
+            echo "::error::Found unsafe usage in Mirage crate sources"
+            exit 1
+          fi

@@ -1,0 +1,23 @@
+[package]
+name = "mirage-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared types, errors, and utilities for the Mirage protocol"
+
+[dependencies]
+# Safe use only: platform O_NOFOLLOW constant for secure_file (no `unsafe`).
+libc = "0.2"
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Safe wrapper for setrlimit/getrlimit; used by `process_hardening` to disable
+# core dumps on POSIX without needing unsafe. No-op dep on non-unix targets.
+[target.'cfg(unix)'.dependencies]
+rlimit = { workspace = true }
+
+[lints]
+workspace = true

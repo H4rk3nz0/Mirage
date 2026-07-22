@@ -1,0 +1,119 @@
+// MIRAGE FINGERPRINT PATCH: TLS_ECDHE_{ECDSA,RSA}_WITH_CHACHA20_POLY1305_SHA256
+// (0xCCA9 / 0xCCA8). Chrome/libwebrtc offers these in its DTLS ClientHello; this
+// makes them negotiable so a Mirage WebRTC peer advertising Chrome's cipher list
+// can actually complete the handshake on one of them. RFC 7905 record layout,
+// SHA-256 PRF, ECDHE key agreement (ECDSA or RSA-authenticated certificate).
+
+use super::*;
+use crate::crypto::crypto_chacha20_poly1305::*;
+use crate::prf::*;
+
+#[derive(Clone)]
+pub struct CipherSuiteChaCha20Poly1305Sha256 {
+    cipher: Option<CryptoChaCha20Poly1305>,
+    rsa: bool,
+}
+
+impl CipherSuiteChaCha20Poly1305Sha256 {
+    const PRF_MAC_LEN: usize = 0;
+    const PRF_KEY_LEN: usize = 32;
+    const PRF_IV_LEN: usize = 12;
+
+    pub fn new(rsa: bool) -> Self {
+        CipherSuiteChaCha20Poly1305Sha256 { cipher: None, rsa }
+    }
+}
+
+impl CipherSuite for CipherSuiteChaCha20Poly1305Sha256 {
+    fn to_string(&self) -> String {
+        if self.rsa {
+            "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256".to_owned()
+        } else {
+            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256".to_owned()
+        }
+    }
+
+    fn id(&self) -> CipherSuiteId {
+        if self.rsa {
+            CipherSuiteId::Tls_Ecdhe_Rsa_With_Chacha20_Poly1305_Sha256
+        } else {
+            CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Chacha20_Poly1305_Sha256
+        }
+    }
+
+    fn certificate_type(&self) -> ClientCertificateType {
+        if self.rsa {
+            ClientCertificateType::RsaSign
+        } else {
+            ClientCertificateType::EcdsaSign
+        }
+    }
+
+    fn hash_func(&self) -> CipherSuiteHash {
+        CipherSuiteHash::Sha256
+    }
+
+    fn is_psk(&self) -> bool {
+        false
+    }
+
+    fn is_initialized(&self) -> bool {
+        self.cipher.is_some()
+    }
+
+    fn init(
+        &mut self,
+        master_secret: &[u8],
+        client_random: &[u8],
+        server_random: &[u8],
+        is_client: bool,
+    ) -> Result<()> {
+        let keys = prf_encryption_keys(
+            master_secret,
+            client_random,
+            server_random,
+            CipherSuiteChaCha20Poly1305Sha256::PRF_MAC_LEN,
+            CipherSuiteChaCha20Poly1305Sha256::PRF_KEY_LEN,
+            CipherSuiteChaCha20Poly1305Sha256::PRF_IV_LEN,
+            self.hash_func(),
+        )?;
+
+        if is_client {
+            self.cipher = Some(CryptoChaCha20Poly1305::new(
+                &keys.client_write_key,
+                &keys.client_write_iv,
+                &keys.server_write_key,
+                &keys.server_write_iv,
+            ));
+        } else {
+            self.cipher = Some(CryptoChaCha20Poly1305::new(
+                &keys.server_write_key,
+                &keys.server_write_iv,
+                &keys.client_write_key,
+                &keys.client_write_iv,
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn encrypt(&self, pkt_rlh: &RecordLayerHeader, raw: &[u8]) -> Result<Vec<u8>> {
+        if let Some(cg) = &self.cipher {
+            cg.encrypt(pkt_rlh, raw)
+        } else {
+            Err(Error::Other(
+                "CipherSuite has not been initialized, unable to encrypt".to_owned(),
+            ))
+        }
+    }
+
+    fn decrypt(&self, input: &[u8]) -> Result<Vec<u8>> {
+        if let Some(cg) = &self.cipher {
+            cg.decrypt(input)
+        } else {
+            Err(Error::Other(
+                "CipherSuite has not been initialized, unable to decrypt".to_owned(),
+            ))
+        }
+    }
+}

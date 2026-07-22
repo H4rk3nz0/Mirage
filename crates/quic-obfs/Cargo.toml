@@ -1,0 +1,22 @@
+[package]
+name = "mirage-quic-obfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "QUIC packet obfuscation (Salamander XOR + Gecko fragmentation) for Mirage's QUIC carriers (hysteria2 / h3), defeating QUIC-protocol and packet-size DPI fingerprinting."
+
+[dependencies]
+quinn = { workspace = true }
+tokio = { workspace = true }
+blake3 = { workspace = true }
+tracing = { workspace = true }
+getrandom = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,34 @@
+[package]
+name = "mirage-discovery-dht"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "BEP-44 DHT channel adapter for the Mirage discovery layer (spec §03 §8; A9)"
+
+[dependencies]
+mirage-common = { workspace = true }
+mirage-spec = { workspace = true }
+mirage-crypto = { workspace = true }
+mirage-discovery = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+# BEP-44 info-hashes are SHA-1 over pubkey || salt (BitTorrent DHT is
+# Kademlia-SHA-1 at the address layer; we can't swap it for SHA-256
+# without forking the DHT, which is out of scope).
+sha1 = "0.10"
+
+# Real mainline (BitTorrent) DHT I/O backend. Always compiled: Mirage
+# announces on and discovers via the DHT by default - no cargo feature flag,
+# the behaviour is chosen in config (prompted by mirage-setup).
+mainline = { version = "6.2" }
+
+[dev-dependencies]
+getrandom = "0.3"
+hex = "=0.4.3"
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "mirage-transport-obfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "obfs-tcp transport for Mirage: TCP + BLAKE3-keyed handshake, no TLS layer (v0.1t test-bed for the transport framework)"
+
+[dependencies]
+mirage-common = { workspace = true }
+mirage-crypto = { workspace = true }
+mirage-discovery = { workspace = true }
+mirage-transport = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+getrandom = "0.3"
+
+[dev-dependencies]
+proptest = { workspace = true }
+# `tokio::test(start_paused = true)` requires the `test-util` feature
+# so the auth-fail tarpit's sleep can auto-advance under tests.
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

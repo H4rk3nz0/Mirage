@@ -1,0 +1,20 @@
+[package]
+name = "mirage-mux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Stream multiplexing for Mirage sessions: many concurrent streams per tunnel with per-stream flow control"
+
+[dependencies]
+mirage-common = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

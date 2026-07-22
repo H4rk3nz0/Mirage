@@ -1,0 +1,26 @@
+[package]
+name = "mirage-tun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Transparent system-wide VPN layer for Mirage: a userspace IP stack (smoltcp) that terminates every TCP flow off an OS TUN device and hands (target, byte-stream) pairs to the Mirage tunnel - no per-app SOCKS configuration."
+
+[dependencies]
+smoltcp = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+# Production OS TUN device (Linux/macOS /dev/net/tun, Windows Wintun). Always
+# compiled - the netstack core still unit-tests against MemoryTun with no device
+# or root access; whether a real device is opened is a RUNTIME decision.
+tun = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

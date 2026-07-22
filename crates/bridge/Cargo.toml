@@ -1,0 +1,96 @@
+[package]
+name = "mirage-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Mirage bridge daemon: accepts client tunnels, proxies decrypted traffic to an upstream target"
+
+[lib]
+name = "mirage_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mirage-bridge"
+path = "src/main.rs"
+
+[[bin]]
+name = "mirage-keygen"
+path = "src/bin/mirage-keygen.rs"
+
+[[bin]]
+name = "mirage-rotate"
+path = "src/bin/mirage-rotate.rs"
+
+[[bin]]
+name = "mirage-publish"
+path = "src/bin/mirage-publish.rs"
+
+[[bin]]
+name = "mirage-cover-fetch"
+path = "src/bin/mirage-cover-fetch.rs"
+
+[[bin]]
+name = "mirage-setup"
+path = "src/bin/mirage-setup.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+mirage-circuit = { workspace = true }
+mirage-common = { workspace = true }
+mirage-crypto = { workspace = true }
+# ECDSA P-256 for the Reality TLS-signing identity (keygen generates it, the
+# daemon loads it) - the browser-realistic CertVerify scheme (0x0403).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+mirage-discovery = { workspace = true }
+mirage-discovery-nostr = { workspace = true }
+mirage-discovery-dht = { workspace = true }
+mirage-mux = { workspace = true }
+mirage-runtime = { workspace = true }
+mirage-spec = { workspace = true }
+mirage-session = { workspace = true }
+mirage-socks5 = { workspace = true }
+mirage-transport = { workspace = true }
+mirage-transport-mux = { workspace = true }
+mirage-transport-obfs = { workspace = true }
+mirage-transport-reality = { workspace = true }
+mirage-transport-shadowsocks = { workspace = true }
+mirage-transport-ws = { workspace = true }
+mirage-transport-meek = { workspace = true }
+mirage-transport-webrtc = { workspace = true }
+mirage-transport-vless = { workspace = true }
+mirage-transport-doh = { workspace = true }
+mirage-transport-pad = { workspace = true }
+mirage-transport-hysteria2 = { workspace = true }
+mirage-transport-masque = { workspace = true }
+mirage-transport-dnstt = { workspace = true }
+mirage-quic-obfs = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+getrandom = "0.3"
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+# mirage-cover-record: HLS URL resolution + real cert roots for the recorder.
+url = { workspace = true }
+webpki-roots = "0.26"
+
+
+[[bin]]
+name = "mirage-cover-record"
+path = "src/bin/mirage-cover-record.rs"
+
+[dev-dependencies]
+tempfile = "3"
+tracing-subscriber = { workspace = true }
+mirage-runtime = { workspace = true }
+mirage-session = { workspace = true, features = ["danger-no-token"] }
+async-trait = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+base64 = { workspace = true }
+getrandom = "0.3"

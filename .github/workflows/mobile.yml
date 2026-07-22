@@ -1,0 +1,117 @@
+name: Mobile (PR validation)
+
+# PR-time validation that the mobile FFI (crates/mobile-ffi) still cross-builds:
+#   - Android: per-ABI libmirage_mobile_ffi.so via cargo-ndk.
+#   - iOS: staticlib slices → XCFramework (macOS runner).
+# These catch NDK/Xcode-specific breakage that the host-only workspace build in
+# ci.yml can't. The RELEASE artifacts (attached to the GitHub Release) are built
+# by the `android`/`ios` jobs in release.yml — this workflow does NOT publish.
+on:
+  pull_request:
+    paths:
+      - 'crates/mobile-ffi/**'
+      - 'crates/client/**'
+      - 'crates/tun/**'
+      - 'bindings/**'
+      - '.github/workflows/mobile.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  android:
+    name: Android (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            target: aarch64-linux-android
+          - abi: armeabi-v7a
+            target: armv7-linux-androideabi
+          - abi: x86_64
+            target: x86_64-linux-android
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins 1.86; install the Android target std into it so
+      # `cargo ndk` (which shells out to cargo) finds core/std, keeping the MSRV.
+      - name: Install Rust 1.86 with the Android target
+        run: rustup toolchain install 1.86 --profile minimal --target ${{ matrix.target }}
+
+      # The NDK ships the per-ABI clang that ring's C build needs. ubuntu-latest
+      # runners include an NDK; pin ANDROID_NDK_HOME to it.
+      - name: Set up NDK
+        run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: mobile-android-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            mobile-android-${{ matrix.target }}-
+
+      - name: Build .so
+        run: |
+          cargo ndk -t ${{ matrix.abi }} -o jniLibs \
+            build --release -p mirage-mobile-ffi
+
+      - name: Upload jniLibs
+        uses: actions/upload-artifact@v4
+        with:
+          name: mirage-android-${{ matrix.abi }}
+          path: jniLibs/${{ matrix.abi }}/libmirage_mobile_ffi.so
+          if-no-files-found: error
+
+  # iOS: build the staticlib for device + simulator and assemble an XCFramework.
+  # Building the artifact needs only a macOS runner with Xcode (no Apple account);
+  # device install / TestFlight / App Store are account-gated (docs/building-ios.md).
+  ios:
+    name: iOS (XCFramework)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.86 with the iOS targets
+        run: rustup toolchain install 1.86 --profile minimal --target aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: mobile-ios-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            mobile-ios-
+
+      - name: Build staticlib (device + simulator)
+        run: |
+          cargo +1.86 build --release -p mirage-mobile-ffi --target aarch64-apple-ios
+          cargo +1.86 build --release -p mirage-mobile-ffi --target aarch64-apple-ios-sim
+
+      - name: Assemble XCFramework
+        run: |
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/libmirage_mobile_ffi.a \
+                -headers bindings/ios \
+            -library target/aarch64-apple-ios-sim/release/libmirage_mobile_ffi.a \
+                -headers bindings/ios \
+            -output Mirage.xcframework
+
+      - name: Upload XCFramework
+        uses: actions/upload-artifact@v4
+        with:
+          name: mirage-ios-xcframework
+          path: Mirage.xcframework
+          if-no-files-found: error

@@ -1,0 +1,33 @@
+[package]
+name = "mirage-transport-webrtc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "WebRTC data-channel transport for Mirage. Snowflake-grade carrier: a Mirage session rides a DTLS-SCTP data channel that DPI cannot block without breaking every video call. Real webrtc-rs stack is always compiled; the carrier is enabled in config (prompted by mirage-setup)."
+
+[dependencies]
+mirage-common = { workspace = true }
+mirage-crypto = { workspace = true }
+mirage-discovery = { workspace = true }
+mirage-transport = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+base64 = { workspace = true }
+getrandom = "0.3"
+
+# The real WebRTC stack (ICE + DTLS + SCTP data channels). Always compiled:
+# Mirage ships every transport and enables it in config (prompted by
+# mirage-setup), never behind a cargo feature flag. ~50 transitive crates.
+webrtc = { version = "0.11" }
+# Chrome-shaped ICE credential generation.
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

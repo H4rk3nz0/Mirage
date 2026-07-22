@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- WiX v3 source for the Mirage MSI. Built in CI with candle + light. The exes,
+     wintun.dll and icon.ico are copied next to this file before building. The
+     UpgradeCode is FIXED so upgrades replace prior versions cleanly. -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="Mirage" Language="1033" Version="$(var.Version)"
+           Manufacturer="Mirage" UpgradeCode="77664ED8-DDA2-49B7-9907-57EFA7D03828">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
+             Description="Mirage anti-censorship client" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Mirage is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="MirageIcon" SourceFile="icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="MirageIcon" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="Mirage">
+          <Component Id="GuiExe" Guid="*">
+            <File Id="GuiExe" Source="mirage-client-gui.exe" KeyPath="yes" />
+          </Component>
+          <Component Id="ClientExe" Guid="*">
+            <File Id="ClientExe" Source="mirage-client.exe" KeyPath="yes" />
+          </Component>
+          <Component Id="WintunDll" Guid="*">
+            <File Id="WintunDll" Source="wintun.dll" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Component Id="StartMenuShortcut" Guid="*">
+          <Shortcut Id="MirageShortcut" Name="Mirage"
+                    Target="[INSTALLFOLDER]mirage-client-gui.exe"
+                    WorkingDirectory="INSTALLFOLDER" Icon="MirageIcon" />
+          <RemoveFolder Id="CleanupShortcut" On="uninstall" />
+          <RegistryValue Root="HKCU" Key="Software\Mirage" Name="installed"
+                         Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Main" Title="Mirage" Level="1">
+      <ComponentRef Id="GuiExe" />
+      <ComponentRef Id="ClientExe" />
+      <ComponentRef Id="WintunDll" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Product>
+</Wix>

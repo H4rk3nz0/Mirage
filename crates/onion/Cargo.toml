@@ -1,0 +1,27 @@
+[package]
+name = "mirage-onion"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Mirage hidden-service addressing and rendezvous wire format"
+
+[dependencies]
+mirage-common = { workspace = true }
+mirage-crypto = { workspace = true }
+mirage-discovery = { workspace = true }
+mirage-spec = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+base32 = "=0.5.1"
+getrandom = "0.3"
+
+[dev-dependencies.tokio]
+workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }
+getrandom = "0.3"
+
+[lints]
+workspace = true

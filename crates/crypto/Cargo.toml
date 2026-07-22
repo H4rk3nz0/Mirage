@@ -1,0 +1,23 @@
+[package]
+name = "mirage-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cryptographic primitives for Mirage - wraps audited upstream crates, no hand-rolled crypto"
+
+[dependencies]
+snow = { workspace = true }
+ml-kem = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+curve25519-dalek = { workspace = true }
+blake3 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+aes-gcm = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+subtle = { workspace = true }
+rand_core = { workspace = true }
+getrandom = "0.3"

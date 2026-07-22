@@ -1,0 +1,30 @@
+[package]
+name = "mirage-mobile-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Mobile FFI for Mirage: embeds the mirage-client core behind a JNI surface (Android) and a C ABI (iOS), driving the VPN off an OS-provided TUN device."
+publish = false
+
+[lib]
+# cdylib -> Android .so (loaded by the JVM via JNI).
+# staticlib -> iOS .a (linked into an XCFramework; see docs/building-ios.md).
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+mirage-client = { workspace = true }
+mirage-tun = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# JNI entry points for Android. Portable pure-Rust crate, so the whole FFI
+# compiles on the host too (the Java_* symbols are simply never called
+# off-device), which lets CI validate it without an emulator.
+jni = "0.21"
+
+# This crate MUST use `unsafe` (JNI, raw C pointers), so it does NOT inherit the
+# workspace `unsafe_code = "forbid"` lint. It sets `#![deny(unsafe_code)]` at the
+# crate root instead (see src/lib.rs), and every unsafe block is narrowly scoped
+# and documented - matching the pattern used by mirage-client-gui.

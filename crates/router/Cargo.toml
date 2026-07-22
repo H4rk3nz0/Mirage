@@ -1,0 +1,30 @@
+[package]
+name = "mirage-router"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Traffic-class routing for Mirage: per-class circuit profiles, classifier, and hot-pool state machine"
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# HopSelector returns mirage_circuit::HopSpec for use with the
+# v0.2 client circuit-construction orchestrator. The dep is small -
+# circuit pulls in mirage-crypto for AEAD primitives, but the
+# router only uses the cell + builder types (no AEAD calls itself).
+mirage-circuit = { workspace = true }
+# Discovery surface for BridgeCandidate::from_announcement. Closes
+# [RT-H2/H3] - the operator_id and IP-prefix come straight from
+# the parsed announcement + verified operator pk.
+mirage-discovery = { workspace = true }
+# BLAKE3-keyed for stream-isolation slot picking. Re-uses the same
+# crypto primitive as the rest of Mirage; no new attack surface.
+mirage-crypto = { workspace = true }
+# Default CSPRNG jitter picker (closes [RT-M1]). Production code
+# uses this so refresh windows aren't predictable from the seq
+# counter alone.
+getrandom = "0.3"
+
+[lints]
+workspace = true

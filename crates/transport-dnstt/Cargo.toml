@@ -1,0 +1,21 @@
+[package]
+name = "mirage-transport-dnstt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Full DNS-tunnel (dnstt-style) transport for Mirage: carries the Mirage session over a real DNS covert channel (base32 query names upstream, TXT records downstream, with a reliable ARQ layer + polling), so it works where only DNS/port 53 is permitted."
+
+[dependencies]
+mirage-common = { workspace = true }
+mirage-transport = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+getrandom = "0.3"
+mirage-crypto = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,40 @@
+# cargo-vet local audits for Mirage.
+#
+# This file is where we record the crates we have audited ourselves.
+# Every entry represents a human having read the source at a specific
+# version and attested that it is safe-to-deploy (or safe-to-run) under
+# the Mirage threat model.
+#
+# Do not hand-edit. Use:
+#
+#   cargo vet certify <crate> <version>
+#     # -> creates an entry after walking you through the audit checklist
+#
+#   cargo vet certify --accept-all <crate> <version>
+#     # -> only if you have already read the diff elsewhere
+#
+# Every audit MUST include a rationale in `notes` - what was checked,
+# what the reviewer looked for, what risks were accepted. "LGTM" is
+# never acceptable in this repository. See AUDIT.md / A30 for the
+# review checklist.
+
+[criteria.crypto-primitive]
+description = """
+Implements cryptographic primitives used in the Mirage protocol path
+(AEAD, MAC, KEM, signature, hash). Audits under this criterion must:
+
+  1. Confirm the implementation matches its published spec reference
+     (RFC, NIST draft, academic paper).
+  2. Verify constant-time behavior on secret-dependent branches and
+     memory accesses (no lookups keyed by secret bytes, no data-dependent
+     branches in hot paths).
+  3. Verify zeroization of secret material on drop where applicable.
+  4. Verify no known-broken primitives are exposed (MD5, SHA1, RC4,
+     curve25519-dalek <2.0, etc.).
+
+Crypto-primitive audits subsume `safe-to-deploy`.
+"""
+implies = "safe-to-deploy"
+
+# Audits go below. This file is scaffolded empty; first entries will be
+# added when someone runs the audit pass for each pinned crypto crate.
