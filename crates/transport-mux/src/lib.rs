@@ -53,7 +53,7 @@
 //!     Ok(MuxResult::Tls(s))                  => { /* REALITY accept */ let _ = s; }
 //!     Ok(MuxResult::Http(s))                 => { /* WebSocket / meek */ let _ = s; }
 //!     Ok(MuxResult::AuthenticatedObfsTcp(s)) => { /* session::accept */ let _ = s; }
-//!     Ok(MuxResult::AuthenticatedShadowsocks(s)) => { /* SS-2022 session */ let _ = s; }
+//!     Ok(MuxResult::AuthenticatedShadowsocks(s, _seed)) => { /* SS-2022 session */ let _ = s; }
 //!     Ok(MuxResult::AuthenticatedVless(s))   => { /* VLESS session */ let _ = s; }
 //!     Ok(MuxResult::Unknown(s))              => { /* proxy to cover */ let _ = s; }
 //!     Err(e) => eprintln!("I/O error: {e}"),

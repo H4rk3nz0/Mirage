@@ -67,6 +67,15 @@ esac
 if [ "$MUX_OFF" = 1 ]; then
   sed -i 's/^{/{\n  "mux_enabled": false,/' "$WORK/cfg/bridge.json"
 fi
+if [ "$TRANSPORT" = ss2022 ]; then
+  # SS-2022 as the sole outer carrier trips the entropy-DPI guard; the test network
+  # has no such DPI, so permit it (a real deployment pairs SS with a mimicry carrier).
+  python3 - "$WORK/cfg/client.json" <<'PY'
+import json,sys
+c=json.load(open(sys.argv[1])); c["allow_ss2022_outer"]=True
+json.dump(c,open(sys.argv[1],'w'),indent=2)
+PY
+fi
 if [ "${REALITY:-0}" = 1 ]; then
   # Reality (ephemeral cert) isn't a keygen flag - inject matching config.
   python3 - "$WORK/cfg/bridge.json" "$WORK/cfg/client.json" <<'PY'

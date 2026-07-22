@@ -56,9 +56,10 @@ pub enum MuxResult {
     AuthenticatedObfsTcp(TcpStream),
 
     /// Authenticated as Shadowsocks-2022. Returns a [`DuplexStream`]
-    /// wrapping the SS-2022 AEAD framing. Caller hands to
-    /// `session::accept`.
-    AuthenticatedShadowsocks(DuplexStream),
+    /// wrapping the SS-2022 AEAD framing, plus the per-session Proteus pace seed
+    /// (the concrete stream is boxed here, so the seed is extracted for the caller
+    /// to apply `maybe_pace_stream` with). Caller hands to `session::accept`.
+    AuthenticatedShadowsocks(DuplexStream, u64),
 
     /// Authenticated as VLESS. The 26-byte VLESS auth frame has been
     /// consumed; no standalone server response header is sent (F21 0-RTT -
@@ -78,7 +79,7 @@ impl std::fmt::Debug for MuxResult {
             Self::Tls(_) => write!(f, "MuxResult::Tls(..)"),
             Self::Http(_) => write!(f, "MuxResult::Http(..)"),
             Self::AuthenticatedObfsTcp(_) => write!(f, "MuxResult::AuthenticatedObfsTcp(..)"),
-            Self::AuthenticatedShadowsocks(_) => {
+            Self::AuthenticatedShadowsocks(..) => {
                 write!(f, "MuxResult::AuthenticatedShadowsocks(..)")
             }
             Self::AuthenticatedVless(_) => write!(f, "MuxResult::AuthenticatedVless(..)"),
@@ -343,7 +344,13 @@ impl ProtocolMux {
                                     format!("ss2022 server auth: {e}"),
                                 )
                             })?;
-                    return Ok(MuxResult::AuthenticatedShadowsocks(Box::pin(ss_stream)));
+                    // Extract the pace seed before boxing loses the concrete type; the
+                    // bridge applies the pacer (Dir::Down) with it.
+                    let seed = ss_stream.pace_seed();
+                    return Ok(MuxResult::AuthenticatedShadowsocks(
+                        Box::pin(ss_stream),
+                        seed,
+                    ));
                 }
             } else {
                 trace!(

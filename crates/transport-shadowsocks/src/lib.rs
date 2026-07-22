@@ -123,7 +123,12 @@ const TAG_LEN: usize = 16;
 /// plus a 16-byte Poly1305 tag.
 const ENC_LEN_FIELD: usize = 2 + TAG_LEN; // 18 bytes
 
-/// Maximum number of bytes allowed in the request-header padding (0-64).
+/// Maximum number of bytes allowed in the request-header padding (0-64). Bounded by
+/// the mux's single 192-byte non-consuming peek (`auth_buf`): salt, length chunk, fixed
+/// header, and tag total ~68 bytes, so the padded header must stay well under 192 or the
+/// peek returns NeedMoreBytes and the connection falls through to cover. Reference
+/// SS-2022 clients pad wider (~900); matching that needs the mux peek to re-read on
+/// NeedMoreBytes first (a larger change), so this stays capped for now.
 const MAX_PADDING: u16 = 64;
 
 /// Maximum plaintext payload per SS-2022 data chunk. The on-wire length field
@@ -167,6 +172,14 @@ pub fn derive_session_key(psk: &[u8; 32], salt: &[u8; 16]) -> [u8; 32] {
     key_material[..32].copy_from_slice(psk);
     key_material[32..].copy_from_slice(salt);
     blake3::derive_key(SESSION_SUBKEY_LABEL, &key_material[..])
+}
+
+/// Proteus pace seed from the request-salt session subkey. Both endpoints derive the
+/// same subkey (`derive_session_key(psk, request_salt)`), so both get the same seed.
+fn ss_pace_seed(subkey: &[u8; 32]) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&subkey[..8]);
+    u64::from_le_bytes(b)
 }
 
 /// Derive the per-bridge "magic" destination (IPv4 address + port) that the
@@ -601,6 +614,7 @@ where
         inner: stream,
         read_subkey: [0u8; 32], // placeholder until the deferred response read
         write_subkey: *session_subkey,
+        pace_seed: ss_pace_seed(&session_subkey),
         read_counter: 0,
         write_counter,
         read_buf: Vec::new(),
@@ -705,6 +719,7 @@ where
         .map_err(|_| TransportError::Timeout(deadline))?
         .map(|state| Ss2022Stream {
             inner: stream,
+            pace_seed: ss_pace_seed(&state.read_subkey),
             read_subkey: state.read_subkey,
             write_subkey: state.write_subkey,
             read_counter: state.read_counter,
@@ -953,6 +968,9 @@ pub struct Ss2022Stream<S> {
     read_subkey: [u8; 32],
     /// Subkey used to encrypt data sent to the peer.
     write_subkey: [u8; 32],
+    /// Per-session Proteus pace seed, derived from the request-salt session subkey
+    /// (identical on both endpoints, so a shared pacer picks the same envelope).
+    pace_seed: u64,
     /// Counter for the next read-side AEAD operation (length field).
     read_counter: u64,
     /// Counter for the next write-side AEAD operation (length field).
@@ -1005,6 +1023,16 @@ pub struct Ss2022Stream<S> {
     resp_stage: Vec<u8>,
     /// Payload length of the response header chunk, learned after phase 1.
     resp_payload_len: usize,
+}
+
+impl<S> Ss2022Stream<S> {
+    /// Per-session Proteus pace seed (identical on both endpoints). Feed to
+    /// `mirage_transport_reality::maybe_pace_stream` so the SS carrier wears the same
+    /// replayed envelope in both directions.
+    #[must_use]
+    pub fn pace_seed(&self) -> u64 {
+        self.pace_seed
+    }
 }
 
 impl<S> std::fmt::Debug for Ss2022Stream<S> {

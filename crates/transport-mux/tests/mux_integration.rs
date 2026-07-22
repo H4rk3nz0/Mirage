@@ -195,7 +195,7 @@ async fn relay_ss2022_wrap_authenticates_via_mux() {
         .await
         .unwrap();
     assert!(
-        matches!(res, MuxResult::AuthenticatedShadowsocks(_)),
+        matches!(res, MuxResult::AuthenticatedShadowsocks(_, _)),
         "relay leg wrapped in SS-2022 under relay_ss_psk must be accepted, got {res:?}"
     );
     client_task.await.unwrap();

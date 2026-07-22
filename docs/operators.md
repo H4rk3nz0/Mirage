@@ -240,10 +240,13 @@ yt-dlp, ffmpeg, tcpdump, or python; it fetches a real HLS video over its own TLS
 wire envelope off the TLS record framing):
 
 ```sh
-mirage-cover-record /opt/mirage/library --count 20            # 20 random real videos (PeerTube)
-mirage-cover-record /opt/mirage/library --loop 30 --max 40    # self-driving (systemd unit provided)
+mirage-cover-record /opt/mirage/library --mode video  --count 20   # streaming-video envelope
+mirage-cover-record /opt/mirage/library --mode browse --count 20   # web-browsing envelope
+mirage-cover-record /opt/mirage/library --loop 30 --max 40         # self-driving (systemd unit)
 ```
 
-Point `reality_pace_profile` at `.../library/peertube` on both the bridge and the clients (ship it
-with the client config). Both ends must run paranoid/replay for the shape to match. Details:
-[`tools/cover-sources/README.md`](../tools/cover-sources/README.md).
+Each class lands in `library/<class>/`. Point `reality_pace_profile` at the class dir that matches
+your Reality pretext (a video/CDN host -> `library/video`; a general site -> `library/browse`) on
+both the bridge and the clients (ship it with the client config). Both ends must run paranoid/replay
+for the shape to match. Per session the pacer chains a random shuffle of several traces, so nothing
+loops. Details: [`tools/cover-sources/README.md`](../tools/cover-sources/README.md).

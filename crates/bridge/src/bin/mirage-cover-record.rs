@@ -44,6 +44,9 @@ const MAX_TIME: Duration = Duration::from_secs(30);
 const BODY_CAP: usize = 6 * 1024 * 1024;
 /// Inter-segment pace cap - mimic a player's buffer wait without stalling recording.
 const SEG_GAP_MAX: Duration = Duration::from_millis(1200);
+/// Browse: subresource fetch caps + inter-asset gap (a page loads assets in a burst).
+const MAX_ASSETS: usize = 48;
+const BROWSE_GAP: Duration = Duration::from_millis(60);
 /// Realistic browser UA so CDNs / PeerTube serve normally.
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
@@ -54,6 +57,21 @@ const PEERTUBE: &[&str] = &[
     "tilvids.com",
     "makertube.net",
     "peertube.tv",
+    "diode.zone",
+    "spectra.video",
+    "video.hardlimit.com",
+    "tube.tchncs.de",
+    "peertube.stream",
+];
+/// Default browse sources: random real pages, ubiquitous + high-collateral to block.
+/// Special:Random 302-redirects to a random article (we follow it).
+const BROWSE_SITES: &[&str] = &[
+    "en.wikipedia.org",
+    "de.wikipedia.org",
+    "fr.wikipedia.org",
+    "es.wikipedia.org",
+    "ja.wikipedia.org",
+    "ru.wikipedia.org",
 ];
 
 /// One recorded record: (relative time s, wire size bytes, dir: 1=down, -1=up).
@@ -210,8 +228,25 @@ impl Fetcher {
         Ok(BufReader::new(tls))
     }
 
-    /// GET a URL, returning `(status, body)`. The tap logs record sizes as a side effect.
+    /// GET a URL, following up to 4 redirects, returning `(status, body)`. The tap logs
+    /// record sizes as a side effect.
     async fn get(&mut self, url: &Url) -> io::Result<(u16, Vec<u8>)> {
+        let mut cur = url.clone();
+        for _ in 0..5 {
+            let (status, location, body) = self.get_once(&cur).await?;
+            if (301..=308).contains(&status) && status != 304 && status != 305 && status != 306 {
+                if let Some(loc) = location.as_deref().and_then(|l| cur.join(l).ok()) {
+                    cur = loc;
+                    continue;
+                }
+            }
+            return Ok((status, body));
+        }
+        Err(io::Error::new(io::ErrorKind::Other, "too many redirects"))
+    }
+
+    /// One request/response (no redirect handling), reusing the per-host connection.
+    async fn get_once(&mut self, url: &Url) -> io::Result<(u16, Option<String>, Vec<u8>)> {
         let host = url
             .host_str()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no host"))?
@@ -228,11 +263,11 @@ impl Fetcher {
             None => url.path().to_string(),
         };
         match request(conn, &host, &path).await {
-            Ok((status, body, keep)) => {
+            Ok((status, location, body, keep)) => {
                 if !keep {
                     self.cur = None;
                 }
-                Ok((status, body))
+                Ok((status, location, body))
             }
             Err(e) => {
                 self.cur = None;
@@ -242,8 +277,12 @@ impl Fetcher {
     }
 }
 
-/// Send one request and read the full response. Returns `(status, body, reusable)`.
-async fn request(conn: &mut Conn, host: &str, path: &str) -> io::Result<(u16, Vec<u8>, bool)> {
+/// Send one request and read the full response. Returns `(status, location, body, reusable)`.
+async fn request(
+    conn: &mut Conn,
+    host: &str,
+    path: &str,
+) -> io::Result<(u16, Option<String>, Vec<u8>, bool)> {
     let req = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {UA}\r\n\
          Accept: */*\r\nAccept-Encoding: identity\r\nConnection: keep-alive\r\n\r\n"
@@ -264,6 +303,7 @@ async fn request(conn: &mut Conn, host: &str, path: &str) -> io::Result<(u16, Ve
     let mut content_len: Option<usize> = None;
     let mut chunked = false;
     let mut keep = true;
+    let mut location: Option<String> = None;
     loop {
         let mut h = String::new();
         if conn.read_line(&mut h).await? == 0 {
@@ -280,6 +320,9 @@ async fn request(conn: &mut Conn, host: &str, path: &str) -> io::Result<(u16, Ve
             chunked = true;
         } else if lower.starts_with("connection:") && lower.contains("close") {
             keep = false;
+        } else if lower.starts_with("location:") {
+            // preserve original case of the value (URLs are case-sensitive)
+            location = h.split_once(':').map(|(_, v)| v.trim().to_string());
         }
     }
 
@@ -299,7 +342,7 @@ async fn request(conn: &mut Conn, host: &str, path: &str) -> io::Result<(u16, Ve
         conn.take(BODY_CAP as u64).read_to_end(&mut b).await?;
         b
     };
-    Ok((status, body, keep))
+    Ok((status, location, body, keep))
 }
 
 async fn read_chunked(conn: &mut Conn) -> io::Result<Vec<u8>> {
@@ -391,6 +434,38 @@ fn parse_media(text: &str, base: &Url) -> Vec<(f64, Url)> {
         } else if let Ok(u) = base.join(l) {
             out.push((dur, u));
             dur = 0.0;
+        }
+    }
+    out
+}
+
+// --- HTML subresource parsing (browse class) --------------------------------
+
+/// Page subresource URLs: quoted `src="..."` (images/scripts/media, incl. `data-src`)
+/// and `href="....css"` (stylesheets), resolved absolute and deduped. Not navigation
+/// links - we replay a page LOAD, not a crawl.
+fn parse_subresources(html: &str, base: &Url) -> Vec<Url> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for attr in ["src=\"", "href=\""] {
+        let is_href = attr.starts_with("href");
+        let mut rest = html;
+        while let Some(i) = rest.find(attr) {
+            rest = &rest[i + attr.len()..];
+            let Some(end) = rest.find('"') else { break };
+            let val = &rest[..end];
+            rest = &rest[end + 1..];
+            if val.is_empty() || val.starts_with("data:") || val.starts_with('#') {
+                continue;
+            }
+            if is_href && !(val.contains(".css") || val.contains("load.php")) {
+                continue; // href: stylesheets/asset bundles only, not page links
+            }
+            if let Ok(u) = base.join(val) {
+                if matches!(u.scheme(), "https" | "http") && seen.insert(u.as_str().to_string()) {
+                    out.push(u);
+                }
+            }
         }
     }
     out
@@ -525,6 +600,40 @@ async fn record_stream(master: &Url) -> io::Result<Vec<Event>> {
     Ok(events)
 }
 
+/// Drive one page load (HTML + its subresources) and return its wire envelope - a
+/// web-browsing shape (bursty small/medium objects), distinct from streaming video.
+async fn record_browse(page: &Url) -> io::Result<Vec<Event>> {
+    let start = Instant::now();
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let mut f = Fetcher::new(start, out.clone())?;
+
+    let (st, body) = f.get(page).await?;
+    if st != 200 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("page HTTP {st}"),
+        ));
+    }
+    let subs = parse_subresources(&String::from_utf8_lossy(&body), page);
+    if subs.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::Other, "no subresources"));
+    }
+
+    let mut bytes = 0usize;
+    for (n, u) in subs.iter().enumerate() {
+        if n >= MAX_ASSETS || bytes >= MAX_BYTES || start.elapsed() >= MAX_TIME {
+            break;
+        }
+        if let Ok((200, b)) = f.get(u).await {
+            bytes += b.len();
+        }
+        tokio::time::sleep(BROWSE_GAP).await;
+    }
+    drop(f);
+    let events = out.lock().unwrap().clone();
+    Ok(events)
+}
+
 // --- library output ---------------------------------------------------------
 
 fn next_index(dir: &Path) -> usize {
@@ -579,11 +688,20 @@ fn down_bytes(events: &[Event]) -> usize {
 
 // --- CLI --------------------------------------------------------------------
 
+/// Cover class: a streaming-video envelope or a web-browsing envelope.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Video,
+    Browse,
+}
+
 struct Args {
     lib: PathBuf,
     name: String,
+    mode: Mode,
     count: usize,
     hls: Option<String>,
+    url: Option<String>,
     instance: Option<String>,
     loop_mins: Option<u64>,
     max: Option<usize>,
@@ -593,104 +711,122 @@ fn usage() -> ! {
     eprintln!(
         "usage: mirage-cover-record <lib-dir> [options]\n\
          \n\
-         Records a real video stream's wire envelope into <lib-dir>/<name>/<i>.csv,\n\
-         the replay library the Reality pacer wears. Self-contained (no external tools).\n\
+         Records real traffic's wire envelope into <lib-dir>/<name>/<i>.csv, the replay\n\
+         library the Reality pacer wears. Self-contained (no external tools).\n\
          \n\
          options:\n\
-           --count N        record N traces (default 1)\n\
-           --hls URL        record a specific HLS master playlist\n\
-           --peertube HOST  use a specific PeerTube instance\n\
-           --name NAME      library subdir name (default: source)\n\
-           --loop MINUTES   self-driving: record, wait, repeat forever\n\
-           --max K          in --loop, keep only the K newest traces\n\
+           --mode video|browse  cover class (default video)\n\
+           --count N            record N traces (default 1)\n\
+           --hls URL            video: record a specific HLS master playlist\n\
+           --peertube HOST      video: use a specific PeerTube instance\n\
+           --url URL            browse: record a specific page + its subresources\n\
+           --name NAME          library subdir name (default: the mode)\n\
+           --loop MINUTES       self-driving: record, wait, repeat forever\n\
+           --max K              in --loop, keep only the K newest traces\n\
          \n\
-         Point the tunnel at the result:\n\
-           reality_pace: \"replay\", reality_pace_profile: \"<lib-dir>/<name>\"\n\
+         Point the tunnel at a class dir:\n\
+           reality_pace: \"replay\", reality_pace_profile: \"<lib-dir>/video\"\n\
          (paranoid mode sets this for you)."
     );
     std::process::exit(2);
+}
+
+/// Next arg value or usage-exit (option requires an argument).
+fn val<I: Iterator<Item = String>>(a: &mut I) -> String {
+    a.next().unwrap_or_else(|| usage())
 }
 
 fn parse_args() -> Args {
     let mut a = std::env::args().skip(1);
     let mut lib: Option<PathBuf> = None;
     let mut name: Option<String> = None;
+    let mut mode = None;
     let mut count = 1usize;
     let mut hls = None;
+    let mut url = None;
     let mut instance = None;
     let mut loop_mins = None;
     let mut max = None;
     while let Some(arg) = a.next() {
         match arg.as_str() {
             "-h" | "--help" => usage(),
-            "--count" => {
-                count = a
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or_else(|| usage())
+            "--mode" => {
+                mode = Some(match val(&mut a).as_str() {
+                    "video" => Mode::Video,
+                    "browse" => Mode::Browse,
+                    _ => usage(),
+                })
             }
-            "--hls" => hls = Some(a.next().unwrap_or_else(|| usage())),
-            "--peertube" => instance = Some(a.next().unwrap_or_else(|| usage())),
-            "--name" => name = Some(a.next().unwrap_or_else(|| usage())),
-            "--loop" => {
-                loop_mins = Some(
-                    a.next()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or_else(|| usage()),
-                )
-            }
-            "--max" => {
-                max = Some(
-                    a.next()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or_else(|| usage()),
-                )
-            }
+            "--count" => count = val(&mut a).parse().unwrap_or_else(|_| usage()),
+            "--hls" => hls = Some(val(&mut a)),
+            "--url" => url = Some(val(&mut a)),
+            "--peertube" => instance = Some(val(&mut a)),
+            "--name" => name = Some(val(&mut a)),
+            "--loop" => loop_mins = Some(val(&mut a).parse().unwrap_or_else(|_| usage())),
+            "--max" => max = Some(val(&mut a).parse().unwrap_or_else(|_| usage())),
             s if s.starts_with('-') => usage(),
             s => lib = Some(PathBuf::from(s)),
         }
     }
     let lib = lib.unwrap_or_else(|| usage());
-    let name = name.unwrap_or_else(|| {
-        if hls.is_some() {
-            "hls".into()
-        } else {
-            "peertube".into()
-        }
+    // --url implies browse, --hls implies video; else default video.
+    let mode = mode.unwrap_or(if url.is_some() {
+        Mode::Browse
+    } else {
+        Mode::Video
+    });
+    let name = name.unwrap_or_else(|| match mode {
+        Mode::Video => "video".into(),
+        Mode::Browse => "browse".into(),
     });
     Args {
         lib,
         name,
+        mode,
         count,
         hls,
+        url,
         instance,
         loop_mins,
         max,
     }
 }
 
-/// Resolve a source URL to record: an explicit `--hls`, or a random PeerTube video.
+/// Resolve a source URL: `--hls`/random PeerTube for video, `--url`/random page for browse.
 async fn resolve_source(args: &Args, start: Instant) -> io::Result<Url> {
-    if let Some(u) = &args.hls {
-        return Url::parse(u)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()));
-    }
-    let out = Arc::new(Mutex::new(Vec::new()));
-    let mut f = Fetcher::new(start, out)?;
-    let instances: Vec<String> = match &args.instance {
-        Some(i) => vec![i.clone()],
-        None => shuffled(PEERTUBE.len())
-            .into_iter()
-            .map(|i| PEERTUBE[i].to_string())
-            .collect(),
+    let parse = |u: &str| {
+        Url::parse(u).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
     };
-    for inst in &instances {
-        match peertube_hls(&mut f, inst).await {
-            Ok(u) => return Ok(u),
-            Err(e) => eprintln!("  {inst}: {e}"),
+    match args.mode {
+        Mode::Browse => {
+            if let Some(u) = &args.url {
+                return parse(u);
+            }
+            let site = BROWSE_SITES[(rand_u64() as usize) % BROWSE_SITES.len()];
+            parse(&format!("https://{site}/wiki/Special:Random"))
+        }
+        Mode::Video => {
+            if let Some(u) = &args.hls {
+                return parse(u);
+            }
+            let out = Arc::new(Mutex::new(Vec::new()));
+            let mut f = Fetcher::new(start, out)?;
+            let instances: Vec<String> = match &args.instance {
+                Some(i) => vec![i.clone()],
+                None => shuffled(PEERTUBE.len())
+                    .into_iter()
+                    .map(|i| PEERTUBE[i].to_string())
+                    .collect(),
+            };
+            for inst in &instances {
+                match peertube_hls(&mut f, inst).await {
+                    Ok(u) => return Ok(u),
+                    Err(e) => eprintln!("  {inst}: {e}"),
+                }
+            }
+            Err(io::Error::new(io::ErrorKind::Other, "no source resolved"))
         }
     }
-    Err(io::Error::new(io::ErrorKind::Other, "no source resolved"))
 }
 
 /// Record one trace (with a few attempts to clear the volume floor).
@@ -703,7 +839,11 @@ async fn record_one(args: &Args, dir: &Path) -> io::Result<()> {
                 continue;
             }
         };
-        match record_stream(&src).await {
+        let recorded = match args.mode {
+            Mode::Video => record_stream(&src).await,
+            Mode::Browse => record_browse(&src).await,
+        };
+        match recorded {
             Ok(events) => {
                 let db = down_bytes(&events);
                 if db < MIN_TRACE_BYTES {
@@ -793,6 +933,26 @@ mod tests {
         assert_eq!(v[0].0, 800_000);
         assert_eq!(v[0].1.as_str(), "https://cdn.example/v/360.m3u8");
         assert_eq!(v[1].1.as_str(), "https://cdn2.example/720.m3u8");
+    }
+
+    #[test]
+    fn parse_subresources_collects_assets_not_nav() {
+        let base = Url::parse("https://en.wikipedia.org/wiki/Cat").unwrap();
+        let html = "<link rel=stylesheet href=\"/w/load.php?modules=x\">\
+                    <a href=\"/wiki/Dog\">Dog</a>\
+                    <img src=\"//upload.wikimedia.org/a/cat.jpg\">\
+                    <script src=\"/w/index.js\"></script>\
+                    <img data-src=\"data:image/gif;base64,zzz\">";
+        let urls: Vec<String> = parse_subresources(html, &base)
+            .iter()
+            .map(|u| u.as_str().to_string())
+            .collect();
+        assert!(urls.contains(&"https://upload.wikimedia.org/a/cat.jpg".to_string()));
+        assert!(urls.contains(&"https://en.wikipedia.org/w/index.js".to_string()));
+        assert!(urls.iter().any(|u| u.contains("load.php")));
+        // navigation link and data: URI are not fetched
+        assert!(!urls.iter().any(|u| u.ends_with("/wiki/Dog")));
+        assert!(!urls.iter().any(|u| u.starts_with("data:")));
     }
 
     #[test]

@@ -2,8 +2,9 @@
 # Install: edit the paths/User below, then
 #   sudo cp mirage-cover-recorder.service /etc/systemd/system/
 #   sudo systemctl enable --now mirage-cover-recorder
-# Point the bridge/client at the library dir it fills:
-#   reality_pace: "replay", reality_pace_profile: "/opt/mirage/library/peertube"
+# Point the bridge/client at the class dir it fills:
+#   reality_pace: "replay", reality_pace_profile: "/opt/mirage/library/video"
+# For a browse-class library too, run a second copy with `--mode browse`.
 # Self-contained: mirage-cover-record needs no external tools or extra capabilities.
 [Unit]
 Description=Proteus cover-source recorder (refreshes the real-traffic replay library)

@@ -133,7 +133,7 @@ Every one is in the standard build.
 | **`mirage-publish`** | Publishes bridge announcements to Nostr / DNS / DHT. Run on your workstation. |
 | **`mirage-rotate`** | Key and invite rotation. |
 | **`mirage-cover-fetch`** | Downloads a real TLS transcript to use as cover material. |
-| **`mirage-cover-record`** | Records a real video stream's wire envelope into the Proteus replay library (paranoid mode). Self-contained - no external tools. |
+| **`mirage-cover-record`** | Records real traffic (video or web-browsing) into the Proteus replay library (paranoid mode). Self-contained - no external tools. |
 | **`mirage-cohort-refresh`** | Diagnostic: asks a bridge for a cohort update. |
 | **`mirage-pt-client`** | Tor pluggable-transport (PT 2.1) adapter - run Mirage as a Tor PT. |
 

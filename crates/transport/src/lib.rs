@@ -40,6 +40,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub mod adaptive;
+pub mod cover_bandit;
 pub mod netfp;
 pub mod posture_net;
 pub mod select;
@@ -47,6 +48,7 @@ pub mod self_adversary;
 pub mod success_persist;
 pub mod success_rate;
 
+pub use cover_bandit::{CoverClass, CoverClassBandit};
 pub use select::{rank, rank_names, Ranked, SelectionPolicy};
 // Re-exported from `mirage-common` (the dependency root) so transports keep
 // using `mirage_transport::SeenNonceSet` while discovery/onion share the same

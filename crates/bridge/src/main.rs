@@ -3429,10 +3429,15 @@ async fn main() {
                         }
                         return;
                     }
-                    Ok(MuxResult::AuthenticatedShadowsocks(stream)) => {
+                    Ok(MuxResult::AuthenticatedShadowsocks(stream, seed)) => {
                         metrics_clone.session_by_transport(TRANSPORT_SS2022);
-                        // SS-2022 authenticated - stream is AEAD-framed;
-                        // run the Mirage session on top.
+                        // SS-2022 authenticated - stream is AEAD-framed. Proteus: pace the
+                        // SS carrier (Dir::Down) to the shared envelope, then run the session.
+                        let stream = mirage_transport_reality::maybe_pace_stream(
+                            stream,
+                            mirage_transport_reality::pacer::Dir::Down,
+                            seed,
+                        );
                         let res = run_authenticated_session(
                             into_session_stream(stream, pad_cfg.as_ref()),
                             peer,

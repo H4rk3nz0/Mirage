@@ -1,8 +1,8 @@
 # Mirage
 
 **A censorship-resistance framework stack.** Pluggable carriers, epoch-rotated bridge
-discovery, authenticated session crypto, and optional onion routing - behind one local
-SOCKS5 proxy or a full-device VPN.
+discovery, authenticated session crypto, replay-based traffic shaping, and optional onion
+routing - behind one local SOCKS5 proxy or a full-device VPN.
 
 > **Status:** `0.1.3-alpha.1`. Deployable today. Wire formats and config may still change
 > before `0.1.0`.
@@ -23,6 +23,34 @@ what your network lets through, and the same session crypto rides on top of any 
 **One build, every capability.** There are no `--features` flags to remember and no
 "optional" builds. Every carrier, every discovery channel, the GUI, and the TUN VPN are
 compiled into the standard build. What you actually use is chosen at **runtime, in config**.
+
+---
+
+## Proteus: wear real traffic, not a fake shape
+
+Our flagship layer, and a genuine upgrade to Reality. **Reality** makes the *connection*
+look real - a real TLS session to a real host, resistant to active probing. **Proteus**
+makes the *flow* look real too.
+
+Even a perfect TLS disguise leaks its purpose through traffic *shape* - packet sizes and
+timing. A proxy shuttling data doesn't breathe like someone streaming a video, and
+traffic-analysis classifiers key on exactly that. Proteus closes it: it records a
+**genuine** video stream or web page load and replays its exact wire envelope - sizes,
+direction, timing - with your data hidden inside the encrypted record bodies.
+
+The point is *replay, not fake*. A generated "video-like" pattern is always subtly wrong,
+and subtly-wrong is detectable; a real recorded envelope, replayed byte-for-byte, is not.
+We proved it on the wire: the paced tunnel's TLS records match the recorded profile exactly.
+
+| | |
+|---|---|
+| **Both directions** | Client shapes what it sends up, bridge shapes what it sends down - a censor watching either sees real traffic. |
+| **Never twice the same** | Each session chains a random shuffle of real traces, so there's no fixed fingerprint and nothing loops. |
+| **Cover classes** | Streaming video *or* web browsing - pick the shape that matches your pretext. |
+| **Self-contained** | `mirage-cover-record` builds the library from real open sources (PeerTube, Wikipedia) - one shipped binary, no external tools. |
+
+One switch turns on the whole strong posture: `"paranoid": true`. Details in the
+**[feature reference](docs/features.md)** and **[operator guide](docs/operators.md)**.
 
 ---
 
@@ -65,7 +93,7 @@ several and switch when one gets blocked.
 
 | Carrier | Looks like | Good for |
 |---|---|---|
-| **Reality** | Real TLS to a real site | The default. Survives active probing. |
+| **Reality (+ Proteus)** | Real TLS to a real site, wearing a real traffic shape | The default. Survives active probing *and* traffic analysis. |
 | **Hysteria2** | QUIC | Lossy / high-latency links. |
 | **MASQUE** | HTTP/3 | Networks that allow QUIC to CDNs. |
 | **WebRTC** | A video call | Blocking it breaks conferencing. |
@@ -89,10 +117,9 @@ fingerprinting), stream multiplexing, and single-port dispatch across every carr
 **Multi-hop** - chain up to **3 bridges** into an onion circuit, each hop authenticated
 separately, so no single bridge sees both who you are and where you're going.
 
-**Paranoid mode** - one config switch (`paranoid: true`) puts on the strongest posture:
-Reality carrier, handshake padding, fail-closed, and **replay pacing** - the flow wears a
-real recorded video-streaming shape (see [`tools/cover-sources`](tools/cover-sources)), so
-traffic-analysis sees genuine traffic, not a generated imitation.
+**Paranoid mode** - one config switch (`paranoid: true`) puts on the strongest posture at
+once: Reality carrier, handshake padding, fail-closed, and **Proteus** replay pacing (see
+above).
 
 Runs on **Linux, macOS, and Windows**. Full detail in the
 **[feature reference](docs/features.md)**.

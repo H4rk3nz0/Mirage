@@ -42,7 +42,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.4-alpha.1"
+version = "0.1.3-alpha.1"
 # MSRV. Must match the pin in rust-toolchain.toml (channel = "1.86"). The true
 # floor is 1.86: edition-2024 transitive deps need 1.85, and several pinned deps
 # (icu 2.x, idna_adapter, time 0.3.45) declare rust-version 1.86. All 37 crates

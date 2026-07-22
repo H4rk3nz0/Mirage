@@ -447,21 +447,28 @@ pub const PACE_ENV: &str = "MIRAGE_REALITY_PACE";
 pub const PACE_PROFILE_ENV: &str = "MIRAGE_REALITY_PACE_PROFILE";
 
 /// Config-set pacing, taking precedence over the env vars. A daemon calls
-/// [`set_pace_override`] once at startup (e.g. from a config field or paranoid mode)
-/// so pacing is config-driven without threading it through every carrier call site.
-static PACE_OVERRIDE: std::sync::OnceLock<(String, Option<String>)> = std::sync::OnceLock::new();
+/// [`set_pace_override`] at startup (config / paranoid mode) so pacing is config-driven
+/// without threading it through every carrier call site. It is UPDATABLE at runtime:
+/// the client's adaptive cover-class loop re-sets it per network as the bandit shifts
+/// classes (a new connection reads the current value), so the store is an `RwLock`.
+static PACE_OVERRIDE: std::sync::RwLock<Option<(String, Option<String>)>> =
+    std::sync::RwLock::new(None);
 
-/// Set the pacing mode (`video`/`browse`/`replay`) and optional replay profile path
-/// from config. Idempotent; the first call wins. Overrides [`PACE_ENV`] /
-/// [`PACE_PROFILE_ENV`]. Call once at daemon startup, before any Reality handshake.
+/// Set (or update) the pacing mode (`video`/`browse`/`replay`) and optional replay
+/// profile path. Overrides [`PACE_ENV`] / [`PACE_PROFILE_ENV`]. Safe to call repeatedly
+/// (last write wins); the value is read at each carrier handshake.
 pub fn set_pace_override(mode: impl Into<String>, profile: Option<String>) {
-    let _ = PACE_OVERRIDE.set((mode.into(), profile));
+    if let Ok(mut w) = PACE_OVERRIDE.write() {
+        *w = Some((mode.into(), profile));
+    }
 }
 
 /// Resolve (mode, profile) from the config override if set, else the env vars.
 fn pace_settings() -> (Option<String>, Option<String>) {
-    if let Some((m, p)) = PACE_OVERRIDE.get() {
-        return (Some(m.clone()), p.clone());
+    if let Ok(g) = PACE_OVERRIDE.read() {
+        if let Some((m, p)) = g.as_ref() {
+            return (Some(m.clone()), p.clone());
+        }
     }
     (
         std::env::var(PACE_ENV).ok(),
@@ -475,11 +482,37 @@ fn pace_settings() -> (Option<String>, Option<String>) {
 /// none qualify.
 const MIN_TRACE_BYTES: u64 = 64 * 1024;
 
+/// Traces chained per session. A single looped trace repeats every ~span seconds (a
+/// periodicity tell); chaining several draws a long, non-repeating envelope. Both ends
+/// derive the same order from the shared seed, so up/down stays coherent.
+const CHAIN_LEN: usize = 8;
+
+/// Deterministic index order for `n` items from `seed` (splitmix64 Fisher-Yates).
+/// Identical on both endpoints, so both build the same per-session chain.
+fn seeded_order(n: usize, seed: u64) -> Vec<usize> {
+    let mut s = seed;
+    let mut next = || {
+        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut v: Vec<usize> = (0..n).collect();
+    for i in (1..n).rev() {
+        let j = (next() % (i as u64 + 1)) as usize;
+        v.swap(i, j);
+    }
+    v
+}
+
 /// Resolve the replay profile path. A plain file is read directly. A DIRECTORY is a
-/// trace library: pick one of its `.csv` traces by the shared session `seed`, so both
-/// endpoints select the SAME trace (coherent up/down envelope) yet it varies per
-/// session - a diverse library never becomes a fixed signature. Volume-aware: prefer
-/// traces with real capacity so a short clip is not looped for a long session.
+/// trace library: per session, a seeded shuffle of up to [`CHAIN_LEN`] traces is
+/// concatenated into one long envelope, flow-tagged so [`crate::pacer::MeasuredProfile`]
+/// chains them in order. Both endpoints derive the SAME chain from the shared `seed`
+/// (coherent up/down) yet it varies per session - a diverse library never becomes a
+/// fixed signature, and no single clip loops. Volume-aware: prefer traces with real
+/// capacity so short clips are not the whole chain.
 fn read_profile(path: &str, seed: u64) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_dir() {
@@ -512,7 +545,30 @@ fn read_profile(path: &str, seed: u64) -> Option<String> {
     } else {
         big
     };
-    std::fs::read_to_string(pool[(seed as usize) % pool.len()]).ok()
+    // Chain a seeded shuffle of several traces, flow-tagging each row (flow id = chain
+    // position) so from_csv concatenates them in order rather than interleaving by time.
+    let mut out = String::new();
+    for (flow, &i) in seeded_order(pool.len(), seed)
+        .iter()
+        .take(CHAIN_LEN)
+        .enumerate()
+    {
+        let Ok(content) = std::fs::read_to_string(pool[i]) else {
+            continue;
+        };
+        for line in content.lines() {
+            let f: Vec<&str> = line.trim().split(',').collect();
+            if f.len() >= 3 {
+                let tail = &f[f.len() - 3..]; // t,size,dir (drop any pre-existing flow col)
+                out.push_str(&format!("{flow},{},{},{}\n", tail[0], tail[1], tail[2]));
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Read [`PACE_ENV`] and, if it selects a mode, wrap `stream` in an envelope pacer;
@@ -527,27 +583,48 @@ where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let seed = stream.pace_seed();
+    match pace_schedule(seed) {
+        Some(sched) => {
+            stream.set_passthrough(true);
+            MaybePaced::Paced(PacedChannel::spawn(stream, sched, dir))
+        }
+        None => MaybePaced::Plain(stream),
+    }
+}
+
+/// Build the pacing schedule for this session from the process-wide pace settings,
+/// or `None` if pacing is not configured (or a replay profile is missing/empty - the
+/// tunnel must never break over a config slip). `seed` MUST be identical on both
+/// endpoints so the up/down envelope stays coherent.
+pub fn pace_schedule(seed: u64) -> Option<ScheduleStream> {
     let (mode, profile) = pace_settings();
-    let sched = match mode.as_deref() {
-        Some(class @ ("video" | "dash" | "browse")) => {
-            ScheduleStream::new(CoverProcess::from_class_seed(class, seed), seed)
-        }
-        Some("replay") => {
-            // Load a real captured profile; fall back to Plain if it is missing or
-            // empty (never break the tunnel over a config slip). The path may be a
-            // single trace file OR a directory library - see [`read_profile`].
-            match profile
-                .and_then(|p| read_profile(&p, seed))
-                .and_then(|s| crate::pacer::MeasuredProfile::from_csv(&s))
-            {
-                Some(profile) => ScheduleStream::replay(std::sync::Arc::new(profile), seed),
-                None => return MaybePaced::Plain(stream),
-            }
-        }
-        _ => return MaybePaced::Plain(stream),
-    };
-    stream.set_passthrough(true);
-    MaybePaced::Paced(PacedChannel::spawn(stream, sched, dir))
+    match mode.as_deref() {
+        Some(class @ ("video" | "dash" | "browse")) => Some(ScheduleStream::new(
+            CoverProcess::from_class_seed(class, seed),
+            seed,
+        )),
+        // Path may be a single trace file OR a directory library - see [`read_profile`].
+        Some("replay") => profile
+            .and_then(|p| read_profile(&p, seed))
+            .and_then(|s| crate::pacer::MeasuredProfile::from_csv(&s))
+            .map(|prof| ScheduleStream::replay(std::sync::Arc::new(prof), seed)),
+        _ => None,
+    }
+}
+
+/// Wrap ANY carrier stream in the envelope pacer if pacing is configured. Unlike
+/// [`maybe_pace`], this does not toggle Reality record-passthrough: it is for carriers
+/// whose write path already emits one framing unit per write (e.g. SS-2022 seals each
+/// `poll_write` as one AEAD chunk), so one pump frame maps to one observable unit for
+/// free. `seed` MUST match on both endpoints.
+pub fn maybe_pace_stream<S>(stream: S, dir: Dir, seed: u64) -> MaybePaced<S>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    match pace_schedule(seed) {
+        Some(sched) => MaybePaced::Paced(PacedChannel::spawn(stream, sched, dir)),
+        None => MaybePaced::Plain(stream),
+    }
 }
 
 #[cfg(test)]
@@ -575,37 +652,70 @@ mod tests {
             let _ = tag;
         }
         let dir = base.to_str().unwrap();
-        // a directory picks a trace deterministically by seed, and different seeds
-        // can select different traces (a diverse library is used, not just one file).
-        let picks: std::collections::HashSet<String> =
-            (0u64..9).filter_map(|s| read_profile(dir, s)).collect();
-        assert!(picks.len() >= 2, "seeds select more than one library trace");
-        assert_eq!(
-            read_profile(dir, 3),
-            read_profile(dir, 3),
-            "same seed -> same trace (both ends agree)"
-        );
-        // a plain file is read verbatim
+        // a plain file is read verbatim (single specified trace, no chaining)
         let one = base.join("0.csv");
         assert_eq!(
             read_profile(one.to_str().unwrap(), 42).unwrap(),
             std::fs::read_to_string(&one).unwrap()
         );
-        // volume-aware: with a big trace present, the tiny ones are never selected
-        // (a short clip would loop -> periodicity). Both ends see the same sizes.
-        let mut big = String::from("flow,t,size,dir\n");
-        for i in 0..5000 {
-            big.push_str(&format!("0,{}.0,1400,1\n", i));
+
+        // Four big traces (each > MIN_TRACE_BYTES) with a distinct size marker, plus the
+        // tiny ones above. Chaining should draw only the big traces, several per session.
+        let big_trace = |marker: usize| {
+            let mut s = String::from("t,size,dir\n");
+            for i in 0..6000 {
+                s.push_str(&format!("{i}.0,{marker},1\n"));
+            }
+            assert!(s.len() as u64 > MIN_TRACE_BYTES);
+            s
+        };
+        for marker in [1401usize, 1402, 1403, 1404] {
+            std::fs::write(base.join(format!("big{marker}.csv")), big_trace(marker)).unwrap();
         }
-        assert!(big.len() as u64 > MIN_TRACE_BYTES);
-        std::fs::write(base.join("big.csv"), &big).unwrap();
-        for s in 0u64..20 {
-            assert_eq!(
-                read_profile(dir, s).unwrap(),
-                big,
-                "the substantial trace is always chosen over tiny clips"
+
+        let out = read_profile(dir, 3).unwrap();
+        let sizes: std::collections::HashSet<&str> =
+            out.lines().filter_map(|l| l.split(',').nth(2)).collect();
+        let flows: std::collections::HashSet<&str> =
+            out.lines().map(|l| l.split(',').next().unwrap()).collect();
+        // volume-aware: tiny traces (markers 100..102) never appear
+        for tiny in ["100", "101", "102"] {
+            assert!(
+                !sizes.contains(tiny),
+                "tiny clip {tiny} excluded from the chain"
             );
         }
+        // chaining: several big traces are concatenated (multiple markers + flow ids)
+        assert!(
+            ["1401", "1402", "1403", "1404"]
+                .iter()
+                .filter(|m| sizes.contains(**m))
+                .count()
+                >= 2,
+            "chain concatenates multiple traces"
+        );
+        assert!(
+            flows.contains("0") && flows.contains("1"),
+            "multiple chain positions"
+        );
+
+        // determinism (both ends agree) + per-session variation (order differs by seed)
+        assert_eq!(
+            read_profile(dir, 3),
+            read_profile(dir, 3),
+            "same seed -> same chain"
+        );
+        let variants: std::collections::HashSet<String> =
+            (0u64..20).filter_map(|s| read_profile(dir, s)).collect();
+        assert!(variants.len() >= 2, "different seeds -> different chains");
+
+        // the chained profile parses and spans longer than a single trace (no quick loop)
+        let chained = crate::pacer::MeasuredProfile::from_csv(&out).unwrap();
+        let single = crate::pacer::MeasuredProfile::from_csv(&big_trace(1401)).unwrap();
+        assert!(
+            chained.span > single.span,
+            "chaining extends the replay span"
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 

@@ -4626,6 +4626,13 @@ async fn establish_session(
             let c = mirage_transport_shadowsocks::ss2022_client_dial(bridge_sock, psk, timeout)
                 .await
                 .map_err(|e| format!("ss2022: {e}"))?;
+            // Proteus: pace the SS carrier to the shared envelope (matched to the bridge).
+            let seed = c.pace_seed();
+            let c = mirage_transport_reality::maybe_pace_stream(
+                c,
+                mirage_transport_reality::pacer::Dir::Up,
+                seed,
+            );
             finish_carrier(c, entry, client_sk, token, timeout).await
         }
         TransportMode::WebSocket { path } => {
@@ -5437,7 +5444,7 @@ async fn dial_with_sock(
 
     match &entry.transport {
         TransportMode::Ss2022 { psk } => {
-            let mut c = mirage_transport_shadowsocks::ss2022_client_dial(bridge_sock, psk, timeout)
+            let c = mirage_transport_shadowsocks::ss2022_client_dial(bridge_sock, psk, timeout)
                 .await
                 .map_err(|e| {
                     warn!(
@@ -5448,6 +5455,13 @@ async fn dial_with_sock(
                     );
                     format!("ss2022: {e}")
                 })?;
+            // Proteus: pace the SS carrier to the shared envelope (matched to the bridge).
+            let seed = c.pace_seed();
+            let mut c = mirage_transport_reality::maybe_pace_stream(
+                c,
+                mirage_transport_reality::pacer::Dir::Up,
+                seed,
+            );
             apply_vless_if_needed(&mut c, entry.vless_uuid, timeout).await?;
             let c = pad_stream_if_enabled(c, entry);
             let mut session = tokio::time::timeout(
@@ -6819,9 +6833,16 @@ async fn try_claim_entry(
         }
 
         TransportMode::Ss2022 { psk } => {
-            let mut c = mirage_transport_shadowsocks::ss2022_client_dial(bridge_sock, psk, timeout)
+            let c = mirage_transport_shadowsocks::ss2022_client_dial(bridge_sock, psk, timeout)
                 .await
                 .map_err(|e| format!("ss2022: {e}"))?;
+            // Proteus: pace the SS carrier to the shared envelope (matched to the bridge).
+            let seed = c.pace_seed();
+            let mut c = mirage_transport_reality::maybe_pace_stream(
+                c,
+                mirage_transport_reality::pacer::Dir::Up,
+                seed,
+            );
             apply_vless_if_needed(&mut c, entry.vless_uuid, timeout).await?;
             let c = pad_stream_if_enabled(c, entry);
             let mut s = tokio::time::timeout(
@@ -7073,9 +7094,16 @@ async fn try_refresh_entry(
         }
 
         TransportMode::Ss2022 { psk } => {
-            let mut c = mirage_transport_shadowsocks::ss2022_client_dial(bridge_sock, psk, timeout)
+            let c = mirage_transport_shadowsocks::ss2022_client_dial(bridge_sock, psk, timeout)
                 .await
                 .map_err(|e| format!("ss2022: {e}"))?;
+            // Proteus: pace the SS carrier to the shared envelope (matched to the bridge).
+            let seed = c.pace_seed();
+            let mut c = mirage_transport_reality::maybe_pace_stream(
+                c,
+                mirage_transport_reality::pacer::Dir::Up,
+                seed,
+            );
             apply_vless_if_needed(&mut c, entry.vless_uuid, timeout).await?;
             let c = pad_stream_if_enabled(c, entry);
             let mut s = tokio::time::timeout(

@@ -68,7 +68,8 @@ pub use carrier::{
 pub use cover_probe::{probe_cover_flight, CoverFlightProfile, DEFAULT_COVER_FLIGHT_WIRE_LEN};
 pub use error::RealityError;
 pub use paced::{
-    maybe_pace, set_pace_override, MaybePaced, PacedChannel, PACE_ENV, PACE_PROFILE_ENV,
+    maybe_pace, maybe_pace_stream, pace_schedule, set_pace_override, MaybePaced, PacedChannel,
+    PACE_ENV, PACE_PROFILE_ENV,
 };
 pub use pacer::{MeasuredProfile, ScheduleStream};
 pub use probe::{
