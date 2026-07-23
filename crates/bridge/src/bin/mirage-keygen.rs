@@ -67,6 +67,9 @@ struct Args {
     /// salt (producer forward secrecy). Opt-in: BOTH the publisher and clients
     /// must run a release that honours the flag, or discovery desyncs.
     forward_secret_rendezvous: bool,
+    /// Base64 ECHConfigList for the carrier front (CDN's DNS HTTPS value). Embedded in
+    /// the invite so clients use ECH on the carrier_tls handshake (encrypts the inner SNI).
+    ech_config: Option<String>,
     /// CDN front domain for Meek HTTP long-polling.  When set, the
     /// generated invite's `transport_caps` will include the MEEK bit
     /// and `--write-client-config` will include `meek_front_domain`.
@@ -102,6 +105,7 @@ fn parse_args() -> Args {
         vless: false,
         hysteria2: false,
         forward_secret_rendezvous: false,
+        ech_config: None,
         meek_front_domain: None,
         doh_front_domain: None,
         write_bridge_config: None,
@@ -152,6 +156,14 @@ fn parse_args() -> Args {
             }
             "--ss2022" => args.ss2022 = true,
             "--forward-secret-rendezvous" => args.forward_secret_rendezvous = true,
+            "--ech-config" => {
+                i += 1;
+                args.ech_config = Some(
+                    argv.get(i)
+                        .cloned()
+                        .unwrap_or_else(|| fatal("--ech-config needs a base64 ECHConfigList")),
+                );
+            }
             "--ws" => args.ws = true,
             "--vless" => args.vless = true,
             "--hysteria2" => args.hysteria2 = true,
@@ -484,6 +496,16 @@ fn main() {
     // the bridge re-derives the SAME value at runtime with no extra config.
     .with_probe_root(mirage_transport_reality::derive_probe_root(&bridge_x_sk))
     .with_fs_bootstrap_tokens(fs_tokens);
+    let invite = match &args.ech_config {
+        Some(b64) => {
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .unwrap_or_else(|e| fatal(&format!("--ech-config: invalid base64: {e}")));
+            invite.with_ech_config(bytes)
+        }
+        None => invite,
+    };
     let invite = if args.forward_secret_rendezvous {
         invite.with_forward_secret_rendezvous()
     } else {

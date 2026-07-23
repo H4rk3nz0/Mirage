@@ -39,6 +39,61 @@ fn flush() {
     std::io::stdout().flush().expect("stdout flush");
 }
 
+// -- Presentation: colour + banner ---------------------------------------------
+
+/// ANSI colour is used only to give the wizard a little identity (banner, step
+/// headers, ok/warn markers). It is suppressed when stdout is not a TTY (piped
+/// to a file, captured by another tool) or when NO_COLOR is set, so scripted
+/// runs and non-ANSI terminals stay clean.
+fn colour_on() -> bool {
+    use std::io::IsTerminal;
+    std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+}
+
+/// Wrap `s` in an ANSI SGR sequence when colour is enabled, else return it bare.
+fn paint(s: &str, code: &str) -> String {
+    if colour_on() {
+        format!("\x1b[{code}m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+// The Mirage palette, as 256-colour ANSI codes: azure (primary), violet (echo),
+// teal (ok), amber (caution), slate (muted).
+const C_AZURE: &str = "38;5;75";
+const C_VIOLET: &str = "38;5;141";
+const C_CREST: &str = "38;5;111";
+const C_TEAL: &str = "38;5;43";
+const C_AMBER: &str = "38;5;179";
+const C_SLATE: &str = "38;5;103";
+const C_TITLE: &str = "1;38;5;189";
+
+/// The Mirage identity banner: a peak on the horizon and its refracted mirage
+/// echo, matching the logo. ASCII-only so it renders on every terminal.
+fn banner() {
+    println!();
+    println!("      {}", paint("/\\", C_CREST));
+    println!("     {}", paint("/  \\", C_CREST));
+    println!(
+        "    {}      {}",
+        paint("/____\\", C_VIOLET),
+        paint("M I R A G E", C_TITLE)
+    );
+    println!(
+        "   {}    {}",
+        paint("~~~~~~~~", C_AZURE),
+        paint("censorship-resistance framework", C_SLATE)
+    );
+    println!("    {}", paint("\\    /", "38;5;60"));
+    println!(
+        "     {}     {}",
+        paint("\\  /", "38;5;60"),
+        paint("Don't be invisible. Be uninteresting.", C_SLATE)
+    );
+    println!("      {}", paint("\\/", "38;5;60"));
+}
+
 /// Print `question [default]: `, read a line.  Returns default if blank.
 /// On EOF prints "\nAborted." and exits 1.
 fn prompt_str(question: &str, default: &str) -> String {
@@ -144,18 +199,22 @@ const RULE: &str = "------------------------------------------------------------
 /// A numbered step header, so the operator always knows where they are.
 fn section(step: u8, total: u8, title: &str) {
     println!();
-    println!("{RULE}");
-    println!("  Step {step}/{total} - {title}");
-    println!("{RULE}");
+    println!("{}", paint(RULE, C_SLATE));
+    println!(
+        "  {}  {}",
+        paint(&format!("Step {step}/{total}"), C_AZURE),
+        paint(title, C_TITLE)
+    );
+    println!("{}", paint(RULE, C_SLATE));
 }
 
 /// An indented explanatory line. Used to say WHY a question is being asked.
 fn note(msg: &str) {
-    println!("  * {msg}");
+    println!("  {} {msg}", paint("*", C_SLATE));
 }
 
 fn warn_line(msg: &str) {
-    println!("  ! {msg}");
+    println!("  {} {msg}", paint("!", C_AMBER));
 }
 
 /// Front-parity vetting (H2): actively probe the chosen Reality cover so a
@@ -204,7 +263,7 @@ fn vet_reality_cover(cover: &str) {
 }
 
 fn ok_line(msg: &str) {
-    println!("  (ok) {msg}");
+    println!("  {} {msg}", paint("(ok)", C_TEAL));
 }
 
 // -- Deployment profiles ------------------------------------------------------
@@ -1064,8 +1123,8 @@ fn print_summary(
 ) {
     let sep = "-".repeat(57);
     println!();
-    println!("{sep}");
-    println!("  Mirage deployment configured.");
+    println!("{}", paint(&sep, C_SLATE));
+    println!("  {}", paint("Mirage deployment configured.", "1;38;5;43"));
     println!();
     println!("  Bridge:     {bind}  (public: {public_addr})");
     let t_list = transports.join(", ");
@@ -1112,7 +1171,37 @@ fn print_summary(
         );
         println!("    Add --daemon to keep republishing on every epoch boundary (~1 h).");
     }
-    println!("{sep}");
+
+    // A crisp, ordered checklist so the operator knows exactly what to do next.
+    println!();
+    println!("  {}", paint("Next steps:", C_TITLE));
+    let mut step = 1u8;
+    if let Some(bp) = bridge_path {
+        println!(
+            "  {}. Copy {bp} to your server and start it:  {}",
+            step,
+            paint(&format!("mirage-bridge {bp}"), C_AZURE)
+        );
+        step += 1;
+    }
+    if !publish_relay_urls.is_empty() || dht_enabled {
+        println!(
+            "  {step}. Run the {} command above on your workstation to announce the bridge.",
+            paint("mirage-publish", C_AZURE)
+        );
+    } else {
+        println!(
+            "  {step}. Publish an announcement ({} above) so clients can find the bridge.",
+            paint("mirage-publish", C_AZURE)
+        );
+    }
+    step += 1;
+    println!(
+        "  {step}. Share the invite with users: run {}, or paste it into the GUI.",
+        paint("mirage-client <invite>", C_AZURE)
+    );
+
+    println!("{}", paint(&sep, C_SLATE));
 }
 
 // -- Write helper --------------------------------------------------------------
@@ -1654,10 +1743,15 @@ fn main() {
         std::process::exit(2);
     }
 
+    banner();
     println!();
-    println!("Welcome to Mirage setup. Press Ctrl+C at any time to abort.");
+    println!("  This wizard writes ready-to-run config and prints the exact commands to");
+    println!(
+        "  deploy. It never phones home. {}",
+        paint("Press Ctrl+C at any time to abort.", C_SLATE)
+    );
     println!();
-    println!("Setup type:");
+    println!("  {}", paint("What are you setting up?", C_TITLE));
     println!("  1. New deployment  - generate bridge.json + client.json");
     println!("  2. Bridge only     - generate bridge.json (you already have a client)");
     println!("  3. Client only     - generate client.json (you have an invite URL)");

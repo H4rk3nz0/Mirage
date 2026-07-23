@@ -156,6 +156,17 @@ pub const INVITE_EXT_FS_BOOTSTRAP_TOKENS: u8 = 0x08;
 /// escalation for the QUIC obfs key.
 pub const INVITE_EXT_REALITY_PROBE_ROOT: u8 = 0x09;
 
+/// Extension type: a CDN's ECHConfigList (variable-length raw bytes, e.g. the value
+/// from the front's DNS HTTPS record). When present, the client uses ECH (RFC 9180) on
+/// the `carrier_tls` handshake, so the real inner SNI is encrypted and a censor sees only
+/// the CDN's outer public name. Absent = no ECH (backward-compatible). Bounded by
+/// [`MAX_ECH_CONFIG_BYTES`].
+pub const INVITE_EXT_ECH_CONFIG: u8 = 0x0a;
+
+/// Sanity cap on the ECHConfigList carried in an invite. Real lists are ~100-300 bytes;
+/// this bounds a forged invite's parse/memory while staying well inside a plausible size.
+pub const MAX_ECH_CONFIG_BYTES: usize = 1024;
+
 /// Extension type: 32-byte Ed25519 mother-key public key.
 /// When present, clients MAY
 /// accept rotation announcements (`doc_type = 0x41`) signed by this
@@ -296,6 +307,9 @@ pub struct MasterInvite {
     /// (backward-compatible with pre-extension invites). See
     /// [`INVITE_EXT_REALITY_PROBE_ROOT`].
     pub probe_root: Option<[u8; 32]>,
+    /// A CDN's ECHConfigList (`INVITE_EXT_ECH_CONFIG`). When set, the client uses ECH on
+    /// the `carrier_tls` (meek/DoH/WS) handshake to encrypt the inner SNI. `None` = no ECH.
+    pub ech_config_list: Option<Vec<u8>>,
     /// Forward-secret rendezvous flag (`INVITE_EXT_FORWARD_SECRET_RENDEZVOUS`).
     /// When `true`, the client + operator derive per-epoch discovery keys from
     /// the one-way [`crate::ratchet`] chain anchored at [`Self::issued_at`]'s
@@ -428,6 +442,7 @@ impl MasterInvite {
             port_hop,
             obfs_secret: None,
             probe_root: None,
+            ech_config_list: None,
             forward_secret_rendezvous: false,
             fs_bootstrap_tokens: Vec::new(),
         })
@@ -451,6 +466,17 @@ impl MasterInvite {
     #[must_use]
     pub fn with_probe_root(mut self, root: [u8; 32]) -> Self {
         self.probe_root = Some(root);
+        self
+    }
+
+    /// Attach a CDN's ECHConfigList (`INVITE_EXT_ECH_CONFIG`) so invited clients use ECH
+    /// on the `carrier_tls` handshake. Silently ignored if longer than
+    /// [`MAX_ECH_CONFIG_BYTES`] (a real list is far smaller).
+    #[must_use]
+    pub fn with_ech_config(mut self, ech_config_list: Vec<u8>) -> Self {
+        if ech_config_list.len() <= MAX_ECH_CONFIG_BYTES {
+            self.ech_config_list = Some(ech_config_list);
+        }
         self
     }
 
@@ -556,6 +582,13 @@ impl MasterInvite {
             out.push(INVITE_EXT_REALITY_PROBE_ROOT);
             out.extend_from_slice(&(32u16).to_be_bytes());
             out.extend_from_slice(root);
+        }
+        if let Some(list) = &self.ech_config_list {
+            if list.len() <= MAX_ECH_CONFIG_BYTES {
+                out.push(INVITE_EXT_ECH_CONFIG);
+                out.extend_from_slice(&(list.len() as u16).to_be_bytes());
+                out.extend_from_slice(list);
+            }
         }
         if self.forward_secret_rendezvous {
             out.push(INVITE_EXT_FORWARD_SECRET_RENDEZVOUS);
@@ -690,6 +723,7 @@ impl MasterInvite {
         let mut port_hop: Option<(u16, u16)> = None;
         let mut obfs_secret: Option<[u8; 32]> = None;
         let mut probe_root: Option<[u8; 32]> = None;
+        let mut ech_config_list: Option<Vec<u8>> = None;
         let mut forward_secret_rendezvous = false;
         let mut fs_bootstrap_tokens: Vec<FsCapabilityToken> = Vec::new();
         let mut i = 0usize;
@@ -769,6 +803,13 @@ impl MasterInvite {
                     let mut root = [0u8; 32];
                     root.copy_from_slice(val);
                     probe_root = Some(root);
+                }
+                INVITE_EXT_ECH_CONFIG => {
+                    if ext_len == 0 || ext_len > MAX_ECH_CONFIG_BYTES {
+                        shared_salt_raw.zeroize();
+                        return Err(DiscoveryError::Wire("invite: ech_config length"));
+                    }
+                    ech_config_list = Some(val.to_vec());
                 }
                 INVITE_EXT_FORWARD_SECRET_RENDEZVOUS => {
                     if ext_len != 0 {
@@ -853,6 +894,7 @@ impl MasterInvite {
             port_hop,
             obfs_secret,
             probe_root,
+            ech_config_list,
             forward_secret_rendezvous,
             fs_bootstrap_tokens,
         };
@@ -1289,6 +1331,24 @@ mod tests {
         let text = inv.encode_text();
         let back_text = MasterInvite::decode_text(&text).unwrap();
         assert_eq!(back_text.probe_root, Some(root));
+    }
+
+    #[test]
+    fn ech_config_roundtrip() {
+        // A variable-length ECHConfigList encodes as ext 0x0a, decodes verbatim, and
+        // survives the text (mirage://) round-trip. Absent -> None (backward-compatible).
+        let ech: Vec<u8> = (0..200u16).map(|i| (i % 251) as u8).collect();
+        let inv = sample_invite().with_ech_config(ech.clone());
+        let back = MasterInvite::decode(&inv.encode()).unwrap();
+        assert_eq!(back.ech_config_list, Some(ech.clone()));
+        let back_text = MasterInvite::decode_text(&inv.encode_text()).unwrap();
+        assert_eq!(back_text.ech_config_list, Some(ech));
+        assert_eq!(
+            MasterInvite::decode(&sample_invite().encode())
+                .unwrap()
+                .ech_config_list,
+            None
+        );
     }
 
     #[test]

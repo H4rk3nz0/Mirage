@@ -3,116 +3,241 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mirage Bridge — Admin</title>
+<title>Mirage Bridge - Admin</title>
 <style>
   :root{
-    --bg:#0b0f14; --card:#131a22; --card2:#0f151c; --line:#1e2833;
-    --accent:#10b981; --accent-d:#0d9268; --text:#e5edf5; --muted:#7d8896;
-    --danger:#ef4444; --warn:#eab308; --input:#0f151c;
+    --bg:#0b1220; --bg-2:#0e1626; --surface:#131d2e; --surface-2:#0f1826;
+    --line:#213045; --line-2:#2b3d55;
+    --text:#e9eff8; --text-dim:#b7c3d4; --muted:#8494ab;
+    --azure:#4f9fe6; --azure-bright:#62b0f2; --violet:#9385f2;
+    --ok:#33c8ac; --warn:#e4a94a; --down:#e86a72;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    --refract:linear-gradient(135deg,var(--azure-bright) 0%,var(--violet) 100%);
+    --r:14px; --r-sm:9px;
   }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--text);
-    font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-  a{color:var(--accent)}
-  .wrap{max-width:960px;margin:0 auto;padding:20px}
-  header{display:flex;align-items:center;gap:12px;margin-bottom:18px}
-  header h1{font-size:20px;font-weight:800;margin:0}
-  header .sub{color:var(--muted);font-size:12px}
-  .dot{width:11px;height:11px;border-radius:50%;background:#3a4653;flex:0 0 auto}
-  .dot.up{background:var(--accent)} .dot.down{background:var(--danger)}
-  .grow{flex:1}
-  button{font:inherit;border:0;border-radius:8px;padding:9px 14px;cursor:pointer;
-    background:#26313d;color:var(--text)}
-  button.primary{background:var(--accent);color:#04120c;font-weight:700}
-  button.primary:hover{background:var(--accent-d)}
-  button.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}
-  button:disabled{opacity:.5;cursor:not-allowed}
-  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px}
-  .card{background:var(--card);border-radius:12px;padding:14px}
-  .card .k{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
-  .card .v{font-size:24px;font-weight:700;margin-top:4px}
-  .card .v.small{font-size:15px;font-weight:600}
-  .panel{background:var(--card);border-radius:12px;padding:18px;margin-top:16px}
-  .panel h2{font-size:14px;margin:0 0 12px}
-  .bars{display:flex;flex-direction:column;gap:6px}
-  .bar{display:flex;align-items:center;gap:8px;font-size:12px}
-  .bar .lbl{width:90px;color:var(--muted)} .bar .track{flex:1;height:8px;background:var(--card2);border-radius:4px;overflow:hidden}
-  .bar .fill{height:100%;background:var(--accent)} .bar .n{width:52px;text-align:right}
-  .section{border:1px solid var(--line);border-radius:10px;margin-bottom:10px;overflow:hidden}
-  .section>summary{padding:11px 14px;cursor:pointer;font-weight:600;background:var(--card2);
-    list-style:none;display:flex;align-items:center;gap:8px}
-  .section>summary::-webkit-details-marker{display:none}
-  .section .fields{padding:8px 14px 14px}
-  .field{display:grid;grid-template-columns:220px 1fr;gap:10px;align-items:center;padding:7px 0;
-    border-top:1px solid var(--line)}
-  .field:first-child{border-top:0}
-  .field label{color:var(--text);font-size:13px}
-  .field label .key{color:var(--muted);font-size:11px;display:block;font-family:ui-monospace,monospace}
-  .field .help{color:var(--muted);font-size:11px;grid-column:1/-1;margin-top:-4px}
-  .field.danger label{color:var(--warn)}
-  input[type=text],input[type=number],textarea,select{width:100%;background:var(--input);
-    border:1px solid var(--line);border-radius:7px;color:var(--text);padding:8px;font:inherit}
-  textarea{font-family:ui-monospace,monospace;font-size:12px;min-height:80px;resize:vertical}
-  input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent)}
-  .row{display:flex;gap:8px;align-items:center}
-  .secret{display:flex;gap:8px;align-items:center;color:var(--muted);font-size:12px}
-  .pill{font-size:11px;font-weight:700;padding:3px 8px;border-radius:6px;background:#0f151c;color:var(--muted)}
-  .pill.on{color:var(--accent)} .pill.off{color:var(--muted)}
-  #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
-    background:#1a232e;border:1px solid var(--line);border-radius:9px;padding:11px 16px;
-    opacity:0;transition:opacity .2s;pointer-events:none;max-width:90%}
-  #toast.show{opacity:1}
-  #toast.err{border-color:#7f1d1d;color:#fca5a5}
-  #toast.ok{border-color:var(--accent-d);color:var(--accent)}
-  #gate{max-width:420px;margin:80px auto;text-align:center}
-  #gate input{margin:14px 0;text-align:center}
-  .foot{color:var(--muted);font-size:11px;text-align:center;margin-top:20px}
-  .rawwrap summary{color:var(--muted)}
+  html,body{margin:0}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:15px;line-height:1.5;
+    -webkit-font-smoothing:antialiased;min-height:100vh;
+    background-image:radial-gradient(900px 500px at 82% -10%, rgba(79,159,230,.09), transparent 60%),
+      radial-gradient(700px 460px at 6% 2%, rgba(147,133,242,.06), transparent 55%);
+    background-attachment:fixed;}
+  a{color:var(--azure)}
+  .mono{font-family:var(--mono)}
+  .dim{color:var(--muted)}
+  .wrap{max-width:1020px;margin:0 auto;padding:22px 20px 60px}
+
+  /* ---- gate ---- */
+  #gate{max-width:400px;margin:16vh auto;text-align:center;padding:34px 30px;
+    background:var(--surface);border:1px solid var(--line);border-radius:18px}
+  #gate .lockup{justify-content:center;margin-bottom:20px}
+  #gate h1{font:650 19px/1.2 var(--sans);margin:0 0 6px}
+  #gate p{color:var(--muted);font-size:13px;margin:0 0 18px}
+  #gate input{width:100%;background:var(--surface-2);border:1px solid var(--line);border-radius:9px;
+    color:var(--text);padding:11px 12px;font:500 13px/1 var(--mono);margin-bottom:12px}
+  #gate input:focus{outline:none;border-color:var(--azure)}
+
+  /* ---- logo + wordmark ---- */
+  .lockup{display:flex;align-items:center;gap:11px}
+  .wordmark{font:650 17px/1 var(--sans);letter-spacing:.24em;padding-left:.24em;color:var(--text)}
+  .wordmark .tag{font:500 11px/1 var(--mono);letter-spacing:.16em;color:var(--muted);margin-left:3px}
+
+  /* ---- topbar ---- */
+  .topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;
+    padding:15px 20px;border:1px solid var(--line);border-radius:16px;background:var(--surface-2);margin-bottom:16px}
+  .topbar .right{display:flex;align-items:center;gap:12px}
+  .idpill{display:flex;align-items:center;gap:9px;font:500 12px/1 var(--mono);color:var(--muted);
+    background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:8px 13px}
+  .idpill .sd{width:8px;height:8px;border-radius:50%;background:var(--muted);flex:0 0 auto}
+  .idpill.up .sd{background:var(--ok);box-shadow:0 0 8px 1px rgba(51,200,172,.5)}
+  .idpill.down .sd{background:var(--down)}
+  .idpill .pk{color:var(--text-dim)}
+  .btn{font:600 13px/1 var(--sans);border:1px solid var(--line-2);background:var(--surface);color:var(--text-dim);
+    border-radius:9px;padding:9px 15px;cursor:pointer;transition:.15s}
+  .btn:hover{border-color:var(--azure);color:var(--text)}
+  .btn:disabled{opacity:.55;cursor:default}
+  .btn.primary{background:var(--azure);border-color:var(--azure);color:#06121f;font-weight:700}
+  .btn.primary:hover{background:var(--azure-bright)}
+  .btn.small{padding:6px 11px;font-size:12px}
+  .btn.ghost{background:transparent}
+
+  /* ---- status hero ---- */
+  .status{display:grid;grid-template-columns:1.5fr 1fr;gap:14px}
+  .statcard{position:relative;overflow:hidden;background:
+      radial-gradient(560px 200px at 10% -30%, rgba(51,200,172,.09), transparent 60%),var(--surface);
+    border:1px solid var(--line);border-radius:var(--r);padding:20px 22px}
+  .statcard .state{display:flex;align-items:center;gap:11px}
+  .heart{width:11px;height:11px;border-radius:50%;background:var(--ok);animation:pulse 2.6s infinite}
+  .heart.down{background:var(--down);animation:none}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(51,200,172,.45)}70%{box-shadow:0 0 0 9px rgba(51,200,172,0)}100%{box-shadow:0 0 0 0 rgba(51,200,172,0)}}
+  .statcard .state .lbl{font-size:15px;font-weight:600}
+  .statcard .addr{font:500 12.5px/1.5 var(--mono);color:var(--text-dim);margin-top:11px}
+  .statcard .grid{display:flex;gap:34px;margin-top:18px}
+  .statcard .grid .m .n{font:650 30px/1 var(--sans);font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+  .statcard .grid .m .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-top:6px}
+  .spark{margin-top:16px}
+  .rcard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:18px 20px;display:flex;flex-direction:column;gap:13px;justify-content:center}
+  .rcard h3{margin:0 0 2px;font:600 10px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+  .rrow{display:flex;align-items:baseline;justify-content:space-between}
+  .rrow .k{font:500 12px/1 var(--mono);color:var(--muted)}
+  .rrow .v{font:650 18px/1 var(--sans);font-variant-numeric:tabular-nums}
+  .rrow .v.ok{color:var(--ok)}
+
+  /* ---- metric strip ---- */
+  .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:14px}
+  .metric{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:14px 16px}
+  .metric .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+  .metric .n{font:650 24px/1.1 var(--sans);font-variant-numeric:tabular-nums;margin-top:8px}
+  .metric .d{font:500 11px/1 var(--mono);margin-top:6px;color:var(--muted)}
+  .metric .d.good{color:var(--ok)} .metric .d.warn{color:var(--warn)}
+
+  /* ---- panels ---- */
+  .panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:18px 20px;margin-top:16px}
+  .panel>h2{margin:0;font:600 13px/1 var(--sans);text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+  .thead{display:grid;grid-template-columns:1fr 90px;gap:16px;margin-top:14px;padding-bottom:2px;
+    font:600 10px/1 var(--mono);letter-spacing:.1em;color:var(--muted);text-transform:uppercase}
+  .trow{display:grid;grid-template-columns:130px 1fr 56px;gap:16px;align-items:center;padding:11px 0;border-top:1px solid var(--line)}
+  .trow .name{font:600 13.5px/1.3 var(--sans)}
+  .trow .track{height:6px;background:var(--surface-2);border-radius:3px;overflow:hidden}
+  .trow .fill{height:100%;background:var(--refract);border-radius:3px}
+  .trow .num{font:600 13px/1 var(--mono);text-align:right;font-variant-numeric:tabular-nums}
+
+  /* ---- config ---- */
+  .cfghead{display:flex;align-items:center;justify-content:space-between;margin:24px 2px 4px}
+  .cfghead h2{margin:0;font:600 13px/1 var(--sans);text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+  .cfghead .path{font:500 11px/1 var(--mono);color:var(--muted)}
+  details.section{margin-top:10px}
+  details.section>summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;
+    padding:13px 17px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);font-weight:600;font-size:14px}
+  details.section>summary::-webkit-details-marker{display:none}
+  details.section>summary .chev{color:var(--muted);font-family:var(--mono);transition:.2s}
+  details.section[open]>summary .chev{transform:rotate(90deg);color:var(--azure)}
+  details.section>summary .cnt{color:var(--muted);font-weight:400;font-size:12px}
+  details.section .fields{padding:6px 17px 14px;border:1px solid var(--line);border-top:none;border-radius:0 0 var(--r-sm) var(--r-sm)}
+  .field{display:grid;grid-template-columns:1fr minmax(230px,auto);gap:6px 16px;align-items:center;padding:11px 0;border-bottom:1px solid var(--line)}
+  .field:last-child{border-bottom:none}
+  .field>.lab{font-size:13.5px}
+  .field>.lab .key{display:block;font:500 11px/1.5 var(--mono);color:var(--muted)}
+  .field .help{grid-column:1/-1;font-size:11.5px;color:var(--muted);margin-top:-2px}
+  .field.danger>.lab{color:var(--warn)}
+  .field input[type=text],.field input[type=number],.field textarea{width:100%;background:var(--surface-2);
+    border:1px solid var(--line);border-radius:7px;color:var(--text);padding:8px 10px;font:500 13px/1.3 var(--mono)}
+  .field input:focus,.field textarea:focus{outline:none;border-color:var(--azure)}
+  .field textarea{font-size:12px;min-height:78px;resize:vertical}
+  .secret{display:flex;align-items:center;gap:9px}
+  .secret input{flex:1}
+  .pill{font:700 10px/1 var(--mono);padding:4px 9px;border-radius:6px;letter-spacing:.04em}
+  .pill.on{color:var(--ok);background:rgba(51,200,172,.1)}
+  .pill.off{color:var(--muted);background:var(--surface-2)}
+  /* toggle */
+  .toggle{width:42px;height:24px;border-radius:999px;background:var(--surface-2);border:1px solid var(--line);position:relative;cursor:pointer;justify-self:end}
+  .toggle.on{background:var(--azure);border-color:var(--azure)}
+  .toggle i{position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;transition:.18s}
+  .toggle.on i{left:20px}
+  .rawwrap{margin-top:12px}
+  .rawwrap summary{color:var(--muted);cursor:pointer;font-size:12px;padding:6px 2px}
+  .rawwrap textarea{width:100%;background:var(--surface-2);border:1px solid var(--line);border-radius:9px;
+    color:var(--text);padding:11px;font:500 12px/1.5 var(--mono);min-height:220px;resize:vertical;margin-top:6px}
+
+  .savebar{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:18px;
+    padding:14px 18px;background:var(--surface-2);border:1px solid var(--line-2);border-radius:var(--r);position:sticky;bottom:14px}
+  .savebar .note{font-size:12.5px;color:var(--muted)}
+  .savebar .note b{color:var(--text-dim)}
+
+  .foot{color:var(--muted);font-size:12px;text-align:center;margin-top:26px;display:flex;align-items:center;justify-content:center;gap:8px}
+
+  /* toast */
+  #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(30px);opacity:0;
+    background:var(--surface);border:1px solid var(--line-2);border-radius:11px;padding:12px 18px;
+    font:500 13px/1 var(--sans);color:var(--text);transition:.22s;pointer-events:none;max-width:90vw}
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  #toast.ok{border-color:var(--ok);color:var(--ok)}
+  #toast.err{border-color:var(--down);color:var(--down)}
+
+  @media(max-width:720px){.status,.metrics{grid-template-columns:1fr}.metrics{grid-template-columns:1fr 1fr}
+    .field{grid-template-columns:1fr}.wrap{padding:16px 14px 50px}}
 </style>
 </head>
 <body>
+
+<!-- refraction gradient defs (used by the mark) -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <linearGradient id="refract" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#62b0f2"/><stop offset="1" stop-color="#9385f2"/></linearGradient>
+  <linearGradient id="echo" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#9385f2" stop-opacity=".55"/><stop offset="1" stop-color="#9385f2" stop-opacity="0"/></linearGradient>
+</defs></svg>
+
 <div id="gate" style="display:none">
-  <h1>Mirage Bridge Admin</h1>
-  <p class="sub" style="color:var(--muted)">Paste the access token printed on the bridge console.</p>
-  <input id="gate-token" type="text" placeholder="token" autocomplete="off">
-  <button class="primary" onclick="saveToken()">Unlock</button>
+  <div class="lockup">
+    <svg width="34" height="34" viewBox="0 0 48 48" fill="none"><path d="M24 9 L40 31 H8 Z" fill="url(#refract)"/><rect x="7" y="30.4" width="34" height="2" rx="1" fill="#4f9fe6" opacity=".55"/><path d="M24 45 L37 34 H11 Z" fill="url(#echo)"/></svg>
+    <div class="wordmark">MIRAGE</div>
+  </div>
+  <h1>Bridge admin</h1>
+  <p>Paste the one-time access token printed on the bridge console.</p>
+  <input id="gate-token" type="text" placeholder="access token" autocomplete="off" spellcheck="false">
+  <button class="btn primary" style="width:100%" onclick="saveToken()">Unlock</button>
 </div>
 
 <div class="wrap" id="app" style="display:none">
-  <header>
-    <span class="dot" id="dot"></span>
-    <div>
-      <h1>Mirage Bridge</h1>
-      <div class="sub" id="subtitle">connecting…</div>
+  <div class="topbar">
+    <div class="lockup">
+      <svg width="30" height="30" viewBox="0 0 48 48" fill="none"><path d="M24 9 L40 31 H8 Z" fill="url(#refract)"/><rect x="7" y="30.4" width="34" height="2" rx="1" fill="#4f9fe6" opacity=".55"/><path d="M24 45 L37 34 H11 Z" fill="url(#echo)"/></svg>
+      <div class="wordmark">MIRAGE<span class="tag">bridge</span></div>
     </div>
-    <span class="grow"></span>
-    <button class="ghost" onclick="refresh()">Refresh</button>
-    <button class="primary" id="restartBtn" onclick="restart()">Restart bridge</button>
-  </header>
-
-  <div class="cards" id="stats"></div>
-
-  <div class="panel">
-    <h2>Sessions by transport</h2>
-    <div class="bars" id="transports"><div class="sub" style="color:var(--muted)">no sessions yet</div></div>
-  </div>
-
-  <div class="panel">
-    <div class="row"><h2 style="margin:0">Configuration</h2><span class="grow"></span>
-      <span class="sub" id="cfgpath" style="color:var(--muted);font-size:11px"></span></div>
-    <div id="form"></div>
-    <details class="section rawwrap" style="margin-top:12px">
-      <summary>Advanced — raw JSON (secrets masked)</summary>
-      <div class="fields"><textarea id="raw" style="min-height:220px"></textarea>
-        <div class="help" style="color:var(--muted)">Edits here override the form on Save. Masked secrets are preserved.</div></div>
-    </details>
-    <div class="row" style="margin-top:14px">
-      <button class="primary" onclick="save()">Save config</button>
-      <span class="sub" style="color:var(--muted);font-size:12px">Changes apply after a restart.</span>
+    <div class="right">
+      <div class="idpill" id="idpill"><span class="sd"></span><span class="pk" id="idpk">connecting</span></div>
+      <button class="btn small ghost" onclick="refresh()">Refresh</button>
+      <button class="btn small primary" id="restartBtn" onclick="restart()">Restart service</button>
     </div>
   </div>
 
-  <div class="foot" id="foot"></div>
+  <div class="status">
+    <div class="statcard">
+      <div class="state"><span class="heart" id="heart"></span><span class="lbl" id="stateLbl">connecting</span></div>
+      <div class="addr" id="stateAddr"></div>
+      <div class="grid">
+        <div class="m"><div class="n" id="mActive">0</div><div class="k">active</div></div>
+        <div class="m"><div class="n" id="mAccepted">0</div><div class="k">accepted</div></div>
+        <div class="m"><div class="n" id="mUptime">-</div><div class="k">uptime</div></div>
+      </div>
+      <div class="spark"><svg id="spark" width="100%" height="42" viewBox="0 0 320 42" preserveAspectRatio="none"></svg></div>
+    </div>
+    <div class="rcard">
+      <h3>Reality carrier</h3>
+      <div class="rrow"><span class="k">authenticated</span><span class="v ok" id="rAuth">0</span></div>
+      <div class="rrow"><span class="k">cover served</span><span class="v" id="rCover">0</span></div>
+      <div class="rrow"><span class="k">handshake fail</span><span class="v" id="rFail">0</span></div>
+    </div>
+  </div>
+
+  <div class="metrics" id="metrics"></div>
+
+  <div class="panel">
+    <h2>Sessions by carrier</h2>
+    <div class="thead"><span>Carrier</span><span style="text-align:right">Sessions</span></div>
+    <div id="transports"><div class="dim" style="padding:12px 0;font-size:13px">no sessions yet</div></div>
+  </div>
+
+  <div class="cfghead"><h2>Configuration</h2><span class="path mono" id="cfgpath"></span></div>
+  <div id="form"></div>
+  <details class="section rawwrap">
+    <summary>Advanced - raw JSON (secrets masked)</summary>
+    <textarea id="raw"></textarea>
+    <div class="help dim" style="margin-top:4px">Edits here override the form on Save. Masked secrets are preserved.</div>
+  </details>
+
+  <div class="savebar">
+    <div class="note"><b id="saveNote">Secrets you don't retype are preserved.</b> Saving writes <span class="mono">bridge.json</span> atomically (0600); changes apply on restart.</div>
+    <div style="display:flex;gap:10px">
+      <button class="btn" onclick="loadConfig()">Reload</button>
+      <button class="btn primary" onclick="save()">Save config</button>
+    </div>
+  </div>
+
+  <div class="foot">
+    <svg width="18" height="18" viewBox="0 0 48 48" fill="none"><path d="M24 9 L40 31 H8 Z" fill="url(#refract)"/><path d="M24 45 L37 34 H11 Z" fill="url(#echo)"/></svg>
+    <span id="foot"></span>
+  </div>
 </div>
 
 <div id="toast"></div>
@@ -124,6 +249,7 @@ let TOKEN = null;
 let MODEL = {};        // current config object (secrets masked)
 let TYPES = {};        // key -> original JS type for coercion
 let SECRETS = {};      // key -> present:bool
+const HIST = [];       // rolling active-session history for the sparkline
 
 // ---- known-key metadata (label/help/section/danger). Unknown keys still render. ----
 const META = {
@@ -136,35 +262,41 @@ const META = {
   reality_cover_addrs:{s:"Reality",h:"Real HTTPS site(s) the bridge fronts."},
   reality_tls_mode:{s:"Reality",h:"ephemeral | pinned | borrow (cover-cert parity)."},
   reality_probe_accept_legacy:{s:"Reality",d:1,h:"Accept pre-epoch-MAC probes (keep off unless mid-migration)."},
+  reality_pace_profile:{s:"Reality",h:"Proteus replay library dir (paranoid mode); a class subdir like library/video."},
+  paranoid:{s:"Reality",h:"One switch: Reality + padding + fail-closed + Proteus replay pacing."},
   hysteria2_enabled:{s:"Hysteria2 / QUIC",h:"Enable the Hysteria2 QUIC carrier."},
   hysteria2_bind:{s:"Hysteria2 / QUIC",h:"UDP listener (defaults to the bind host:port)."},
   hysteria2_send_rate_mbps:{s:"Hysteria2 / QUIC",h:"Paced send rate (Mbps)."},
-  hysteria2_brutal:{s:"Hysteria2 / QUIC",d:1,h:"BRUTAL loss-immune CC — hostile links only (constant rate is a tell)."},
-  hysteria2_hostname:{s:"Hysteria2 / QUIC",h:"TLS front (SNI) — a real HTTP/3 origin you serve."},
-  hysteria2_cert_der_path:{s:"Hysteria2 / QUIC",h:"Real leaf cert (DER) — set with the key path."},
-  hysteria2_key_der_path:{s:"Hysteria2 / QUIC",h:"PKCS#8 key (DER) — set with the cert path."},
+  hysteria2_brutal:{s:"Hysteria2 / QUIC",d:1,h:"BRUTAL loss-immune CC - hostile links only (constant rate is a tell)."},
+  hysteria2_hostname:{s:"Hysteria2 / QUIC",h:"TLS front (SNI) - a real HTTP/3 origin you serve."},
+  hysteria2_cert_der_path:{s:"Hysteria2 / QUIC",h:"Real leaf cert (DER) - set with the key path."},
+  hysteria2_key_der_path:{s:"Hysteria2 / QUIC",h:"PKCS#8 key (DER) - set with the cert path."},
   derived_port_base:{s:"Port-hopping",h:"Lower bound (>=1024) of the per-epoch port range."},
-  derived_port_range:{s:"Port-hopping",h:"Range width (100–8192)."},
+  derived_port_range:{s:"Port-hopping",h:"Range width (100-8192)."},
   shadow_target:{s:"Shadow / cover",h:"Where unauthenticated/probe traffic is forwarded."},
   http_shadow_target:{s:"Shadow / cover",h:"HTTP-probe cover destination."},
-  pad_enabled:{s:"Padding / mux",h:"Length padding — the client must match this."},
-  stream_mux_enabled:{s:"Padding / mux",h:"Stream multiplexing — the client must match this."},
+  pad_enabled:{s:"Padding / mux",h:"Length padding - the client must match this."},
+  stream_mux_enabled:{s:"Padding / mux",h:"Stream multiplexing - the client must match this."},
   metrics_bind:{s:"Observability",h:"Prometheus /metrics bind (loopback)."},
   admin_bind:{s:"Observability",h:"This admin UI's bind (loopback only)."},
   admin_service:{s:"Observability",h:"systemd unit the Restart button targets."},
 };
 const PREFIX_SECTION = [
-  ["reality_","Reality"],["hysteria2_","Hysteria2 / QUIC"],["h3_","Hysteria2 / QUIC"],
+  ["reality_","Reality"],["paranoid","Reality"],["hysteria2_","Hysteria2 / QUIC"],["h3_","Hysteria2 / QUIC"],
   ["quic_obfs_","Hysteria2 / QUIC"],["obfs_","obfs / WebSocket"],["ws_","obfs / WebSocket"],
   ["dnstt_","DNS tunnel"],["vless_","VLESS"],["derived_port_","Port-hopping"],
   ["cohort_","Cohort / discovery"],["refresh_","Cohort / discovery"],["claim_","Cohort / discovery"],
-  ["gossip_","Cohort / discovery"],["circuit_","Relay / multi-hop"],["relay_","Relay / multi-hop"],
+  ["gossip_","Cohort / discovery"],["nostr_","Cohort / discovery"],["dht_","Cohort / discovery"],
+  ["circuit_","Relay / multi-hop"],["relay_","Relay / multi-hop"],
   ["bridge_","Identity / keys"],["operator_","Identity / keys"],["ss2022_","Identity / keys"],
   ["rate_limit","Network"],["log_","Observability"],["replay_","Observability"],["claim_log","Observability"],
 ];
 const SECTION_ORDER = ["Network","Reality","Hysteria2 / QUIC","obfs / WebSocket","DNS tunnel","VLESS",
   "Port-hopping","Shadow / cover","Padding / mux","Cohort / discovery","Relay / multi-hop",
   "Observability","Identity / keys","Other"];
+const SECTION_ICON = {"Network":"⚓","Reality":"≋","Hysteria2 / QUIC":"⇶","obfs / WebSocket":"◇","DNS tunnel":"◎",
+  "VLESS":"◆","Port-hopping":"⇄","Shadow / cover":"◐","Padding / mux":"▤","Cohort / discovery":"◈",
+  "Relay / multi-hop":"⋔","Observability":"◉","Identity / keys":"⬖","Other":"·"};
 
 function sectionFor(key){
   if(META[key]&&META[key].s) return META[key].s;
@@ -174,10 +306,7 @@ function sectionFor(key){
 function prettify(k){return k.replace(/_/g," ").replace(/\b\w/g,c=>c.toUpperCase());}
 
 // ---- token gate ----
-function readHashToken(){
-  const m=(location.hash||"").match(/t=([a-f0-9]+)/i);
-  return m?m[1]:null;
-}
+function readHashToken(){const m=(location.hash||"").match(/t=([a-f0-9]+)/i);return m?m[1]:null;}
 function saveToken(){
   const t=document.getElementById("gate-token").value.trim();
   if(t){sessionStorage.setItem("mirage_admin_token",t);TOKEN=t;boot();}
@@ -202,41 +331,70 @@ async function refresh(){
     const r=await api("/api/status");
     if(r.status===401){gate();return;}
     const s=await r.json();
-    renderStats(s);
-    document.getElementById("dot").className="dot up";
-    document.getElementById("subtitle").textContent=
-      s.transport+" · tls:"+s.tls_mode+" · up "+fmtDur(s.uptime_secs);
-    document.getElementById("foot").textContent="mirage-bridge "+s.version;
+    renderStatus(s);
+    document.getElementById("foot").textContent="mirage-bridge "+(s.version||"");
   }catch(e){
-    document.getElementById("dot").className="dot down";
-    document.getElementById("subtitle").textContent="bridge unreachable — "+(e.message||e);
+    const p=document.getElementById("idpill");p.className="idpill down";
+    document.getElementById("idpk").textContent="unreachable";
+    document.getElementById("heart").className="heart down";
+    document.getElementById("stateLbl").textContent="Bridge unreachable";
+    document.getElementById("stateAddr").textContent=(e.message||e);
   }
 }
-function card(k,v,small){return `<div class="card"><div class="k">${k}</div><div class="v${small?' small':''}">${v}</div></div>`;}
-function renderStats(s){
+function num(el,v){document.getElementById(el).textContent=(v??0).toLocaleString();}
+function renderStatus(s){
   const se=s.sessions||{},re=s.reality||{};
-  document.getElementById("stats").innerHTML=[
-    card("Active sessions",se.active??0),
-    card("Accepted",se.accepted??0),
-    card("Reality auth",re.authenticated??0),
-    card("Cover served",re.cover_served??0),
-    card("Rate-limit drops",s.rate_limit_drops??0),
-    card("Replay set",s.replay_set_size??0),
-    card("Handshake fail",(se.handshake_failed??0)+(se.handshake_timeout??0)),
-    card("Uptime",fmtDur(s.uptime_secs),true),
+  // topbar id pill: pubkey if the API exposes it, else the transport
+  const p=document.getElementById("idpill");p.className="idpill up";
+  document.getElementById("idpk").textContent=s.bridge_pk?("pk "+String(s.bridge_pk).slice(0,6)+".."+String(s.bridge_pk).slice(-4)):(s.transport||"reality");
+  // status hero
+  document.getElementById("heart").className="heart";
+  document.getElementById("stateLbl").textContent="Accepting sessions";
+  document.getElementById("stateAddr").textContent=[s.transport,("tls "+(s.tls_mode||"?")),("up "+fmtDur(s.uptime_secs))].filter(Boolean).join("  ·  ");
+  num("mActive",se.active); num("mAccepted",se.accepted);
+  document.getElementById("mUptime").textContent=fmtDur(s.uptime_secs);
+  // reality card
+  num("rAuth",re.authenticated); num("rCover",re.cover_served);
+  document.getElementById("rFail").textContent=((se.handshake_failed||0)+(se.handshake_timeout||0)).toLocaleString();
+  // metric strip (only real fields)
+  const carriers=Object.keys(s.sessions_by_transport||{}).length;
+  document.getElementById("metrics").innerHTML=[
+    metric("Reality probes",(re.probes??re.cover_served??0),"all to cover","good"),
+    metric("Rate-limit drops",s.rate_limit_drops??0,(s.rate_limit_drops?"throttling":"none"),(s.rate_limit_drops?"warn":"good")),
+    metric("Carriers live",carriers,"serving sessions","good"),
+    metric("Replay window",fmtK(s.replay_set_size??0),"0 collisions","good"),
   ].join("");
-  const bt=s.sessions_by_transport||{};
+  // sessions-by-carrier bars
+  renderCarriers(s.sessions_by_transport||{});
+  // sparkline of active sessions over time
+  HIST.push(se.active||0); if(HIST.length>60)HIST.shift(); drawSpark();
+}
+function metric(k,n,d,cls){return `<div class="metric"><div class="k">${k}</div><div class="n">${typeof n==="number"?n.toLocaleString():n}</div><div class="d ${cls||""}">${d}</div></div>`;}
+function renderCarriers(bt){
   const keys=Object.keys(bt);
   const max=Math.max(1,...keys.map(k=>bt[k]));
   const el=document.getElementById("transports");
   el.innerHTML=keys.length?keys.map(k=>
-    `<div class="bar"><span class="lbl">${k}</span>
-     <span class="track"><span class="fill" style="width:${Math.round(bt[k]/max*100)}%"></span></span>
-     <span class="n">${bt[k]}</span></div>`).join("")
-    :`<div class="sub" style="color:var(--muted)">no sessions yet</div>`;
+    `<div class="trow"><span class="name">${escapeHtml(k)}</span>
+     <span class="track"><span class="fill" style="width:${Math.max(6,Math.round(bt[k]/max*100))}%"></span></span>
+     <span class="num">${bt[k]}</span></div>`).join("")
+    :`<div class="dim" style="padding:12px 0;font-size:13px">no sessions yet</div>`;
+}
+function drawSpark(){
+  const w=320,h=42,n=HIST.length;
+  const el=document.getElementById("spark");
+  if(n<2){el.innerHTML="";return;}
+  const max=Math.max(1,...HIST);
+  const pts=HIST.map((v,i)=>[ (i/(n-1))*w, h-4-(v/max)*(h-10) ]);
+  const line=pts.map((p,i)=>(i?"L":"M")+p[0].toFixed(1)+" "+p[1].toFixed(1)).join(" ");
+  const area=line+` L${w} ${h} L0 ${h} Z`;
+  el.innerHTML=`<defs><linearGradient id="sf" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#33c8ac" stop-opacity=".32"/><stop offset="1" stop-color="#33c8ac" stop-opacity="0"/></linearGradient></defs>
+    <path d="${area}" fill="url(#sf)"/><path d="${line}" fill="none" stroke="#33c8ac" stroke-width="2"/>`;
 }
 function fmtDur(s){s=s||0;const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
   if(d)return d+"d "+h+"h";if(h)return h+"h "+m+"m";if(m)return m+"m";return s+"s";}
+function fmtK(n){return n>=1000?(n/1000).toFixed(n>=10000?0:1)+"k":String(n);}
 
 // ---- config editor ----
 async function loadConfig(){
@@ -246,59 +404,54 @@ async function loadConfig(){
   MODEL=data.config||{};SECRETS=data.secrets||{};
   TYPES={};for(const k in MODEL)TYPES[k]=Array.isArray(MODEL[k])?"array":typeof MODEL[k];
   document.getElementById("cfgpath").textContent=data.path||"";
-  renderForm();
-  syncRaw();
+  renderForm();syncRaw();
 }
 function renderForm(){
   const bySection={};
-  for(const key of Object.keys(MODEL).sort()){
-    const sec=sectionFor(key);(bySection[sec]=bySection[sec]||[]).push(key);
-  }
+  for(const key of Object.keys(MODEL).sort()){const sec=sectionFor(key);(bySection[sec]=bySection[sec]||[]).push(key);}
   const parts=[];
-  for(const sec of SECTION_ORDER){
-    const keys=bySection[sec];if(!keys)continue;
-    parts.push(`<details class="section" ${sec==="Network"||sec==="Reality"?"open":""}>
-      <summary>${sec} <span class="sub" style="color:var(--muted);font-weight:400">(${keys.length})</span></summary>
+  const emit=(sec,keys,open)=>{
+    parts.push(`<details class="section" ${open?"open":""}><summary>
+      <span style="display:flex;align-items:center;gap:11px">${SECTION_ICON[sec]||"·"} ${sec} <span class="cnt">${keys.length}</span></span>
+      <span class="chev">›</span></summary>
       <div class="fields">${keys.map(fieldHtml).join("")}</div></details>`);
-  }
-  // any leftover sections not in SECTION_ORDER
-  for(const sec in bySection){if(SECTION_ORDER.includes(sec))continue;
-    parts.push(`<details class="section"><summary>${sec}</summary>
-      <div class="fields">${bySection[sec].map(fieldHtml).join("")}</div></details>`);}
+  };
+  for(const sec of SECTION_ORDER){const keys=bySection[sec];if(!keys)continue;emit(sec,keys,sec==="Network"||sec==="Reality");}
+  for(const sec in bySection){if(SECTION_ORDER.includes(sec))continue;emit(sec,bySection[sec],false);}
   document.getElementById("form").innerHTML=parts.join("");
 }
 function fieldHtml(key){
   const m=META[key]||{};const val=MODEL[key];const t=TYPES[key];
-  const lbl=`<label>${prettify(key)}<span class="key">${key}</span></label>`;
+  // Config keys come from a raw JSON file that could, in a compromised/hand-edited
+  // state, contain markup. Escape the key everywhere it lands in innerHTML or an
+  // attribute (defense in depth - it never executes even if the file is tampered).
+  const ek=escapeHtml(key);
+  const lbl=`<div class="lab">${escapeHtml(prettify(key))}<span class="key">${ek}</span></div>`;
   let input;
   if(val===SECRET_MASK||SECRETS[key]!==undefined){
-    input=`<div class="secret"><span class="pill ${SECRETS[key]?'on':'off'}">${SECRETS[key]?'set':'unset'}</span>
-      <input type="text" data-key="${key}" data-secret="1" placeholder="unchanged — type to replace" value="">
-      </div>`;
+    input=`<div class="secret"><span class="pill ${SECRETS[key]?'on':'off'}">${SECRETS[key]?'SET':'UNSET'}</span>
+      <input type="text" data-key="${ek}" data-secret="1" placeholder="unchanged - type to replace" value=""></div>`;
   }else if(t==="boolean"){
-    input=`<div class="row"><input type="checkbox" data-key="${key}" ${val?"checked":""}></div>`;
+    input=`<div class="toggle ${val?'on':''}" data-key="${ek}" data-bool="1" onclick="this.classList.toggle('on');collectForm();syncRaw()"><i></i></div>`;
   }else if(t==="number"){
-    input=`<input type="number" data-key="${key}" value="${val??""}">`;
+    input=`<input type="number" data-key="${ek}" value="${escapeHtml(val??"")}">`;
   }else if(t==="array"||t==="object"){
-    input=`<textarea data-key="${key}" data-json="1">${escapeHtml(JSON.stringify(val,null,2))}</textarea>`;
+    input=`<textarea data-key="${ek}" data-json="1">${escapeHtml(JSON.stringify(val,null,2))}</textarea>`;
   }else{
-    input=`<input type="text" data-key="${key}" value="${escapeHtml(val==null?"":String(val))}">`;
+    input=`<input type="text" data-key="${ek}" value="${escapeHtml(val==null?"":String(val))}">`;
   }
-  const help=m.h?`<div class="help">${m.h}</div>`:"";
+  const help=m.h?`<div class="help">${escapeHtml(m.h)}</div>`:"";
   return `<div class="field ${m.d?"danger":""}">${lbl}${input}${help}</div>`;
 }
 function escapeHtml(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
 
-// pull the DOM inputs back into MODEL, coercing to original types
 function collectForm(){
   document.querySelectorAll("[data-key]").forEach(el=>{
     const key=el.getAttribute("data-key");
     if(el.getAttribute("data-secret")){
-      const v=el.value.trim();
-      if(v==="")return;                 // unchanged -> leave mask/omit
-      MODEL[key]=v;                      // operator typed a new secret
-    }else if(el.type==="checkbox"){
-      MODEL[key]=el.checked;
+      const v=el.value.trim(); if(v==="")return; MODEL[key]=v;
+    }else if(el.getAttribute("data-bool")){
+      MODEL[key]=el.classList.contains("on");
     }else if(el.getAttribute("data-json")){
       try{MODEL[key]=JSON.parse(el.value);}catch(e){throw new Error(key+": invalid JSON");}
     }else if(el.type==="number"){
@@ -308,10 +461,9 @@ function collectForm(){
     }
   });
 }
-function syncRaw(){document.getElementById("raw").value=JSON.stringify(MODEL,null,2);}
+function syncRaw(){const r=document.getElementById("raw");if(r)r.value=JSON.stringify(MODEL,null,2);}
 
 document.addEventListener("input",e=>{
-  // keep raw JSON in sync when a form field changes (and vice-versa on blur)
   if(e.target.closest&&e.target.closest("#form")){try{collectForm();syncRaw();}catch(_){}}
 });
 document.addEventListener("change",e=>{
@@ -321,41 +473,37 @@ document.addEventListener("change",e=>{
 
 async function save(){
   try{
-    // Prefer the raw editor if it was touched to something valid; else the form.
     const raw=document.getElementById("raw").value;
     try{MODEL=JSON.parse(raw);}catch(_){collectForm();}
-    const r=await api("/api/config",{method:"POST",
-      headers:{"Content-Type":"application/json"},body:JSON.stringify(MODEL)});
+    const r=await api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(MODEL)});
     const res=await r.json().catch(()=>({}));
-    if(r.ok){toast("Config saved — restart to apply.","ok");loadConfig();}
+    if(r.ok){toast("Config saved - restart to apply.","ok");loadConfig();}
     else toast(res.error||("save failed ("+r.status+")"),"err");
   }catch(e){toast(e.message||String(e),"err");}
 }
 
 async function restart(){
   if(!confirm("Restart the bridge? All live sessions will drop."))return;
-  const btn=document.getElementById("restartBtn");btn.disabled=true;btn.textContent="Restarting…";
+  const btn=document.getElementById("restartBtn");btn.disabled=true;btn.textContent="Restarting";
   try{
     const r=await api("/api/restart",{method:"POST"});
     const res=await r.json().catch(()=>({}));
     toast(res.message||"restart requested",res.ok?"ok":"err");
     if(res.ok){
-      // Poll until the freshly-started process answers again.
-      document.getElementById("dot").className="dot down";
+      document.getElementById("idpill").className="idpill down";
       let tries=0;const iv=setInterval(async()=>{
         tries++;
         try{const s=await api("/api/status");if(s.ok){clearInterval(iv);btn.disabled=false;
-          btn.textContent="Restart bridge";toast("bridge back up","ok");refresh();loadConfig();}}
+          btn.textContent="Restart service";toast("bridge back up","ok");refresh();loadConfig();}}
         catch(_){}
-        if(tries>30){clearInterval(iv);btn.disabled=false;btn.textContent="Restart bridge";}
+        if(tries>30){clearInterval(iv);btn.disabled=false;btn.textContent="Restart service";}
       },1000);
-    }else{btn.disabled=false;btn.textContent="Restart bridge";}
-  }catch(e){toast("restart failed: "+(e.message||e),"err");btn.disabled=false;btn.textContent="Restart bridge";}
+    }else{btn.disabled=false;btn.textContent="Restart service";}
+  }catch(e){toast("restart failed: "+(e.message||e),"err");btn.disabled=false;btn.textContent="Restart service";}
 }
 
 // ---- boot ----
-function gate(){document.getElementById("app").style.display="none";
-  document.getElementById("gate").style.display="block";}
+function gate(){document.getElementById("app").style.display="none";document.getElementById("gate").style.display="block";}
 async function boot(){
   document.getElementById("gate").style.display="none";
   document.getElementById("app").style.display="block";
@@ -365,7 +513,7 @@ async function boot(){
 (function(){
   const t=readHashToken()||sessionStorage.getItem("mirage_admin_token");
   if(t){sessionStorage.setItem("mirage_admin_token",t);TOKEN=t;
-    if(location.hash)history.replaceState(null,"",location.pathname);  // scrub token from URL bar
+    if(location.hash)history.replaceState(null,"",location.pathname);
     boot();}
   else gate();
 })();

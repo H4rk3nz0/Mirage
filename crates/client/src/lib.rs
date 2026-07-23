@@ -89,6 +89,7 @@ use mirage_session::{
 use mirage_socks5::server::{read_request, send_success_reply_for_internal, ConnectTarget};
 use mirage_socks5::{REP_GENERAL_FAILURE, REP_HOST_UNREACHABLE, REP_SUCCEEDED};
 
+mod ech;
 mod local_socks;
 use mirage_mux::{MuxConnError, MuxConnection, MuxPolicy, MuxTarget, StreamRole, MUX_SESSION_TAG};
 use mirage_transport::adaptive::{class_of, outcome_reward, AdaptiveRouter};
@@ -218,6 +219,11 @@ struct ClientConfig {
     /// carrier's front domain (meek/DoH) or cover host (WS) when unset.
     #[serde(default)]
     carrier_tls_sni: Option<String>,
+    /// Base64 ECHConfigList for the carrier front (e.g. the CDN's value from its DNS
+    /// HTTPS record). When set with `carrier_tls`, the handshake uses ECH (RFC 9180) so
+    /// the real inner SNI is encrypted - a censor sees only the CDN's outer public name.
+    #[serde(default)]
+    carrier_ech_config: Option<String>,
     /// JA3/JA4 fingerprint template (`"chrome-desktop"`,
     /// `"firefox-desktop"`, `"safari-desktop"`).  Default:
     /// `"chrome-desktop"`.
@@ -741,6 +747,11 @@ struct BridgeEntry {
     carrier_tls: bool,
     /// Optional explicit SNI for `carrier_tls` (else the front/cover host).
     carrier_tls_sni: Option<String>,
+    /// A CDN's ECHConfigList (raw bytes from the invite). When set, the `carrier_tls`
+    /// handshake uses ECH (RFC 9180) to encrypt the real inner SNI - the censor sees
+    /// only the CDN's outer public name. Real domain-fronting; needs the bridge behind
+    /// an ECH-capable front.
+    ech_config_list: Option<Vec<u8>>,
     /// CBR frame size for the padding layer (bytes). `None` = event-driven.
     pad_cbr_frame_bytes: Option<usize>,
     /// CBR inter-frame interval in milliseconds. Default 10.
@@ -900,6 +911,7 @@ impl BridgeEntry {
         let port_hop = invite.port_hop;
         let obfs_secret = invite.obfs_secret;
         let probe_root = invite.probe_root;
+        let ech_config_list = invite.ech_config_list.clone();
         // Inline the anchor (epoch of issued_at) rather than call the &self
         // method: `invite` is partially moved (bootstrap_announcement taken
         // above), so a whole-struct borrow would not compile; field reads are ok.
@@ -935,6 +947,7 @@ impl BridgeEntry {
             quic_obfs_disable: false,  // set by build_pool()
             carrier_tls: false,        // set by build_pool()
             carrier_tls_sni: None,     // set by build_pool()
+            ech_config_list,           // from the invite; config may override in build_pool
             pad_cbr_frame_bytes: None, // set by build_pool()
             pad_cbr_interval_ms: 10,   // set by build_pool()
             circuit_relay: false,      // set by build_pool()
@@ -1139,10 +1152,18 @@ struct EntryPool {
     cursor: AtomicUsize,
     failure_backoff: Duration,
     /// Signalled when ALL bridge entries are simultaneously exhausted (mass IP
-    /// block event). The background Nostr discovery task wakes immediately on
-    /// this signal rather than waiting for the next periodic tick, so the client
-    /// can recover in seconds instead of minutes.
+    /// block event), OR when the operator asks for a fresh walk via the
+    /// management API (`POST /api/rediscover`). The background discovery task
+    /// wakes immediately on this signal rather than waiting for the next
+    /// periodic tick, so the client recovers in seconds instead of minutes.
     discovery_trigger: Arc<tokio::sync::Notify>,
+    /// The rendezvous channels this client is configured to walk (e.g.
+    /// `["dht","nostr","dns"]`). Static from config; surfaced in the management
+    /// API so the GUI can show which channels are in play.
+    discovery_channels: Vec<String>,
+    /// `true` while a discovery pass is in flight, so the GUI can show a live
+    /// "walking rendezvous" indicator that reflects reality rather than a timer.
+    discovery_active: Arc<AtomicBool>,
     /// Per-(network, transport) success-rate map. Every dial outcome is
     /// recorded here (success in `record_latency`, failure in `mark_failure`),
     /// persisted across restarts, and surfaced in the management API. This is
@@ -1302,6 +1323,8 @@ impl EntryPool {
         entries: Vec<BridgeEntry>,
         failure_backoff: Duration,
         discovery_trigger: Arc<tokio::sync::Notify>,
+        discovery_channels: Vec<String>,
+        discovery_active: Arc<AtomicBool>,
         success_map: Arc<SuccessRateMap>,
         network: NetworkFingerprint,
     ) -> Self {
@@ -1319,6 +1342,8 @@ impl EntryPool {
             cursor: AtomicUsize::new(0),
             failure_backoff,
             discovery_trigger,
+            discovery_channels,
+            discovery_active,
             success_map,
             network,
             routing: std::sync::Mutex::new(AdaptiveRouting {
@@ -1370,6 +1395,33 @@ impl EntryPool {
             self.egress_verified.load(Ordering::Acquire),
             self.egress_since_unix.load(Ordering::Relaxed),
         )
+    }
+
+    /// Kick an immediate discovery walk (the operator's "re-discover now").
+    /// Wakes the background task via the same channel the mass-failure path
+    /// uses; a no-op if no discovery channels are configured (nothing listens).
+    pub fn trigger_rediscovery(&self) {
+        self.discovery_trigger.notify_one();
+    }
+
+    /// The rendezvous channels this client walks, for the management API.
+    pub fn discovery_channels(&self) -> &[String] {
+        &self.discovery_channels
+    }
+
+    /// `true` while a discovery pass is in flight.
+    pub fn discovery_active(&self) -> bool {
+        self.discovery_active.load(Ordering::Relaxed)
+    }
+
+    /// Total distinct addresses discovered across all entries this session,
+    /// for the "+N bridges found" indicator. Reads each entry's live set.
+    pub async fn discovered_count(&self) -> usize {
+        let mut total = 0usize;
+        for e in &self.entries {
+            total += e.discovered_addrs.read().await.len();
+        }
+        total
     }
 
     /// Pick the next healthy entry index, preferring entries with the
@@ -1776,15 +1828,28 @@ struct DiscoveryGroup {
 /// The task also wakes immediately when `trigger` is notified (signalled by the
 /// dial path when ALL entries fail simultaneously), so recovery happens in seconds
 /// during a mass IP block rather than waiting for the next periodic tick.
-async fn run_nostr_discovery(
+/// The rendezvous-channel configuration for the background discovery task,
+/// bundled so the task signature stays readable.
+struct DiscoveryNetCfg {
     relay_urls: Vec<String>,
     dns_apexes: Vec<String>,
     dht_bootstrap_addrs: Vec<String>,
     dht_enabled: bool,
+}
+
+async fn run_nostr_discovery(
+    net: DiscoveryNetCfg,
     groups: Vec<DiscoveryGroup>,
     interval: Duration,
     trigger: Arc<tokio::sync::Notify>,
+    active: Arc<AtomicBool>,
 ) {
+    let DiscoveryNetCfg {
+        relay_urls,
+        dns_apexes,
+        dht_bootstrap_addrs,
+        dht_enabled,
+    } = net;
     use mirage_discovery::channel::DiscoveryChannel;
     use mirage_discovery_dht::DhtFetchChannel;
     use std::sync::Arc as StdArc;
@@ -1894,14 +1959,19 @@ async fn run_nostr_discovery(
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        // Wake on whichever comes first: the periodic tick, or an emergency
-        // notification from the dial path (all entries failed simultaneously).
+        // Idle while waiting; the GUI reads this as "not currently walking".
+        active.store(false, Ordering::Relaxed);
+        // Wake on whichever comes first: the periodic tick, an emergency
+        // notification from the dial path (all entries failed simultaneously),
+        // or an operator-requested re-discover from the management API.
         tokio::select! {
             _ = ticker.tick() => {},
             _ = trigger.notified() => {
-                debug!("nostr discovery: emergency re-fetch (all bridges failed)");
+                debug!("nostr discovery: immediate re-fetch (mass-failure or operator request)");
             }
         }
+        // A pass is now in flight - the GUI shows the live "walking" indicator.
+        active.store(true, Ordering::Relaxed);
 
         // Clock-skew-corrected time (see pin_clock_offset), so a poisoned OS
         // clock cannot silently land discovery on the wrong (empty) epoch.
@@ -2276,15 +2346,16 @@ fn build_pool(mut config: ClientConfig) -> Result<EntryPool, String> {
                 fs_rendezvous_anchor: base.fs_rendezvous_anchor,
                 fresh_tokens: Arc::clone(&base.fresh_tokens),
                 fs_unsupported_until: Arc::clone(&base.fs_unsupported_until),
-                vless_uuid: None,          // stamped below
-                pad_enabled: false,        // stamped below
-                quic_obfs_disable: false,  // stamped below
-                carrier_tls: false,        // stamped below
-                carrier_tls_sni: None,     // stamped below
-                pad_cbr_frame_bytes: None, // stamped below
-                pad_cbr_interval_ms: 10,   // stamped below
-                circuit_relay: false,      // stamped below
-                mux_enabled: false,        // stamped below
+                vless_uuid: None,                              // stamped below
+                pad_enabled: false,                            // stamped below
+                quic_obfs_disable: false,                      // stamped below
+                carrier_tls: false,                            // stamped below
+                carrier_tls_sni: None,                         // stamped below
+                ech_config_list: base.ech_config_list.clone(), // inherit from the base entry
+                pad_cbr_frame_bytes: None,                     // stamped below
+                pad_cbr_interval_ms: 10,                       // stamped below
+                circuit_relay: false,                          // stamped below
+                mux_enabled: false,                            // stamped below
                 mux_carriers: Arc::new(Mutex::new(Vec::new())),
                 mux_establishing: Arc::new(Mutex::new(())),
                 operator_ed25519_pk: base.operator_ed25519_pk,
@@ -2345,6 +2416,7 @@ fn build_pool(mut config: ClientConfig) -> Result<EntryPool, String> {
             quic_obfs_disable: false,  // set by build_pool()
             carrier_tls: false,        // set by build_pool()
             carrier_tls_sni: None,     // set by build_pool()
+            ech_config_list: None,     // set by build_pool()
             pad_cbr_frame_bytes: None, // set by build_pool()
             pad_cbr_interval_ms: 10,   // set by build_pool()
             circuit_relay: false,      // set by build_pool()
@@ -2423,11 +2495,21 @@ fn build_pool(mut config: ClientConfig) -> Result<EntryPool, String> {
         }
     }
 
-    // Stamp the carrier-TLS flag + SNI (red-team #4: TLS-wrap meek/DoH/WS).
+    // Stamp the carrier-TLS flag + SNI (red-team #4: TLS-wrap meek/DoH/WS) + optional
+    // ECH config (RFC 9180: encrypt the inner SNI behind the CDN's outer public name).
     if config.carrier_tls {
+        let ech = config.carrier_ech_config.as_deref().and_then(|s| {
+            B64.decode(s.trim())
+                .map_err(|e| warn!(error = %e, "carrier_ech_config: invalid base64 - ECH off"))
+                .ok()
+        });
         for entry in &mut entries {
             entry.carrier_tls = true;
             entry.carrier_tls_sni = config.carrier_tls_sni.clone();
+            // Explicit config ECH overrides; otherwise keep any invite-delivered value.
+            if let Some(ech) = &ech {
+                entry.ech_config_list = Some(ech.clone());
+            }
         }
     }
 
@@ -2511,10 +2593,24 @@ fn build_pool(mut config: ClientConfig) -> Result<EntryPool, String> {
     );
 
     let discovery_trigger = Arc::new(tokio::sync::Notify::new());
+    let discovery_active = Arc::new(AtomicBool::new(false));
+    // The channels we're configured to walk, for the management API's status.
+    let mut discovery_channels: Vec<String> = Vec::new();
+    if config.dht_enabled {
+        discovery_channels.push("dht".to_string());
+    }
+    if !config.nostr_relays.is_empty() {
+        discovery_channels.push("nostr".to_string());
+    }
+    if !config.dns_discovery_apexes.is_empty() {
+        discovery_channels.push("dns".to_string());
+    }
     let pool = EntryPool::new(
         entries,
         failure_backoff,
         Arc::clone(&discovery_trigger),
+        discovery_channels,
+        Arc::clone(&discovery_active),
         Arc::clone(&success_map),
         network,
     );
@@ -2554,13 +2650,16 @@ fn build_pool(mut config: ClientConfig) -> Result<EntryPool, String> {
         let dht_enabled = config.dht_enabled;
         let interval = Duration::from_secs(config.discovery_interval_secs);
         tokio::spawn(run_nostr_discovery(
-            relay_urls,
-            dns_apexes,
-            dht_bootstrap_addrs,
-            dht_enabled,
+            DiscoveryNetCfg {
+                relay_urls,
+                dns_apexes,
+                dht_bootstrap_addrs,
+                dht_enabled,
+            },
             discovery_groups,
             interval,
             discovery_trigger,
+            Arc::clone(&discovery_active),
         ));
     }
 
@@ -2825,6 +2924,7 @@ pub async fn cli_main() {
                    --help, -h                Print this help and exit.\n\
                    --check-config            Validate config and print a summary without starting.\n\
                    --management-bind <addr>  Serve management JSON API at this address (e.g. 127.0.0.1:19443).\n\
+                   --paranoid                Force the strong posture (Reality + replay pacing + fail-closed).\n\
                  \n\
                  Config transport fields (priority order, only one active at a time):\n\
                    hysteria2_enabled        QUIC/BRUTAL carrier (highest priority).\n\
@@ -2864,7 +2964,12 @@ pub async fn cli_main() {
             run_daemon(config, mgmt).await;
             return;
         }
-        Some(p) if p.starts_with('-') && p != "--management-bind" && p != "--check-config" => {
+        Some(p)
+            if p.starts_with('-')
+                && p != "--management-bind"
+                && p != "--check-config"
+                && p != "--paranoid" =>
+        {
             eprintln!("mirage-client: unknown flag '{p}'. Try --help.");
             std::process::exit(2);
         }
@@ -2874,14 +2979,15 @@ pub async fn cli_main() {
     let config_path = match argv.get(1) {
         Some(p) if !p.starts_with('-') => p.clone(),
         _ => {
-            eprintln!("usage: mirage-client <config.json> [--management-bind <addr>]\nTry --help for more information.");
+            eprintln!("usage: mirage-client <config.json> [--management-bind <addr>] [--paranoid]\nTry --help for more information.");
             std::process::exit(2);
         }
     };
 
-    // Parse --management-bind <addr> and --check-config
+    // Parse --management-bind <addr>, --check-config, --paranoid
     let mut management_bind: Option<String> = None;
     let mut check_only = false;
+    let mut force_paranoid = false;
     for (i, arg) in argv.iter().enumerate() {
         if arg == "--management-bind" {
             management_bind = argv.get(i + 1).cloned();
@@ -2889,9 +2995,12 @@ pub async fn cli_main() {
         if arg == "--check-config" {
             check_only = true;
         }
+        if arg == "--paranoid" {
+            force_paranoid = true;
+        }
     }
 
-    let config: ClientConfig = match std::fs::read_to_string(&config_path)
+    let mut config: ClientConfig = match std::fs::read_to_string(&config_path)
         .map_err(|e| format!("read {config_path}: {e}"))
         .and_then(|s| serde_json::from_str::<ClientConfig>(&s).map_err(|e| e.to_string()))
     {
@@ -2901,6 +3010,14 @@ pub async fn cli_main() {
             std::process::exit(2);
         }
     };
+
+    // `--paranoid` on the CLI forces the strong posture on regardless of the
+    // config file, so the GUI's Paranoid switch works for a file-based config
+    // it won't rewrite. `apply_paranoid` (run inside build_pool/run_daemon)
+    // then expands it into the concrete carrier/pacing/fail-closed settings.
+    if force_paranoid {
+        config.paranoid = true;
+    }
 
     if check_only {
         let local_bind_chk = config.local_bind.clone();
@@ -3196,6 +3313,8 @@ async fn run_daemon(config: ClientConfig, management_bind: Option<String>) {
     pin_clock_offset(&config).await;
 
     let local_bind = config.local_bind.clone();
+    // Strong-posture flag, surfaced in the management API (before the move).
+    let paranoid = config.paranoid;
     // Extract TUN params before `build_pool` consumes `config`.
     let tun_enabled = config.tun_enabled;
     let tun_name = config.tun_name.clone();
@@ -3336,6 +3455,7 @@ async fn run_daemon(config: ClientConfig, management_bind: Option<String>) {
         let mgmt_total = Arc::clone(&total_sessions);
         let mgmt_lb = local_bind.clone();
         let mgmt_addr = mgmt_bind.clone();
+        let mgmt_paranoid = paranoid;
         tokio::spawn(serve_management(
             mgmt_addr,
             mgmt_pool,
@@ -3343,6 +3463,7 @@ async fn run_daemon(config: ClientConfig, management_bind: Option<String>) {
             mgmt_total,
             start_time,
             mgmt_lb,
+            mgmt_paranoid,
         ));
     }
 
@@ -4485,6 +4606,7 @@ impl AsyncWrite for CarrierConn {
 async fn carrier_tls_wrap(
     tcp: TcpStream,
     sni: &str,
+    ech_config_list: Option<&[u8]>,
     timeout: Duration,
 ) -> Result<CarrierConn, String> {
     use tokio_rustls::rustls::pki_types::ServerName;
@@ -4493,11 +4615,21 @@ async fn carrier_tls_wrap(
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let provider = std::sync::Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
-    let cfg = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("carrier tls config: {e}"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let builder = ClientConfig::builder_with_provider(provider);
+    // ECH: when the invite delivered a CDN ECHConfigList, encrypt the real inner SNI
+    // (RFC 9180 HPKE, hand-rolled in `crate::ech`). Else the standard TLS path.
+    let cfg = match ech_config_list {
+        Some(list) => builder
+            .with_ech(crate::ech::ech_mode(list).map_err(|e| format!("carrier tls ech: {e}"))?)
+            .map_err(|e| format!("carrier tls ech: {e}"))?
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        None => builder
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("carrier tls config: {e}"))?
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    };
     let connector = TlsConnector::from(std::sync::Arc::new(cfg));
     let server_name = ServerName::try_from(sni.to_string())
         .map_err(|_| format!("carrier tls: bad SNI {sni:?}"))?;
@@ -4519,7 +4651,7 @@ async fn carrier_maybe_tls(
 ) -> Result<CarrierConn, String> {
     if entry.carrier_tls {
         let sni = entry.carrier_tls_sni.as_deref().unwrap_or(default_sni);
-        carrier_tls_wrap(tcp, sni, timeout).await
+        carrier_tls_wrap(tcp, sni, entry.ech_config_list.as_deref(), timeout).await
     } else {
         Ok(CarrierConn::Plain(tcp))
     }
@@ -7294,6 +7426,7 @@ async fn serve_management(
     total_sessions: Arc<AtomicUsize>,
     start_time: std::time::Instant,
     local_bind: String,
+    paranoid: bool,
 ) {
     // RT #10: the management API exposes session stats AND the live bridge
     // list (IPs + ports) with no authentication. It is a MACHINE-LOCAL API;
@@ -7350,17 +7483,46 @@ async fn serve_management(
                 return;
             }
 
-            let path = req
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("/");
+            let first_line = req.lines().next().unwrap_or("");
+            let method = first_line.split_whitespace().next().unwrap_or("");
+            let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+
+            // State-changing endpoint: kick an immediate discovery walk. Guarded
+            // by POST + a non-simple custom header: a cross-origin browser page
+            // cannot set `X-Mirage-Control` without a CORS preflight, which this
+            // server never approves (it emits no CORS headers), so only a
+            // same-origin caller or a native client (the GUI) can reach it. The
+            // Host-loopback check above already blocks DNS-rebinding. Impact is
+            // low regardless (it only makes the client look for bridges), but a
+            // read-only API earns a state-change guard.
+            if path == "/api/rediscover" {
+                let has_ctrl = req
+                    .lines()
+                    .any(|l| l.to_ascii_lowercase().starts_with("x-mirage-control:"));
+                if method != "POST" || !has_ctrl {
+                    let resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n";
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    return;
+                }
+                pool.trigger_rediscovery();
+                let body = "{\"ok\":true}";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                return;
+            }
 
             let body = match path {
                 "/api/status" => {
                     let uptime = start.elapsed().as_secs();
                     let (mux_carriers, mux_streams) = pool.mux_totals().await;
                     let (egress_verified, egress_since) = pool.egress_status();
+                    let discovery_channels = pool.discovery_channels().to_vec();
+                    let discovered_count = pool.discovered_count().await;
+                    let discovery_active = pool.discovery_active();
                     serde_json::json!({
                         "version": env!("CARGO_PKG_VERSION"),
                         "local_bind": lb,
@@ -7376,6 +7538,12 @@ async fn serve_management(
                         // consume this to arm or release egress.
                         "egress_verified": egress_verified,
                         "egress_verified_since_unix": egress_since,
+                        // Discovery status for the GUI's rendezvous panel.
+                        "discovery_channels": discovery_channels,
+                        "discovered_count": discovered_count,
+                        "discovery_active": discovery_active,
+                        // Whether the strong (Reality + replay + fail-closed) posture is on.
+                        "paranoid": paranoid,
                     })
                     .to_string()
                 }
@@ -7962,6 +8130,7 @@ mod success_recording_tests {
             quic_obfs_disable: false,
             carrier_tls: false,
             carrier_tls_sni: None,
+            ech_config_list: None,
             pad_cbr_frame_bytes: None,
             pad_cbr_interval_ms: 10,
             circuit_relay: false,
@@ -8159,6 +8328,8 @@ mod success_recording_tests {
             vec![test_entry(reality())],
             Duration::from_secs(0),
             Arc::new(tokio::sync::Notify::new()),
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(SuccessRateMap::new()),
             NetworkFingerprint::unknown(),
         );
@@ -8183,6 +8354,36 @@ mod success_recording_tests {
         // Re-arming after a drop works (recovery).
         pool.mark_egress_verified();
         assert!(pool.egress_status().0);
+    }
+
+    #[tokio::test]
+    async fn discovery_status_surface_reflects_config_and_trigger_wakes() {
+        // The configured channels are surfaced verbatim for the GUI panel; a
+        // fresh pool has discovered nothing yet and is not mid-walk.
+        let trigger = Arc::new(tokio::sync::Notify::new());
+        let pool = EntryPool::new(
+            vec![test_entry(reality())],
+            Duration::from_secs(0),
+            Arc::clone(&trigger),
+            vec!["dht".to_string(), "nostr".to_string()],
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(SuccessRateMap::new()),
+            NetworkFingerprint::unknown(),
+        );
+        assert_eq!(pool.discovery_channels(), ["dht", "nostr"]);
+        assert_eq!(pool.discovered_count().await, 0);
+        assert!(!pool.discovery_active());
+
+        // `trigger_rediscovery` wakes a waiter on the same channel the discovery
+        // task selects on - this is what `POST /api/rediscover` drives.
+        let waiter = tokio::spawn(async move { trigger.notified().await });
+        tokio::task::yield_now().await;
+        pool.trigger_rediscovery();
+        // The notified future resolves promptly once triggered.
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("rediscover trigger must wake the discovery waiter")
+            .expect("waiter task joins");
     }
 
     #[test]
@@ -8228,6 +8429,8 @@ mod success_recording_tests {
             vec![test_entry(reality())],
             Duration::from_secs(30),
             Arc::new(tokio::sync::Notify::new()),
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
             Arc::clone(&map),
             net.clone(),
         );
@@ -8247,6 +8450,8 @@ mod success_recording_tests {
             Vec::new(), // no entries
             Duration::from_secs(30),
             Arc::new(tokio::sync::Notify::new()),
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
             Arc::clone(&map),
             net,
         );
@@ -8346,6 +8551,8 @@ mod success_recording_tests {
             ],
             Duration::from_secs(0), // disable health soft-fail; test TRANSPORT selection
             Arc::new(tokio::sync::Notify::new()),
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
             Arc::clone(&map),
             net.clone(),
         );

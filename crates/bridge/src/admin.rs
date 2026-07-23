@@ -17,8 +17,11 @@
 //!   fragment (never sent to the server, never logged). A local process that
 //!   cannot read the console cannot drive the API, and a cross-origin page cannot
 //!   set the `Authorization` header - so CSRF is structurally blocked.
-//! - **No CORS, strict CSP.** The page is self-hosted; responses set a strict
-//!   `Content-Security-Policy` and never emit `Access-Control-Allow-Origin`.
+//! - **No CORS, strict CSP, no framing.** The page is self-hosted; responses set a
+//!   strict `Content-Security-Policy` (incl. `frame-ancestors 'none'`), `X-Frame-Options:
+//!   DENY` (anti-clickjacking), and `nosniff`, and never emit `Access-Control-Allow-Origin`.
+//! - **Token never logged.** The access token is printed to the operator's console only,
+//!   never included in the structured (`info!`) log that a collector might ship off-box.
 //! - **Secrets never leave the box.** Long-term key material in the config
 //!   (`*_sk_hex`, `*_secret_hex`, `*_psk_hex`, salt, relay token) is masked
 //!   before the config is sent to the browser and restored from disk on write,
@@ -374,8 +377,10 @@ async fn write_html(sock: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
          Content-Type: text/html; charset=utf-8\r\n\
          Content-Length: {len}\r\n\
          Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; \
-script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'\r\n\
+script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; \
+form-action 'none'; frame-ancestors 'none'\r\n\
          X-Content-Type-Options: nosniff\r\n\
+         X-Frame-Options: DENY\r\n\
          Referrer-Policy: no-referrer\r\n\
          Connection: close\r\n\r\n",
         len = body.len()
@@ -399,6 +404,8 @@ async fn write_resp(
          Content-Type: {ctype}\r\n\
          Content-Length: {len}\r\n\
          Cache-Control: no-store\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         Content-Security-Policy: default-src 'none'; frame-ancestors 'none'\r\n\
          Connection: close\r\n\r\n",
         len = body.len()
     );
@@ -463,10 +470,12 @@ pub fn warn_if_public(bind: &str) {
     }
 }
 
-/// Log the one-time access URL (token in the fragment, never sent to the server).
+/// Print the one-time access URL to the operator console. The token is deliberately
+/// kept OUT of the structured log (`info!`) - a log aggregator or a shipped log file
+/// would otherwise leak a live credential. It goes only to the direct stdout print,
+/// the operator's intended channel.
 pub fn log_access_url(bind: &str, token: &str) {
-    info!(bind = %bind, "admin UI: http://{bind}/#t={token}");
-    // Also to stdout so it's visible even at a low log level.
+    info!(bind = %bind, "admin UI listening; access URL with token printed to console");
     println!("\n  Mirage bridge admin UI:  http://{bind}/#t={token}\n");
 }
 
@@ -600,6 +609,19 @@ mod tests {
         .await;
         assert!(page.contains("200 OK"), "page: {page}");
         assert!(page.contains("Mirage Bridge"), "serves the SPA");
+        // Anti-clickjacking + no-sniff hardening must be present on the page response.
+        assert!(
+            page.contains("X-Frame-Options: DENY"),
+            "anti-clickjacking header: {page}"
+        );
+        assert!(
+            page.contains("frame-ancestors 'none'"),
+            "CSP forbids framing: {page}"
+        );
+        assert!(
+            page.contains("X-Content-Type-Options: nosniff"),
+            "nosniff: {page}"
+        );
 
         // /api/status without a token -> 401.
         let noauth = raw_http(

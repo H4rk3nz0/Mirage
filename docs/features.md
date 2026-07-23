@@ -51,6 +51,7 @@ Ride on top of any carrier.
 | **CBR mode** | Constant bitrate - near-total shape concealment, high bandwidth cost. | `pad_cbr_frame_bytes` |
 | **Stream multiplexing** | Many logical streams over one carrier connection, with per-stream flow control. | `stream_mux_enabled` |
 | **Cover traffic** | Fetches real decoy pages while idle, so "idle" doesn't stand out. | `cover_destinations` |
+| **Encrypted SNI (ECH)** | Encrypts the inner TLS hostname behind a CDN (RFC 9180 HPKE), so the CDN edge doesn't reveal which site you reach. TLS carriers (meek / DoH / WebSocket). | invite (`INVITE_EXT_ECH_CONFIG`) or `carrier_ech_config` |
 
 ---
 
@@ -111,6 +112,7 @@ network.
 | **Post-quantum session keys** | "Harvest now, decrypt later." ML-KEM-768 is mixed into the Noise handshake. |
 | **Padding + jitter** | ML/DPI flow classifiers. |
 | **Replay pacing** (`paranoid` mode) | Traffic-analysis. The flow's packet sizes/timing replay a real recorded video-streaming envelope instead of a generated one; build the library with `tools/cover-sources`. |
+| **Encrypted SNI (ECH)** | A censor reading the CDN edge to learn which inner host you reach. The inner TLS hostname is HPKE-encrypted (RFC 9180). |
 | **Log anonymization** | Your own logs being used against your users after a seizure. On by default. |
 | **Egress restrictions** | Your bridge being used as an open proxy or for SSRF. Private/loopback targets refused by default. |
 | **Rate limiting** | Resource exhaustion and abuse. Per-IP connection and rate caps. |
@@ -126,7 +128,7 @@ Every one is in the standard build.
 | Binary | What it's for |
 |---|---|
 | **`mirage-client`** | The client daemon. SOCKS5 proxy and/or TUN VPN. |
-| **`mirage-client-gui`** | Graphical client - paste an invite or browse to a config, click Connect. Slint software renderer (no GTK); ships in the `...-gui` release archives. |
+| **`mirage-client-gui`** | Graphical client - connect from an invite or `client.json`, save/switch **profiles**, force **re-discover**, reconnect, and toggle **Paranoid**, with a live discovery + carrier view. Slint software renderer (no GTK); ships in the `...-gui` release archives. |
 | **`mirage-bridge`** | The bridge daemon operators run. |
 | **`mirage-setup`** | Interactive wizard: profiles, preflight checks, writes both configs + a hardened systemd unit. |
 | **`mirage-keygen`** | One-shot key/invite generator for scripted deployments. |

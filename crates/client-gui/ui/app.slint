@@ -1,8 +1,10 @@
-// Mirage client GUI — Slint markup.
+// Mirage client GUI - Slint markup.
 //
 // Rendered by the software renderer (no GPU/GL). The Rust side (src/main.rs)
 // owns process supervision and pushes live daemon state into the `in` properties
-// here via a background poll thread (upgrade_in_event_loop).
+// here via a background poll thread (upgrade_in_event_loop). Layout follows the
+// Mirage design system: a connection orb, an in-control row, saved profiles, a
+// live discovery panel, and session stats - all cool blue-slate with teal = ok.
 
 import { VerticalBox, HorizontalBox, ScrollView, LineEdit, TextEdit } from "std-widgets.slint";
 
@@ -17,7 +19,7 @@ export struct BridgeRow {
     mux: string,
     healthy: bool,
     port: string,
-    id-color: color,   // stable per-bridge colour (derived from the address)
+    id-color: color,
 }
 
 // One entry in the built-in file browser (Rust lists the directory).
@@ -26,342 +28,650 @@ export struct BrowserEntry {
     is-dir: bool,
 }
 
+// One saved connection profile. The invite / config path live on the Rust side,
+// keyed by name; `active` marks the profile currently connected.
+export struct ProfileRow {
+    name: string,
+    subtitle: string,
+    active: bool,
+}
+
+// One discovery rendezvous channel (DHT / Nostr / DNS) + its health.
+export struct ChannelRow {
+    name: string,
+    healthy: bool,
+}
+
 export component AppWindow inherits Window {
     title: "Mirage";
     icon: @image-url("../assets/icon.png");
     default-font-size: 14px;
-    preferred-width: 640px;
-    preferred-height: 800px;
-    min-width: 480px;
-    min-height: 560px;
-    background: #0b0f14;
+    preferred-width: 480px;
+    preferred-height: 860px;
+    min-width: 420px;
+    min-height: 620px;
+    background: root.bg;
 
     // ---- Inputs driven from Rust ----
-    in-out property <string> invite;                 // pasted mirage:// invite
-    in-out property <string> config-path;            // optional client.json path
+    in-out property <string> invite;
+    in-out property <string> config-path;
     in property <string> daemon-state: "stopped";    // stopped|starting|running|error
     in property <string> error-text;
     in property <string> bind-addr;
-    in property <string> sessions;                   // "active / total"
+    in property <string> sessions;
     in property <string> uptime;
-    in property <string> mux;                        // "carriers x streams"
+    in property <string> mux;
     in property <string> version;
     in property <[BridgeRow]> bridges;
-    in property <string> log-text;                   // full log, joined; selectable
-    in property <bool> copied;                       // brief "copied!" flash
+    in property <string> log-text;
+    in property <bool> copied;
 
-    // ---- Built-in file browser state (driven from Rust) ----
+    // Connection detail (derived from /api/bridges by Rust).
+    in property <string> via-carrier;                // e.g. "Reality"
+    in property <string> via-bridge;                 // short bridge fingerprint
+    in property <string> session-streams;            // open mux streams
+    in property <bool> paranoid;                     // strong posture on?
+
+    // Discovery status (from /api/status).
+    in property <bool> discovery-active;
+    in property <int> discovered-count;
+    in property <[ChannelRow]> channels;
+
+    // ---- Saved profiles ----
+    in property <[ProfileRow]> profiles;
+    in property <string> active-profile;
+    in-out property <string> profile-name;
+
+    // ---- Built-in file browser state ----
     in-out property <bool> show-browser: false;
     in property <string> browser-path;
     in property <[BrowserEntry]> browser-entries;
 
+    // ---- Local UI state ----
+    in-out property <bool> show-log: false;
+    in-out property <bool> show-connect: false;      // reveal connect form while running
+    property <bool> pulse: false;                    // drives the orb breath
+
     // ---- Events to Rust ----
     callback start();
     callback stop();
+    callback reconnect();
+    callback rediscover();
+    callback toggle-paranoid();
     callback copy-bind();
     callback clear-log();
     callback browse();
-    callback browser-enter(string);   // navigate into a dir (or "..")
-    callback browser-pick(string);    // choose a file
+    callback browser-enter(string);
+    callback browser-pick(string);
     callback browser-cancel();
+    callback save-profile();
+    callback load-profile(string);
+    callback delete-profile(string);
 
     property <bool> running: root.daemon-state == "running";
     property <bool> starting: root.daemon-state == "starting";
+    property <bool> is-error: root.daemon-state == "error";
     property <bool> stopped: root.daemon-state == "stopped" || root.daemon-state == "error";
-    property <color> accent: #10b981;
-    property <color> card-bg: #131a22;
-    property <color> muted: #7d8896;
 
-    VerticalBox {
-        padding-left: 26px;
-        padding-right: 26px;
-        padding-top: 28px;
-        padding-bottom: 22px;
-        spacing: 20px;
+    // Identity palette (see the design system).
+    property <color> bg: #0b1220;
+    property <color> surface: #131d2e;
+    property <color> surface-2: #0f1826;
+    property <color> line: #213045;
+    property <color> line-2: #2b3d55;
+    property <color> text-hi: #e9eff8;
+    property <color> muted: #8494ab;
+    property <color> azure: #4f9fe6;
+    property <color> azure-bright: #62b0f2;
+    property <color> violet: #9385f2;
+    property <color> accent: #33c8ac;    // teal = connected / ok
+    property <color> amber: #e4a94a;
+    property <color> coral: #e86a72;
 
-        // ===== Header =====
-        HorizontalBox {
-            spacing: 14px;
-            padding-top: 4px;
-            padding-bottom: 10px;
-            Rectangle {
-                width: 14px;
-                height: 14px;
-                border-radius: 7px;
-                background: root.running ? root.accent
-                    : root.starting ? #eab308
-                    : root.daemon-state == "error" ? #ef4444
-                    : #3a4653;
-            }
-            VerticalLayout {
-                spacing: 3px;
-                Text {
-                    text: "Mirage";
-                    font-size: 27px;
-                    font-weight: 800;
-                    color: white;
-                }
-                Text {
-                    text: root.running ? "SOCKS5 proxy on " + root.bind-addr
-                        : root.starting ? "Establishing tunnel…"
-                        : root.daemon-state == "error" ? "Disconnected"
-                        : "Not connected";
-                    font-size: 12px;
-                    color: root.muted;
-                }
-            }
-            Rectangle { horizontal-stretch: 1; }
-            // Disconnect lives in the header once connected, so the big connect
-            // card can disappear and free the space for bridges + log.
-            if root.running || root.starting: Rectangle {
-                height: 32px;
-                border-radius: 8px;
-                background: disc-touch.pressed ? #3a181c : #2a1a1e;
-                disc-touch := TouchArea { clicked => { root.stop(); } }
-                HorizontalLayout {
-                    padding-left: 14px;
-                    padding-right: 14px;
-                    Text {
-                        text: "Disconnect";
-                        color: #fca5a5;
-                        font-size: 12px;
-                        font-weight: 600;
-                        vertical-alignment: center;
-                    }
-                }
-            }
-            Rectangle {
-                height: 32px;
-                border-radius: 16px;
-                background: root.running ? #10331f
-                    : root.daemon-state == "error" ? #2a1416
-                    : #1a232e;
-                HorizontalLayout {
-                    padding-left: 16px;
-                    padding-right: 16px;
-                    Text {
-                        text: root.running ? "CONNECTED"
-                            : root.starting ? "CONNECTING…"
-                            : root.daemon-state == "error" ? "ERROR"
-                            : "OFFLINE";
-                        font-size: 11px;
-                        font-weight: 700;
-                        color: root.running ? root.accent
-                            : root.daemon-state == "error" ? #fca5a5
-                            : root.muted;
-                        vertical-alignment: center;
-                    }
-                }
-            }
-        }
+    // Orb / state colour follows the daemon state.
+    property <color> state-color: root.running ? root.accent
+        : root.starting ? root.amber
+        : root.is-error ? root.coral
+        : root.muted;
 
-        // ===== Connect card (only while stopped — hidden once connected so the
-        // bridges + log get the vertical space) =====
-        if root.stopped: Rectangle {
-            border-radius: 12px;
-            background: root.card-bg;
-            VerticalBox {
-                padding: 18px;
-                spacing: 12px;
-                Text { text: "Connection"; font-weight: 700; color: white; }
+    // Gentle breath for the connection orb (only animates while connected).
+    Timer {
+        interval: 2400ms;
+        running: root.running;
+        triggered => { root.pulse = !root.pulse; }
+    }
+
+    VerticalLayout {
+        // ===== Fixed header =====
+        Rectangle {
+            background: root.surface-2;
+            height: 56px;
+            HorizontalLayout {
+                padding-left: 18px;
+                padding-right: 16px;
+                spacing: 11px;
+                Image {
+                    source: @image-url("../assets/mark.png");
+                    width: 26px;
+                    height: 26px;
+                    y: (parent.height - self.height) / 2;
+                }
                 Text {
-                    text: "Paste an invite (mirage://…) or point to a client.json.";
-                    color: root.muted; font-size: 12px; wrap: word-wrap;
+                    text: "MIRAGE";
+                    color: root.text-hi;
+                    font-size: 16px;
+                    font-weight: 700;
+                    vertical-alignment: center;
                 }
-                invite-edit := LineEdit {
-                    placeholder-text: "mirage://…";
-                    text <=> root.invite;
-                    enabled: root.stopped;
-                }
-                HorizontalBox {
-                    spacing: 8px;
-                    path-edit := LineEdit {
-                        placeholder-text: "…or select a client.json";
-                        text <=> root.config-path;
-                        enabled: root.stopped;
-                        horizontal-stretch: 1;
-                    }
-                    Rectangle {
-                        width: 92px;
-                        border-radius: 9px;
-                        background: browse-touch.pressed ? #1a232e : #26313d;
-                        browse-touch := TouchArea {
-                            enabled: root.stopped;
-                            clicked => { root.browse(); }
+                Rectangle { horizontal-stretch: 1; }
+                // Profile / state pill.
+                Rectangle {
+                    y: (parent.height - self.height) / 2;
+                    height: 30px;
+                    border-radius: 15px;
+                    background: root.surface;
+                    border-width: 1px;
+                    border-color: root.line;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 13px;
+                        spacing: 8px;
+                        Rectangle {
+                            width: 8px; height: 8px; border-radius: 4px;
+                            y: (parent.height - self.height) / 2;
+                            background: root.state-color;
                         }
                         Text {
-                            text: "Browse…";
-                            color: root.stopped ? white : root.muted;
-                            font-size: 13px;
+                            text: root.active-profile != "" ? root.active-profile
+                                : root.running ? "Connected"
+                                : root.starting ? "Connecting"
+                                : root.is-error ? "Error" : "Not connected";
+                            color: root.muted;
+                            font-size: 12px;
+                            vertical-alignment: center;
                         }
                     }
                 }
-                Rectangle {
-                    height: 44px;
+            }
+        }
+        Rectangle { height: 1px; background: root.line; }
+
+        // ===== Scrollable body =====
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalBox {
+                padding: 18px;
+                spacing: 16px;
+
+                // ---- Connection hero: the orb + state ----
+                VerticalLayout {
+                    spacing: 12px;
+                    padding-top: 6px;
+                    padding-bottom: 2px;
+                    // Orb: concentric teal circles + a breathing ring.
+                    Rectangle {
+                        height: 96px;
+                        Rectangle {
+                            width: 96px; height: 96px; border-radius: 48px;
+                            x: (parent.width - self.width) / 2;
+                            background: root.state-color;
+                            opacity: 0.10;
+                        }
+                        // Breathing ring (only while connected).
+                        if root.running: Rectangle {
+                            width: root.pulse ? 82px : 54px;
+                            height: root.pulse ? 82px : 54px;
+                            border-radius: self.width / 2;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            border-width: 2px;
+                            border-color: root.accent;
+                            opacity: root.pulse ? 0.05 : 0.5;
+                            animate width, height, opacity { duration: 2400ms; easing: ease-in-out; }
+                        }
+                        // Core glow.
+                        Rectangle {
+                            width: 30px; height: 30px; border-radius: 15px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            background: root.state-color;
+                            opacity: 0.28;
+                        }
+                        // Core.
+                        Rectangle {
+                            width: 16px; height: 16px; border-radius: 8px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            background: root.state-color;
+                        }
+                    }
+                    Text {
+                        text: root.running ? "Connected"
+                            : root.starting ? "Establishing tunnel"
+                            : root.is-error ? "Disconnected" : "Not connected";
+                        color: root.text-hi;
+                        font-size: 19px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                    }
+                    if root.running: Text {
+                        text: "socks5://" + root.bind-addr;
+                        color: root.muted;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                    }
+                    if root.running && root.via-carrier != "": Text {
+                        text: "via " + root.via-carrier + (root.paranoid ? " + Proteus" : "")
+                            + (root.via-bridge != "" ? " - bridge " + root.via-bridge : "");
+                        color: root.azure-bright;
+                        font-size: 11px;
+                        horizontal-alignment: center;
+                    }
+                }
+
+                // ---- Control row (connected) ----
+                if root.running: HorizontalLayout {
+                    spacing: 8px;
+                    // Re-discover
+                    Rectangle {
+                        height: 46px;
+                        horizontal-stretch: 1;
+                        border-radius: 10px;
+                        background: rd-touch.pressed ? root.surface-2 : root.surface;
+                        border-width: 1px;
+                        border-color: rd-touch.has-hover ? root.azure : root.line;
+                        rd-touch := TouchArea { clicked => { root.rediscover(); } }
+                        Text {
+                            text: "Re-discover";
+                            color: root.text-hi; font-size: 12px; font-weight: 600;
+                        }
+                    }
+                    // Reconnect
+                    Rectangle {
+                        height: 46px;
+                        horizontal-stretch: 1;
+                        border-radius: 10px;
+                        background: rc-touch.pressed ? root.surface-2 : root.surface;
+                        border-width: 1px;
+                        border-color: rc-touch.has-hover ? root.azure : root.line;
+                        rc-touch := TouchArea { clicked => { root.reconnect(); } }
+                        Text {
+                            text: "Reconnect";
+                            color: root.text-hi; font-size: 12px; font-weight: 600;
+                        }
+                    }
+                    // Paranoid (toggle)
+                    Rectangle {
+                        height: 46px;
+                        horizontal-stretch: 1;
+                        border-radius: 10px;
+                        background: root.paranoid ? #14283f : (pn-touch.pressed ? root.surface-2 : root.surface);
+                        border-width: 1px;
+                        border-color: root.paranoid ? root.azure : (pn-touch.has-hover ? root.azure : root.line);
+                        pn-touch := TouchArea { clicked => { root.toggle-paranoid(); } }
+                        Text {
+                            text: "Paranoid";
+                            color: root.paranoid ? root.azure : root.text-hi;
+                            font-size: 12px; font-weight: 600;
+                        }
+                    }
+                }
+
+                // Disconnect (connected) - subordinate, full-width, coral text.
+                if root.running || root.starting: Rectangle {
+                    height: 38px;
                     border-radius: 9px;
-                    background: touch.pressed ? root.accent.darker(0.2) : root.accent;
-                    opacity: (root.invite != "" || root.config-path != "") ? 1.0 : 0.5;
-                    touch := TouchArea {
-                        clicked => {
-                            if (root.invite != "" || root.config-path != "") {
-                                root.start();
+                    background: dc-touch.pressed ? #2a1a20 : root.surface-2;
+                    border-width: 1px;
+                    border-color: root.line;
+                    dc-touch := TouchArea { clicked => { root.stop(); } }
+                    Text { text: "Disconnect"; color: root.coral; font-size: 12px; font-weight: 600; }
+                }
+
+                // ---- Error banner ----
+                if root.error-text != "": Rectangle {
+                    border-radius: 9px;
+                    background: #241519;
+                    border-width: 1px;
+                    border-color: #5c2830;
+                    VerticalBox {
+                        padding: 12px;
+                        Text { text: root.error-text; color: root.coral; font-size: 12px; wrap: word-wrap; }
+                    }
+                }
+
+                // ---- Connect form (idle, or when revealed while running) ----
+                if root.stopped || root.show-connect: Rectangle {
+                    border-radius: 14px;
+                    background: root.surface;
+                    border-width: 1px;
+                    border-color: root.line;
+                    VerticalBox {
+                        padding: 18px;
+                        spacing: 12px;
+                        Text { text: "New connection"; font-weight: 700; color: root.text-hi; }
+                        Text {
+                            text: "Paste an invite (mirage://...) or point to a client.json.";
+                            color: root.muted; font-size: 12px; wrap: word-wrap;
+                        }
+                        invite-edit := LineEdit {
+                            placeholder-text: "mirage://...";
+                            text <=> root.invite;
+                        }
+                        HorizontalBox {
+                            spacing: 8px;
+                            path-edit := LineEdit {
+                                placeholder-text: "or select a client.json";
+                                text <=> root.config-path;
+                                horizontal-stretch: 1;
+                            }
+                            Rectangle {
+                                width: 92px; border-radius: 9px;
+                                background: br-touch.pressed ? root.surface-2 : #223247;
+                                br-touch := TouchArea { clicked => { root.browse(); } }
+                                Text { text: "Browse"; color: root.text-hi; font-size: 13px; }
                             }
                         }
-                    }
-                    Text { text: "Connect"; color: #04120c; font-weight: 700; }
-                }
-            }
-        }
-
-        // ===== Error banner =====
-        if root.error-text != "": Rectangle {
-            border-radius: 9px;
-            background: #2a1416;
-            border-width: 1px;
-            border-color: #7f1d1d;
-            VerticalBox {
-                padding: 12px;
-                Text { text: root.error-text; color: #fca5a5; font-size: 12px; wrap: word-wrap; }
-            }
-        }
-
-        // ===== Status card (only when connected) =====
-        if root.running: Rectangle {
-            border-radius: 12px;
-            background: root.card-bg;
-            VerticalBox {
-                padding: 16px;
-                spacing: 8px;
-                HorizontalBox {
-                    Text { text: "SOCKS5 proxy"; color: root.muted; font-size: 12px; }
-                    Rectangle { horizontal-stretch: 1; }
-                    Text {
-                        text: root.copied ? "copied!" : root.bind-addr;
-                        color: root.copied ? root.accent : white;
-                        font-weight: 600;
-                    }
-                    Rectangle {
-                        width: 58px; height: 24px; border-radius: 6px; background: #26313d;
-                        TouchArea { clicked => { root.copy-bind(); } }
-                        Text { text: "copy"; color: root.muted; font-size: 11px; }
-                    }
-                }
-                HorizontalBox {
-                    Text { text: "Sessions"; color: root.muted; font-size: 12px; }
-                    Rectangle { horizontal-stretch: 1; }
-                    Text { text: root.sessions; color: white; }
-                }
-                HorizontalBox {
-                    Text { text: "Uptime"; color: root.muted; font-size: 12px; }
-                    Rectangle { horizontal-stretch: 1; }
-                    Text { text: root.uptime; color: white; }
-                }
-                HorizontalBox {
-                    Text { text: "Mux"; color: root.muted; font-size: 12px; }
-                    Rectangle { horizontal-stretch: 1; }
-                    Text { text: root.mux; color: white; }
-                }
-            }
-        }
-
-        // ===== Bridges table =====
-        if root.running && root.bridges.length > 0: Rectangle {
-            vertical-stretch: 1;
-            border-radius: 12px;
-            background: root.card-bg;
-            VerticalBox {
-                padding: 16px;
-                spacing: 8px;
-                Text { text: "Bridges"; font-weight: 700; color: white; }
-                ScrollView {
-                    VerticalBox {
-                        spacing: 6px;
-                        for b in root.bridges: Rectangle {
-                            height: 42px;
-                            border-radius: 8px;
-                            background: #0f151c;
-                            HorizontalBox {
-                                padding-left: 0px;
-                                padding-right: 12px;
-                                spacing: 10px;
-                                // Stable per-bridge colour swatch (a vertical bar
-                                // on the left) so each bridge is identifiable at a
-                                // glance, independent of transport/health colour.
-                                Rectangle {
-                                    width: 5px;
-                                    background: b.id-color;
-                                    border-top-left-radius: 8px;
-                                    border-bottom-left-radius: 8px;
-                                }
-                                Rectangle {
-                                    width: 9px; height: 9px; border-radius: 5px;
-                                    background: b.healthy ? root.accent : #ef4444;
-                                }
-                                Text {
-                                    text: b.addr + (b.port != "" ? ":" + b.port : "");
-                                    color: white; font-size: 13px;
-                                    overflow: elide; horizontal-stretch: 1;
-                                }
-                                Rectangle {
-                                    border-radius: 5px;
-                                    background: b.transport-color;
-                                    HorizontalBox {
-                                        padding-left: 8px; padding-right: 8px;
-                                        Text { text: b.transport; color: white; font-size: 10px; }
+                        HorizontalBox {
+                            spacing: 8px;
+                            name-edit := LineEdit {
+                                placeholder-text: "Name to save this as a profile";
+                                text <=> root.profile-name;
+                                horizontal-stretch: 1;
+                            }
+                            Rectangle {
+                                width: 92px; border-radius: 9px;
+                                background: sv-touch.pressed ? root.surface-2 : #223247;
+                                opacity: (root.profile-name != "" && (root.invite != "" || root.config-path != "")) ? 1.0 : 0.45;
+                                sv-touch := TouchArea {
+                                    clicked => {
+                                        if (root.profile-name != "" && (root.invite != "" || root.config-path != "")) {
+                                            root.save-profile();
+                                        }
                                     }
                                 }
-                                Text { text: b.latency; color: b.latency-color; font-size: 11px; }
+                                Text { text: "Save"; color: root.text-hi; font-size: 13px; }
+                            }
+                        }
+                        Rectangle {
+                            height: 46px; border-radius: 10px;
+                            background: cn-touch.pressed ? root.azure.darker(0.2) : root.azure;
+                            opacity: (root.invite != "" || root.config-path != "") ? 1.0 : 0.45;
+                            cn-touch := TouchArea {
+                                clicked => {
+                                    if (root.invite != "" || root.config-path != "") {
+                                        root.show-connect = false;
+                                        root.start();
+                                    }
+                                }
+                            }
+                            Text { text: "Connect"; color: #041020; font-weight: 700; font-size: 15px; }
+                        }
+                    }
+                }
+
+                // ---- Profiles ----
+                if root.profiles.length > 0: VerticalLayout {
+                    spacing: 8px;
+                    HorizontalLayout {
+                        Text {
+                            text: "PROFILES";
+                            color: root.muted; font-size: 10px; font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        if root.running: Rectangle {
+                            width: 96px; height: 22px;
+                            pi-touch := TouchArea { clicked => { root.show-connect = !root.show-connect; } }
+                            Text {
+                                text: root.show-connect ? "close" : "+ Paste invite";
+                                color: root.azure; font-size: 11px; font-weight: 600;
+                                horizontal-alignment: right; vertical-alignment: center;
+                            }
+                        }
+                    }
+                    for p in root.profiles: Rectangle {
+                        height: 50px;
+                        border-radius: 11px;
+                        background: p.active ? #12233a : (prow-touch.pressed ? root.surface-2 : root.surface);
+                        border-width: 1px;
+                        border-color: p.active ? root.azure : root.line;
+                        prow-touch := TouchArea { clicked => { root.load-profile(p.name); } }
+                        HorizontalLayout {
+                            padding-left: 13px;
+                            padding-right: 10px;
+                            spacing: 11px;
+                            Rectangle {
+                                width: 9px; height: 9px; border-radius: 5px;
+                                y: (parent.height - self.height) / 2;
+                                background: p.active ? root.accent : root.line-2;
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: p.name;
+                                    color: root.text-hi; font-size: 13px; font-weight: 600;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: p.subtitle;
+                                    color: root.muted; font-size: 10px; overflow: elide;
+                                }
+                            }
+                            Text {
+                                text: p.active ? "connected" : "connect";
+                                color: p.active ? root.accent : root.muted;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
+                            Rectangle {
+                                width: 28px; height: 28px; border-radius: 6px;
+                                y: (parent.height - self.height) / 2;
+                                background: del-touch.pressed ? #3a1a1f : transparent;
+                                del-touch := TouchArea { clicked => { root.delete-profile(p.name); } }
+                                Text { text: "x"; color: root.muted; font-size: 14px; }
                             }
                         }
                     }
                 }
-            }
-        }
 
-        // ===== Log panel =====
-        Rectangle {
-            // When connected, share the freed space with the bridges panel
-            // (bridges stretch 1 : log stretch 2). When idle, the log fills.
-            vertical-stretch: root.running ? 2 : 1;
-            min-height: 150px;
-            border-radius: 12px;
-            background: #05080b;
-            VerticalBox {
-                padding: 14px;
-                spacing: 8px;
-                HorizontalBox {
-                    Text { text: "Log"; font-weight: 700; color: root.muted; font-size: 12px; }
-                    Rectangle { horizontal-stretch: 1; }
+                // ---- Discovery ----
+                if root.running && root.channels.length > 0: VerticalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "DISCOVERY";
+                        color: root.muted; font-size: 10px; font-weight: 700;
+                    }
                     Rectangle {
-                        width: 52px; height: 24px; border-radius: 5px; background: #131a22;
-                        TouchArea { clicked => { root.clear-log(); } }
-                        Text { text: "clear"; color: root.muted; font-size: 10px; }
+                        border-radius: 12px;
+                        background: root.surface-2;
+                        border-width: 1px;
+                        border-color: root.line;
+                        VerticalBox {
+                            padding: 15px;
+                            spacing: 12px;
+                            HorizontalLayout {
+                                Text {
+                                    text: "Walking rendezvous";
+                                    color: root.text-hi; font-size: 12px; font-weight: 600;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                Text {
+                                    text: root.discovery-active ? "searching" : "idle";
+                                    color: root.discovery-active ? root.azure : root.muted;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                    opacity: root.discovery-active && root.pulse ? 0.55 : 1.0;
+                                    animate opacity { duration: 700ms; }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 16px;
+                                alignment: LayoutAlignment.start;
+                                for c in root.channels: HorizontalLayout {
+                                    spacing: 7px;
+                                    Rectangle {
+                                        width: 7px; height: 7px; border-radius: 4px;
+                                        y: (parent.height - self.height) / 2;
+                                        background: c.healthy ? root.accent : root.amber;
+                                    }
+                                    Text { text: c.name; color: root.text-hi; font-size: 11px; vertical-alignment: center; }
+                                }
+                            }
+                            Rectangle { height: 1px; background: root.line; }
+                            Text {
+                                text: root.discovered-count > 0
+                                    ? root.discovered-count + " bridges known - rendezvous rotates hourly, nothing to seize"
+                                    : "rendezvous rotates hourly, nothing to seize";
+                                color: root.muted; font-size: 11px; wrap: word-wrap;
+                            }
+                        }
                     }
                 }
-                // Read-only TextEdit => the log is selectable and Ctrl+C-copyable,
-                // with its own scrolling.
-                TextEdit {
-                    read-only: true;
-                    wrap: no-wrap;
-                    font-size: 12px;
-                    text: root.log-text;
+
+                // ---- This session ----
+                if root.running: VerticalLayout {
+                    spacing: 8px;
+                    Text { text: "THIS SESSION"; color: root.muted; font-size: 10px; font-weight: 700; }
+                    HorizontalLayout {
+                        spacing: 9px;
+                        Rectangle {
+                            horizontal-stretch: 1; height: 62px; border-radius: 11px;
+                            background: root.surface; border-width: 1px; border-color: root.line;
+                            VerticalLayout {
+                                padding: 12px; spacing: 5px;
+                                Text { text: "CARRIER"; color: root.muted; font-size: 9px; font-weight: 700; }
+                                Text {
+                                    text: root.via-carrier != "" ? root.via-carrier : "-";
+                                    color: root.accent; font-size: 16px; font-weight: 700; overflow: elide;
+                                }
+                            }
+                        }
+                        Rectangle {
+                            horizontal-stretch: 1; height: 62px; border-radius: 11px;
+                            background: root.surface; border-width: 1px; border-color: root.line;
+                            VerticalLayout {
+                                padding: 12px; spacing: 5px;
+                                Text { text: "STREAMS"; color: root.muted; font-size: 9px; font-weight: 700; }
+                                Text { text: root.session-streams; color: root.text-hi; font-size: 16px; font-weight: 700; }
+                            }
+                        }
+                        Rectangle {
+                            horizontal-stretch: 1; height: 62px; border-radius: 11px;
+                            background: root.surface; border-width: 1px; border-color: root.line;
+                            VerticalLayout {
+                                padding: 12px; spacing: 5px;
+                                Text { text: "UPTIME"; color: root.muted; font-size: 9px; font-weight: 700; }
+                                Text { text: root.uptime; color: root.text-hi; font-size: 16px; font-weight: 700; overflow: elide; }
+                            }
+                        }
+                    }
+                }
+
+                // ---- Bridges (connected) ----
+                if root.running && root.bridges.length > 0: VerticalLayout {
+                    spacing: 8px;
+                    HorizontalLayout {
+                        Text { text: "BRIDGES"; color: root.muted; font-size: 10px; font-weight: 700; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.sessions + " sessions"; color: root.muted; font-size: 10px; vertical-alignment: center; }
+                    }
+                    for b in root.bridges: Rectangle {
+                        height: 42px;
+                        border-radius: 9px;
+                        background: root.surface;
+                        border-width: 1px;
+                        border-color: root.line;
+                        HorizontalLayout {
+                            padding-left: 0px;
+                            padding-right: 12px;
+                            spacing: 10px;
+                            Rectangle {
+                                width: 4px;
+                                background: b.id-color;
+                                border-top-left-radius: 9px;
+                                border-bottom-left-radius: 9px;
+                            }
+                            Rectangle {
+                                width: 9px; height: 9px; border-radius: 5px;
+                                y: (parent.height - self.height) / 2;
+                                background: b.healthy ? root.accent : root.coral;
+                            }
+                            Text {
+                                text: b.addr + (b.port != "" ? ":" + b.port : "");
+                                color: root.text-hi; font-size: 12px;
+                                overflow: elide; horizontal-stretch: 1;
+                                vertical-alignment: center;
+                            }
+                            Rectangle {
+                                border-radius: 5px;
+                                background: b.transport-color;
+                                y: (parent.height - self.height) / 2;
+                                height: 18px;
+                                HorizontalLayout {
+                                    padding-left: 8px; padding-right: 8px;
+                                    Text { text: b.transport; color: white; font-size: 10px; vertical-alignment: center; }
+                                }
+                            }
+                            Text { text: b.latency; color: b.latency-color; font-size: 11px; vertical-alignment: center; }
+                        }
+                    }
+                }
+
+                // ---- Log (collapsible) ----
+                VerticalLayout {
+                    spacing: 8px;
+                    HorizontalLayout {
+                        Rectangle {
+                            width: 60px; height: 22px;
+                            lt-touch := TouchArea { clicked => { root.show-log = !root.show-log; } }
+                            Text {
+                                text: root.show-log ? "LOG -" : "LOG +";
+                                color: root.muted; font-size: 10px; font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        if root.show-log: Rectangle {
+                            width: 52px; height: 22px; border-radius: 5px;
+                            background: cl-touch.pressed ? root.surface-2 : #182437;
+                            cl-touch := TouchArea { clicked => { root.clear-log(); } }
+                            Text { text: "clear"; color: root.muted; font-size: 10px; }
+                        }
+                    }
+                    if root.show-log: Rectangle {
+                        height: 180px;
+                        border-radius: 12px;
+                        background: #070c15;
+                        border-width: 1px;
+                        border-color: root.line;
+                        VerticalBox {
+                            padding: 12px;
+                            TextEdit {
+                                read-only: true;
+                                wrap: no-wrap;
+                                font-size: 12px;
+                                text: root.log-text;
+                            }
+                        }
+                    }
+                }
+
+                // ---- Footer ----
+                if root.version != "": Text {
+                    text: "mirage-client " + root.version;
+                    color: root.muted; font-size: 10px;
+                    horizontal-alignment: center;
                 }
             }
-        }
-
-        // ===== Footer =====
-        if root.version != "": Text {
-            text: "mirage-client " + root.version;
-            color: root.muted; font-size: 10px;
-            horizontal-alignment: center;
         }
     }
 
     // ===== Built-in file browser (modal overlay) =====
-    // A self-contained picker so no system file-dialog tool is required.
     if root.show-browser: Rectangle {
         background: #000000cc;
-        // Click the dimmed backdrop to dismiss.
         TouchArea { clicked => { root.browser-cancel(); } }
 
         Rectangle {
@@ -369,22 +679,23 @@ export component AppWindow inherits Window {
             y: (parent.height - self.height) / 2;
             width: min(parent.width - 40px, 400px);
             height: min(parent.height - 60px, 460px);
-            background: root.card-bg;
+            background: root.surface;
             border-radius: 14px;
-            // Absorb clicks inside the panel so they don't hit the backdrop.
+            border-width: 1px;
+            border-color: root.line;
             TouchArea {}
 
             VerticalBox {
                 padding: 16px;
                 spacing: 10px;
-                Text { text: "Select a client.json"; font-weight: 700; color: white; }
+                Text { text: "Select a client.json"; font-weight: 700; color: root.text-hi; }
                 Text {
                     text: root.browser-path;
                     color: root.muted; font-size: 11px; overflow: elide;
                 }
                 Rectangle {
                     vertical-stretch: 1;
-                    background: #0f151c;
+                    background: root.surface-2;
                     border-radius: 8px;
                     ScrollView {
                         VerticalLayout {
@@ -394,7 +705,7 @@ export component AppWindow inherits Window {
                             for e in root.browser-entries: Rectangle {
                                 height: 30px;
                                 border-radius: 6px;
-                                background: row-touch.has-hover ? #1a232e : transparent;
+                                background: row-touch.has-hover ? #1b2941 : transparent;
                                 row-touch := TouchArea {
                                     clicked => {
                                         if (e.is-dir) {
@@ -411,11 +722,11 @@ export component AppWindow inherits Window {
                                     Rectangle {
                                         width: 8px; height: 8px; border-radius: 2px;
                                         y: (parent.height - self.height) / 2;
-                                        background: e.is-dir ? root.accent : root.muted;
+                                        background: e.is-dir ? root.azure : root.muted;
                                     }
                                     Text {
                                         text: e.is-dir ? e.name + "/" : e.name;
-                                        color: white; font-size: 13px; overflow: elide;
+                                        color: root.text-hi; font-size: 13px; overflow: elide;
                                         vertical-alignment: center;
                                         horizontal-stretch: 1;
                                     }
@@ -428,7 +739,7 @@ export component AppWindow inherits Window {
                     alignment: end;
                     Rectangle {
                         width: 92px; height: 34px; border-radius: 8px;
-                        background: cancel-touch.pressed ? #1a232e : #26313d;
+                        background: cancel-touch.pressed ? root.surface-2 : #223247;
                         cancel-touch := TouchArea { clicked => { root.browser-cancel(); } }
                         Text { text: "Cancel"; color: root.muted; }
                     }

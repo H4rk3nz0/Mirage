@@ -46,6 +46,11 @@ struct Shared {
     child: Mutex<Option<std::process::Child>>,
     logs: Mutex<VecDeque<String>>,
     state: Mutex<DaemonState>,
+    /// Whether to launch the daemon with `--paranoid` (the GUI's Paranoid
+    /// switch). The daemon echoes its actual posture back in /api/status.
+    paranoid: Mutex<bool>,
+    /// Name of the saved profile currently connected (empty = ad-hoc invite).
+    active_profile: Mutex<String>,
 }
 
 impl Shared {
@@ -54,11 +59,21 @@ impl Shared {
             child: Mutex::new(None),
             logs: Mutex::new(VecDeque::new()),
             state: Mutex::new(DaemonState::Stopped),
+            paranoid: Mutex::new(false),
+            active_profile: Mutex::new(String::new()),
         }
     }
 
     fn set_state(&self, s: DaemonState) {
         *self.state.lock().expect("state lock") = s;
+    }
+
+    fn paranoid(&self) -> bool {
+        *self.paranoid.lock().expect("paranoid lock")
+    }
+
+    fn active_profile(&self) -> String {
+        self.active_profile.lock().expect("profile lock").clone()
     }
 
     fn push_log(&self, line: String) {
@@ -109,6 +124,22 @@ fn http_get(addr: &str, path: &str) -> Option<String> {
     let mut resp = String::new();
     stream.read_to_string(&mut resp).ok();
     resp.split("\r\n\r\n").nth(1).map(|s| s.to_string())
+}
+
+/// POST to a state-changing management endpoint. Sends the `X-Mirage-Control`
+/// header the daemon requires (a non-simple header a cross-origin browser page
+/// cannot forge), so only this native client can trigger it. Best-effort.
+fn http_post_control(addr: &str, path: &str) {
+    use std::io::Write;
+    use std::net::TcpStream;
+
+    if let Ok(mut stream) = TcpStream::connect(addr) {
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+        let req = format!(
+            "POST {path} HTTP/1.0\r\nHost: {addr}\r\nX-Mirage-Control: 1\r\nContent-Length: 0\r\n\r\n"
+        );
+        let _ = stream.write_all(req.as_bytes());
+    }
 }
 
 // Binary / launch helpers
@@ -193,6 +224,10 @@ fn launch_client(shared: &Arc<Shared>, invite: String, config_path: String) {
         .env("NO_COLOR", "1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // The Paranoid switch forces the strong posture regardless of the config.
+    if shared.paranoid() {
+        command.arg("--paranoid");
+    }
 
     // Linux: SIGKILL this child if the GUI dies (covers hard-kills that skip Drop).
     #[cfg(target_os = "linux")]
@@ -312,6 +347,88 @@ fn stop_client(shared: &Arc<Shared>) {
     }
     *shared.child.lock().expect("child lock") = None;
     shared.set_state(DaemonState::Stopped);
+}
+
+// Saved connection profiles
+
+/// A named connection profile: an invite string and/or a client.json path. Stored
+/// as a small JSON array in the user's config dir so the GUI can offer one-click
+/// reconnects across launches. Contents are the same secrets the user already
+/// pasted; no new sensitive material is introduced.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct Profile {
+    name: String,
+    #[serde(default)]
+    invite: String,
+    #[serde(default)]
+    config_path: String,
+}
+
+/// Where profiles live: `$XDG_CONFIG_HOME/mirage/gui-profiles.json` (Linux),
+/// `~/Library/Application Support/mirage/...` (macOS), `%APPDATA%\mirage\...`
+/// (Windows), falling back to the current directory if none resolve.
+fn profiles_path() -> std::path::PathBuf {
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA").map(std::path::PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join("Library/Application Support"));
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")));
+    base.unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("mirage")
+        .join("gui-profiles.json")
+}
+
+fn load_profiles() -> Vec<Profile> {
+    std::fs::read_to_string(profiles_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_profiles(list: &[Profile]) {
+    let path = profiles_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(list) {
+        let _ = std::fs::write(&path, s);
+    }
+}
+
+/// A short human subtitle for a profile row: the config filename if present,
+/// else a truncated preview of the invite.
+fn profile_subtitle(p: &Profile) -> String {
+    if !p.config_path.is_empty() {
+        std::path::Path::new(&p.config_path)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| p.config_path.clone())
+    } else if !p.invite.is_empty() {
+        let preview: String = p.invite.trim().chars().take(30).collect();
+        if p.invite.trim().chars().count() > 30 {
+            format!("{preview}...")
+        } else {
+            preview
+        }
+    } else {
+        String::new()
+    }
+}
+
+fn profiles_model(list: &[Profile], active: &str) -> slint::ModelRc<ProfileRow> {
+    let rows: Vec<ProfileRow> = list
+        .iter()
+        .map(|p| ProfileRow {
+            name: p.name.clone().into(),
+            subtitle: profile_subtitle(p).into(),
+            active: !active.is_empty() && p.name == active,
+        })
+        .collect();
+    slint::ModelRc::new(slint::VecModel::from(rows))
 }
 
 // Log line cleanup
@@ -450,6 +567,7 @@ fn spawn_poll_thread(ui: slint::Weak<AppWindow>, shared: Arc<Shared>) {
         }
 
         let state = shared.state.lock().expect("state lock").clone();
+        let active_profile = shared.active_profile();
         let logs: Vec<String> = shared
             .logs
             .lock()
@@ -459,9 +577,45 @@ fn spawn_poll_thread(ui: slint::Weak<AppWindow>, shared: Arc<Shared>) {
             .collect();
 
         // Marshal into UI-thread update.
-        let _ =
-            ui.upgrade_in_event_loop(move |ui| apply_snapshot(&ui, &state, status, bridges, logs));
+        let _ = ui.upgrade_in_event_loop(move |ui| {
+            apply_snapshot(&ui, &state, status, bridges, logs, &active_profile);
+        });
     });
+}
+
+/// Prettify a wire transport name for display ("reality" -> "Reality").
+fn prettify_carrier(t: &str) -> String {
+    match t.to_ascii_lowercase().as_str() {
+        "reality" => "Reality".into(),
+        "hysteria2" => "Hysteria2".into(),
+        "ss2022" | "shadowsocks" => "Shadowsocks".into(),
+        "meek" => "meek".into(),
+        "websocket" | "ws" => "WebSocket".into(),
+        "vless" => "VLESS".into(),
+        "doh" => "DoH".into(),
+        "dnstt" | "dns" => "dnstt".into(),
+        "webrtc" => "WebRTC".into(),
+        "h3" | "masque" => "MASQUE".into(),
+        "obfs" => "obfs".into(),
+        "raw" => "Raw".into(),
+        other if !other.is_empty() => {
+            let mut c = other.chars();
+            c.next()
+                .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                .unwrap_or_default()
+        }
+        _ => "-".into(),
+    }
+}
+
+/// Prettify a discovery channel name ("dht" -> "DHT").
+fn prettify_channel(c: &str) -> String {
+    match c.to_ascii_lowercase().as_str() {
+        "dht" => "DHT".into(),
+        "nostr" => "Nostr".into(),
+        "dns" => "DNS TXT".into(),
+        other => other.to_uppercase(),
+    }
 }
 
 fn apply_snapshot(
@@ -470,6 +624,7 @@ fn apply_snapshot(
     status: Option<serde_json::Value>,
     bridges: Vec<BridgeStat>,
     logs: Vec<String>,
+    active_profile: &str,
 ) {
     let (state_str, err) = match state {
         DaemonState::Stopped => ("stopped", String::new()),
@@ -479,6 +634,9 @@ fn apply_snapshot(
     };
     ui.set_daemon_state(state_str.into());
     ui.set_error_text(err.into());
+    ui.set_active_profile(active_profile.into());
+    // Keep the profile list (and its active highlight) in sync with disk + state.
+    ui.set_profiles(profiles_model(&load_profiles(), active_profile));
 
     if let Some(v) = status {
         ui.set_bind_addr(v["local_bind"].as_str().unwrap_or("").into());
@@ -490,6 +648,42 @@ fn apply_snapshot(
         let carriers = v["mux_carriers"].as_u64().unwrap_or(0);
         let streams = v["mux_streams"].as_u64().unwrap_or(0);
         ui.set_mux(format!("{carriers} x {streams}").into());
+        ui.set_session_streams(streams.to_string().into());
+
+        // Discovery status + strong-posture flag.
+        ui.set_paranoid(v["paranoid"].as_bool().unwrap_or(false));
+        ui.set_discovery_active(v["discovery_active"].as_bool().unwrap_or(false));
+        ui.set_discovered_count(v["discovered_count"].as_i64().unwrap_or(0) as i32);
+        let chans: Vec<ChannelRow> = v["discovery_channels"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| c.as_str())
+                    .map(|c| ChannelRow {
+                        name: prettify_channel(c).into(),
+                        // Configured channels are shown as in-play; the daemon
+                        // does not expose per-channel liveness yet.
+                        healthy: true,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ui.set_channels(slint::ModelRc::new(slint::VecModel::from(chans)));
+    }
+
+    // Derive the "via <carrier> - bridge <fp>" line from the primary bridge:
+    // prefer one actively carrying traffic, else the first healthy, else first.
+    if let Some(primary) = bridges
+        .iter()
+        .find(|b| b.healthy && b.mux_carriers > 0)
+        .or_else(|| bridges.iter().find(|b| b.healthy))
+        .or_else(|| bridges.first())
+    {
+        ui.set_via_carrier(prettify_carrier(&primary.transport).into());
+        ui.set_via_bridge(primary.bridge_pk_fp.clone().into());
+    } else {
+        ui.set_via_carrier("".into());
+        ui.set_via_bridge("".into());
     }
 
     let rows: Vec<BridgeRow> = bridges
@@ -608,6 +802,9 @@ fn main() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
     let shared = Arc::new(Shared::new());
 
+    // Load saved profiles from disk into the picker.
+    ui.set_profiles(profiles_model(&load_profiles(), ""));
+
     {
         let ui_weak = ui.as_weak();
         let shared = Arc::clone(&shared);
@@ -615,13 +812,127 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Some(ui) = ui_weak.upgrade() {
                 let invite = ui.get_invite().to_string();
                 let path = ui.get_config_path().to_string();
+                // An ad-hoc invite is not a saved profile.
+                shared.active_profile.lock().expect("profile lock").clear();
                 launch_client(&shared, invite, path);
             }
         });
     }
     {
+        let ui_weak = ui.as_weak();
         let shared = Arc::clone(&shared);
-        ui.on_stop(move || stop_client(&shared));
+        ui.on_stop(move || {
+            stop_client(&shared);
+            shared.active_profile.lock().expect("profile lock").clear();
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_active_profile("".into());
+                ui.set_profiles(profiles_model(&load_profiles(), ""));
+            }
+        });
+    }
+    // Reconnect = restart the daemon with the same invite/config. This re-walks
+    // discovery and renegotiates carriers; the active profile is preserved.
+    {
+        let ui_weak = ui.as_weak();
+        let shared = Arc::clone(&shared);
+        ui.on_reconnect(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                let invite = ui.get_invite().to_string();
+                let path = ui.get_config_path().to_string();
+                stop_client(&shared);
+                launch_client(&shared, invite, path);
+            }
+        });
+    }
+    // Re-discover: ask the running daemon to walk the rendezvous channels now
+    // (POST /api/rediscover). Non-blocking; the poll loop reflects the result.
+    {
+        ui.on_rediscover(move || {
+            std::thread::spawn(|| http_post_control(MGMT_ADDR, "/api/rediscover"));
+        });
+    }
+    // Paranoid toggle: flip the launch flag and, if connected, restart into the
+    // new posture. The daemon echoes its actual posture back in /api/status.
+    {
+        let ui_weak = ui.as_weak();
+        let shared = Arc::clone(&shared);
+        ui.on_toggle_paranoid(move || {
+            {
+                let mut p = shared.paranoid.lock().expect("paranoid lock");
+                *p = !*p;
+            }
+            if let Some(ui) = ui_weak.upgrade() {
+                let running = shared.state.lock().expect("state lock").clone();
+                if matches!(running, DaemonState::Running | DaemonState::Starting) {
+                    let invite = ui.get_invite().to_string();
+                    let path = ui.get_config_path().to_string();
+                    stop_client(&shared);
+                    launch_client(&shared, invite, path);
+                }
+            }
+        });
+    }
+    // Save the current form as a named profile (replacing any of the same name).
+    {
+        let ui_weak = ui.as_weak();
+        let shared = Arc::clone(&shared);
+        ui.on_save_profile(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                let name = ui.get_profile_name().to_string().trim().to_string();
+                let invite = ui.get_invite().to_string();
+                let config_path = ui.get_config_path().to_string();
+                if name.is_empty() || (invite.is_empty() && config_path.is_empty()) {
+                    return;
+                }
+                let mut list = load_profiles();
+                list.retain(|p| p.name != name);
+                list.push(Profile {
+                    name,
+                    invite,
+                    config_path,
+                });
+                list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                save_profiles(&list);
+                ui.set_profiles(profiles_model(&list, &shared.active_profile()));
+                ui.set_profile_name("".into());
+            }
+        });
+    }
+    // Connect using a saved profile: load its fields, mark it active, (re)launch.
+    {
+        let ui_weak = ui.as_weak();
+        let shared = Arc::clone(&shared);
+        ui.on_load_profile(move |name| {
+            if let Some(ui) = ui_weak.upgrade() {
+                if let Some(p) = load_profiles()
+                    .into_iter()
+                    .find(|p| p.name == name.as_str())
+                {
+                    let nm = p.name.clone();
+                    *shared.active_profile.lock().expect("profile lock") = nm.clone();
+                    ui.set_invite(p.invite.clone().into());
+                    ui.set_config_path(p.config_path.clone().into());
+                    ui.set_active_profile(nm.clone().into());
+                    ui.set_show_connect(false);
+                    ui.set_profiles(profiles_model(&load_profiles(), &nm));
+                    stop_client(&shared);
+                    launch_client(&shared, p.invite, p.config_path);
+                }
+            }
+        });
+    }
+    // Forget a saved profile.
+    {
+        let ui_weak = ui.as_weak();
+        let shared = Arc::clone(&shared);
+        ui.on_delete_profile(move |name| {
+            if let Some(ui) = ui_weak.upgrade() {
+                let mut list = load_profiles();
+                list.retain(|p| p.name != name.as_str());
+                save_profiles(&list);
+                ui.set_profiles(profiles_model(&list, &shared.active_profile()));
+            }
+        });
     }
     // Built-in file browser - open, navigate, pick, cancel. All handlers run on
     // the UI thread; directory listing is a fast synchronous fs read.

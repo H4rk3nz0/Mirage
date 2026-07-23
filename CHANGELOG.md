@@ -5,6 +5,76 @@ All notable changes to Mirage are documented here. The format follows
 follow [Semantic Versioning](https://semver.org/) once it reaches 1.0. Until
 then, pre-releases may make breaking changes between versions.
 
+## [Unreleased]
+
+### Added
+- **Proteus - replay-based traffic shaping, the flagship Reality upgrade.**
+  Reality makes the *connection* look real; Proteus makes the *flow* look real,
+  replaying the exact wire envelope (record sizes, direction, timing) of a
+  genuine recorded video stream or web page load with your data hidden inside the
+  encrypted records. The point is replay, not fake: a generated "video-like"
+  pattern is subtly wrong and detectable, a real recorded envelope is not.
+  - A live envelope pacer wired into the Reality carrier, symmetric in both
+    directions (the client paces what it sends up, the bridge what it sends down).
+  - `mirage-cover-record` - a self-contained recorder that builds the trace
+    library from real open sources (PeerTube video, Wikipedia browsing), with a
+    self-driving `--loop` mode and a systemd unit; one shipped binary, no
+    external tools.
+  - Cover **classes** (streaming video *or* web browsing) and **per-session
+    trace-chaining** - each session replays a fresh random shuffle of real
+    traces, so there is no fixed fingerprint and nothing loops.
+  - Extended to the **Shadowsocks-2022** carrier in addition to Reality.
+  - An adaptive per-network cover-class bandit that learns which shape gets
+    through on the current network.
+- **Encrypted Client Hello (ECH)** on the TLS carriers (meek / DoH / WebSocket).
+  The inner SNI is encrypted with a hand-rolled RFC 9180 HPKE
+  (DHKEM-X25519 / HKDF-SHA256 / AES-128-GCM, no new dependencies), so a censor
+  cannot see which host you are really reaching behind a CDN. Delivered via the
+  invite (`INVITE_EXT_ECH_CONFIG`) or config (`carrier_ech_config`), and minted
+  by `mirage-keygen --ech-config`.
+- **Mirage visual identity + logo.** A refraction mark (a peak on the horizon
+  and its mirage echo) and a blue-slate palette (teal = connected, not alarm
+  green) applied across the desktop client, the operator admin UI, and the setup
+  wizard, plus a README banner and a redesigned app icon.
+- **Desktop client redesigned, and it puts you in control of both ends.** The
+  GUI was rebuilt to the new design: a connection **orb**, a control row
+  (**Re-discover** / **Reconnect** / **Paranoid**), saved connection
+  **profiles** (name, one-click switch, persisted to the platform config dir), a
+  live **discovery panel** (which rendezvous channels are walking and how many
+  bridges are known), and session stats (carrier / streams / uptime).
+- **On-demand re-discovery.** The client can walk its rendezvous channels
+  (DHT / Nostr / DNS) immediately on request instead of waiting for the next
+  periodic tick - surfaced as the GUI's **Re-discover** button and the management
+  endpoint `POST /api/rediscover`.
+- **`mirage-client --paranoid`** forces the strong posture (Reality + replay
+  pacing + fail-closed) from the command line regardless of the config file;
+  this powers the GUI's Paranoid toggle for file-based configs it will not
+  rewrite.
+- The client management API (`GET /api/status`) now reports the configured
+  discovery channels, the number of bridges discovered, whether a discovery walk
+  is currently in flight, and whether paranoid mode is on.
+- **Bridge operator admin web UI redesign** to the new identity, with a live
+  sessions sparkline.
+- **Setup wizard** (`mirage-setup`) gained an identity banner, colour accents
+  (suppressed when piped or under `NO_COLOR`), warmer intro copy, and a numbered
+  "next steps" handoff (start the bridge, publish the announcement, share the
+  invite).
+
+### Changed
+- The README now headlines Proteus as the flagship Reality upgrade; the feature
+  and operator docs cover cover classes, paranoid mode, and the cover recorder.
+
+### Security
+- Admin web UI: the access token is no longer written to the structured log
+  (console-only), so a log shipper cannot carry off a live credential; added
+  anti-clickjacking headers (`X-Frame-Options: DENY`,
+  `Content-Security-Policy: frame-ancestors 'none'`) and
+  `X-Content-Type-Options: nosniff`; config keys are HTML-escaped in the editor.
+- The new state-changing `POST /api/rediscover` endpoint requires POST plus a
+  non-simple `X-Mirage-Control` header that a cross-origin web page cannot forge
+  (its CORS preflight is never approved), on top of the existing
+  loopback-`Host` / DNS-rebinding check.
+
 ## [0.1.3-alpha.1] - 2026-07-21
 
 ### Added

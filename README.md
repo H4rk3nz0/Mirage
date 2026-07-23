@@ -1,8 +1,18 @@
-# Mirage
+<p align="center">
+  <img src="assets/mirage-banner.svg" alt="Mirage" width="640">
+</p>
 
-**A censorship-resistance framework stack.** Pluggable carriers, epoch-rotated bridge
-discovery, authenticated session crypto, replay-based traffic shaping, and optional onion
-routing - behind one local SOCKS5 proxy or a full-device VPN.
+<p align="center">
+  Pluggable carriers &middot; epoch-rotated discovery &middot; authenticated session crypto &middot; replay-based traffic shaping &middot; onion routing<br>
+  <sub>behind one local SOCKS5 proxy or a full-device VPN</sub>
+</p>
+
+<p align="center">
+  <a href="docs/getting-started.md"><b>Get started</b></a> &nbsp;&middot;&nbsp;
+  <a href="docs/operators.md">Run a bridge</a> &nbsp;&middot;&nbsp;
+  <a href="docs/features.md">Features</a> &nbsp;&middot;&nbsp;
+  <a href="docs/security-model.md">Security model</a>
+</p>
 
 > **Status:** `0.1.3-alpha.1`. Deployable today. Wire formats and config may still change
 > before `0.1.0`.
@@ -75,7 +85,10 @@ One switch turns on the whole strong posture: `"paranoid": true`. Details in the
 mirage-client client.json      # then point your browser at socks5://127.0.0.1:1080
 ```
 
-Or run `mirage-client-gui`, paste the invite, click **Connect**.
+Or run `mirage-client-gui`, paste the invite, click **Connect**. The desktop app
+keeps you in control of both ends: save and switch **profiles**, force a fresh
+**re-discover** walk, reconnect, and flip **Paranoid** on, with a live view of the
+carrier, the rendezvous channels, and the bridges it has found.
 
 **Run a bridge** - the wizard writes both configs and the invite for you:
 
@@ -108,6 +121,10 @@ several and switch when one gets blocked.
 **Layers that ride on top of any carrier:** frame padding + timing jitter (defeats ML flow
 fingerprinting), stream multiplexing, and single-port dispatch across every carrier at once.
 
+**Encrypted SNI (ECH)** - on CDN-fronted TLS carriers (meek / DoH / WebSocket), the real
+inner hostname is encrypted with RFC 9180 HPKE, so a censor watching the CDN edge can't see
+which site you are really reaching. Delivered in the invite or set in config.
+
 **Finding bridges** - epoch-rotated rendezvous over **Nostr**, **DNS TXT**, and the
 **BitTorrent DHT**, so there's no single list to seize.
 
@@ -117,9 +134,10 @@ fingerprinting), stream multiplexing, and single-port dispatch across every carr
 **Multi-hop** - chain up to **3 bridges** into an onion circuit, each hop authenticated
 separately, so no single bridge sees both who you are and where you're going.
 
-**Paranoid mode** - one config switch (`paranoid: true`) puts on the strongest posture at
-once: Reality carrier, handshake padding, fail-closed, and **Proteus** replay pacing (see
-above).
+**Paranoid mode** - one switch puts on the strongest posture at once: Reality carrier,
+handshake padding, fail-closed, and **Proteus** replay pacing (see above). Set
+`"paranoid": true` in config, pass `--paranoid` to `mirage-client`, or flip the toggle in
+the GUI.
 
 Runs on **Linux, macOS, and Windows**. Full detail in the
 **[feature reference](docs/features.md)**.

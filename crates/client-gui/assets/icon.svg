@@ -1,9 +1,24 @@
 <svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
-  <rect width="512" height="512" rx="115" fill="#0b0f14"/>
-  <!-- protective shield outline (Mirage green) -->
-  <path d="M256 92 L390 150 V276 C390 356 330 408 256 434 C182 408 122 356 122 276 V150 Z"
-        fill="none" stroke="#10b981" stroke-width="30" stroke-linejoin="round"/>
-  <!-- inner mark: a solid dot over a soft ring (a shrouded point = 'mirage') -->
-  <circle cx="256" cy="252" r="86" fill="none" stroke="#10b981" stroke-width="14" opacity="0.35"/>
-  <circle cx="256" cy="252" r="46" fill="#10b981"/>
+  <defs>
+    <linearGradient id="r" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#62b0f2"/><stop offset="1" stop-color="#9385f2"/>
+    </linearGradient>
+    <linearGradient id="e" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9385f2" stop-opacity=".55"/><stop offset="1" stop-color="#9385f2" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="32%" r="62%">
+      <stop offset="0" stop-color="#4f9fe6" stop-opacity=".30"/>
+      <stop offset="58%" stop-color="#9385f2" stop-opacity=".07"/>
+      <stop offset="100%" stop-color="#9385f2" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <!-- dusk-blue rounded tile + one soft refraction glow -->
+  <rect width="512" height="512" rx="115" fill="#0b1220"/>
+  <rect width="512" height="512" rx="115" fill="url(#glow)"/>
+  <!-- the mark (48-unit artwork scaled to 320px, centred): peak, horizon, echo -->
+  <g transform="translate(96,96) scale(6.6667)">
+    <path d="M24 9 L40 31 H8 Z" fill="url(#r)"/>
+    <rect x="7" y="30.4" width="34" height="2" rx="1" fill="#4f9fe6" opacity=".55"/>
+    <path d="M24 45 L37 34 H11 Z" fill="url(#e)"/>
+  </g>
 </svg>

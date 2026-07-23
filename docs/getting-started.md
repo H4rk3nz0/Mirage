@@ -38,8 +38,19 @@ cargo build --release --workspace
 mirage-client-gui
 ```
 
-Paste the invite (or click **Browse...** to pick a `client.json`), then click **Connect**. It shows
-live connection status and which carrier it settled on.
+Paste the invite (or click **Browse...** to pick a `client.json`), then click **Connect**. A
+connection orb shows live status, the carrier it settled on, and the bridge it is using.
+
+The app is built to keep you in control of both ends:
+
+- **Profiles** - save an invite or `client.json` under a name and switch between them with one
+  click (persisted locally, so they survive restarts).
+- **Re-discover** - force the client to walk its rendezvous channels (DHT / Nostr / DNS) again
+  right now instead of waiting for the next periodic sweep. The **Discovery** panel shows which
+  channels are in play and how many bridges it has found.
+- **Reconnect** - drop and re-establish the tunnel.
+- **Paranoid** - flip on the strongest posture (Reality + replay pacing + fail-closed) without
+  editing config.
 
 Install it from the native installer for your platform - **AppImage/`.deb`** (Linux),
 **`.dmg`** (macOS), or **`.msi`** (Windows) - see **[install.md](install.md)** (installers are
