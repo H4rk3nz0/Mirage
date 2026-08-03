@@ -152,6 +152,12 @@ then, pre-releases may make breaking changes between versions.
   capture missed.
 
 ### Security
+- `event-listener` 5.4.1 -> 5.4.2, clearing RUSTSEC-2026-0221 (`StackSlot<'_, T>`
+  unconditionally implemented `Send`/`Sync`, allowing `!Send` tags to cross
+  thread boundaries). Reached only through the Slint desktop client's
+  zbus/ashpd portal stack, so it was eligible for a GUI-only ignore on the same
+  reasoning as the existing entries; a patched release existed, so it was
+  upgraded rather than ignored.
 - Admin web UI: the access token is no longer written to the structured log
   (console-only), so a log shipper cannot carry off a live credential; added
   anti-clickjacking headers (`X-Frame-Options: DENY`,

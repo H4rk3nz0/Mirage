@@ -345,7 +345,11 @@ pub fn null_model(
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     };
-    let mut draws: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); N_FEATURES];
+    // Built per element, not `vec![Vec::with_capacity(reps); N]`: that form
+    // evaluates the expression once and CLONES it, and cloning an empty Vec
+    // drops its capacity, so all but one would reallocate their way up through
+    // `reps` pushes.
+    let mut draws: Vec<Vec<f64>> = (0..N_FEATURES).map(|_| Vec::with_capacity(reps)).collect();
     let (mut ai, mut bi) = (Vec::with_capacity(na), Vec::with_capacity(n - na));
     for _ in 0..reps {
         // Fisher-Yates, so every split is equally likely.
@@ -774,7 +778,7 @@ mod tests {
             }
             wins / total
         }
-        let mut rng = 0xD15E_A5Eu64;
+        let mut rng = 0x0D15_EA5E_u64;
         let mut next = || {
             rng = rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
             let mut z = rng;
