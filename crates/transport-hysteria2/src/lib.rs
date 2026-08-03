@@ -92,6 +92,16 @@ const HYSTERIA2_KNOCK_LABEL: &str = "mirage hysteria2 v1 auth";
 
 /// Length of the knock token in bytes.
 const KNOCK_TOKEN_LEN: usize = 32;
+/// Per-session pace seed sent immediately after the knock.
+///
+/// Envelope pacing only works if BOTH ends replay the same trace from the same
+/// offset, so they need a shared per-session value. Deriving it from the obfs key
+/// would give every session to a given bridge the identical envelope - a fixed
+/// shape repeated across sessions is its own fingerprint - so the client draws it
+/// fresh and sends it. It is not a secret and authenticates nothing; the inner
+/// Noise handshake does that. It rides inside the obfuscated QUIC stream, so it is
+/// no more visible than the knock it follows.
+const PACE_SEED_LEN: usize = 8;
 
 /// Minimum BRUTAL congestion window (64 KiB).
 const MIN_BRUTAL_WINDOW: u64 = 64 * 1024;
@@ -202,6 +212,13 @@ pub struct Hysteria2ServerConfig {
     /// only on a hostile link that throttles via induced loss - BRUTAL's
     /// non-backoff pacing is a behavioural tell and antisocial on shared paths.
     pub brutal_cc: bool,
+    /// Opt-in to the Wu-2023 evasion preamble on obfuscated datagrams (needs
+    /// `obfs_key`). Salamander/Gecko output is uniformly random, which the GFW's
+    /// deployed fully-encrypted-traffic classifier flags; the preamble prepends
+    /// a printable run that clears its exemptions. MUST match the client. Off by
+    /// default - it is a per-network posture, not a universal win (see
+    /// `mirage_quic_obfs::wu`). Ignored when `obfs_key` is `None`.
+    pub quic_wu_evasion: bool,
 }
 
 // Client configuration
@@ -220,6 +237,10 @@ pub struct Hysteria2ClientConfig {
     /// XOR-scrambles every datagram + fragments handshake packets so the wire
     /// shows no QUIC fingerprint. MUST match the bridge's key. `None` = plain.
     pub obfs_key: Option<[u8; 32]>,
+    /// Opt-in to the Wu-2023 evasion preamble on obfuscated datagrams (needs
+    /// `obfs_key`). MUST match the bridge. Off by default; see
+    /// `mirage_quic_obfs::wu` and [`Hysteria2ServerConfig::quic_wu_evasion`].
+    pub quic_wu_evasion: bool,
 }
 
 // Stream wrapper
@@ -236,18 +257,40 @@ pub struct Hysteria2Stream {
     remote_addr: SocketAddr,
     /// L2: the server's h3 CONTROL stream (plain-QUIC mode only). Held - never
     /// finished or dropped - for the connection lifetime so it stays a valid h3
+    /// Per-session pace seed shared with the peer (see [`Self::pace_seed`]).
+    pace_seed: u64,
     /// control stream to an active prober. `None` in obfs mode / on the client.
     _h3_control: Option<quinn::SendStream>,
 }
 
 impl Hysteria2Stream {
-    fn new(send: quinn::SendStream, recv: quinn::RecvStream, remote_addr: SocketAddr) -> Self {
+    /// [`Self::new`] carrying the per-session pace seed both endpoints share.
+    fn with_seed(
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+        remote_addr: SocketAddr,
+        pace_seed: u64,
+    ) -> Self {
         Self {
             send,
             recv,
             remote_addr,
             _h3_control: None,
+            pace_seed,
         }
+    }
+
+    /// Per-session Proteus pace seed (identical on both endpoints). Feed to
+    /// `mirage_transport_reality::maybe_pace_stream` so the carrier's PAYLOAD is
+    /// held to the cover's envelope. The datagram shaper below quinn fixes sizes
+    /// and fills idle gaps but deliberately never delays real datagrams, so it
+    /// does nothing about VOLUME - measured at 76x between an idle and a busy
+    /// tunnel, perfectly separable on total bytes. Rate has to be enforced above
+    /// the transport, where backpressure reaches the application instead of
+    /// confusing a congestion controller.
+    #[must_use]
+    pub fn pace_seed(&self) -> u64 {
+        self.pace_seed
     }
 
     /// Attach the held server h3 control stream (L2).
@@ -423,6 +466,7 @@ fn build_server_quinn_config(
     hostname: &str,
     cert_key_der: Option<(&std::path::Path, &std::path::Path)>,
     brutal: bool,
+    wu: bool,
 ) -> Result<quinn::ServerConfig, TransportError> {
     // Cert source: an operator-provided DER cert+key (a real CA chain from a
     // reverse proxy / CDN / certbot, `openssl x509 -outform der` + a PKCS#8 DER
@@ -481,6 +525,7 @@ fn build_server_quinn_config(
     // L3: apply the same Chrome-QUIC transport-parameter magnitudes the client
     // uses, so the plain-QUIC (obfs-off) posture is not client/server-asymmetric.
     apply_chrome_transport_params(&mut transport);
+    apply_obfs_mtu_headroom(&mut transport, wu);
     server_config.transport_config(Arc::new(transport));
 
     Ok(server_config)
@@ -493,6 +538,7 @@ fn build_server_quinn_config(
 fn build_client_quinn_config(
     send_rate_bps: u64,
     brutal: bool,
+    wu: bool,
 ) -> Result<quinn::ClientConfig, TransportError> {
     let crypto_provider = Arc::new(rustls::crypto::ring::default_provider());
 
@@ -521,6 +567,7 @@ fn build_client_quinn_config(
     let initial_window = initial_window_for_rate(send_rate_bps);
     transport.send_window(initial_window);
     apply_chrome_transport_params(&mut transport);
+    apply_obfs_mtu_headroom(&mut transport, wu);
     client_config.transport_config(Arc::new(transport));
 
     Ok(client_config)
@@ -539,6 +586,85 @@ pub(crate) fn apply_chrome_transport_params(t: &mut quinn::TransportConfig) {
     t.stream_receive_window(quinn::VarInt::from_u32(6_291_456)); // ~6 MB
     t.max_concurrent_bidi_streams(quinn::VarInt::from_u32(100));
     t.max_concurrent_uni_streams(quinn::VarInt::from_u32(103));
+}
+
+/// Build datagram-layer shaping for this endpoint from the replay cover, if one
+/// is configured.
+///
+/// `want_down` picks the direction this endpoint SENDS: a bridge shapes what it
+/// sends downstream, a client what it sends upstream. Sizes are clamped to what
+/// the path can actually carry - padding a datagram past the MTU would trade a
+/// size fingerprint for dropped packets, which is a worse deal.
+fn build_quic_shape(want_down: bool, seed: u64, wu: bool) -> Option<mirage_quic_obfs::QuicShape> {
+    let tokens = mirage_transport_reality::pace_wire_sizes(want_down, seed)?;
+    let ceiling = u16::try_from(
+        usize::from(mirage_quic_obfs::mtu_upper_bound_with_overhead()).saturating_sub(if wu {
+            usize::from(mirage_quic_obfs::WU_MAX_WIRE_OVERHEAD)
+        } else {
+            0
+        }),
+    )
+    .unwrap_or(1200);
+    // Split oversize records into the back-to-back MTU packets the wire would
+    // have made of them, rather than clamping each to one. See
+    // `mirage_transport_reality::fragment_to_mtu` for why clamping both starves
+    // the byte rate and collapses the size distribution to a constant.
+    let burst = mirage_transport_reality::min_positive_gap(&tokens);
+    let tokens = mirage_transport_reality::fragment_to_mtu(tokens, ceiling, burst);
+    if tokens.is_empty() {
+        return None;
+    }
+    // Drop records too small to ever hold a QUIC datagram. Keeping them would not
+    // shape anything: the datagram cannot shrink to fit, so it would go out at its
+    // own length - measured at 100% of upstream datagrams against a browse cover,
+    // whose upstream records max around 500 bytes against QUIC's 1200 floor. A
+    // cover that cannot shape is worth refusing loudly, not applying quietly.
+    // Keep every record. QUIC's 1200-byte floor applies only to datagrams carrying
+    // an Initial, so small cover records still shape the small datagrams that make
+    // up most of a client's upstream - discarding them would throw away the useful
+    // majority to guard against the oversized minority. Only warn when nothing in
+    // the cover could hold a full-size datagram, since those will go out unpadded.
+    let biggest = tokens.iter().map(|&(sz, _)| sz).max().unwrap_or(0);
+    if biggest < mirage_quic_obfs::QUIC_MIN_HANDSHAKE_RECORD {
+        tracing::warn!(
+            direction = if want_down { "down" } else { "up" },
+            largest_record = biggest,
+            needed_for_full_size = mirage_quic_obfs::QUIC_MIN_HANDSHAKE_RECORD,
+            "hysteria2: cover has no record large enough for a full-size QUIC datagram - small \
+             datagrams are still shaped, oversized ones go out unpadded. Use a cover with \
+             larger records in this direction to close that."
+        );
+    }
+    let shape = mirage_quic_obfs::QuicShape { tokens };
+    tracing::info!(
+        direction = if want_down { "down" } else { "up" },
+        records = shape.tokens.len(),
+        max_size = shape.max_size(),
+        mean_gap_ms = shape.mean_gap().as_millis() as u64,
+        "hysteria2: datagram shaping from the replay cover"
+    );
+    Some(shape)
+}
+
+/// Reserve path-MTU headroom for the bytes the obfuscation layer adds beneath
+/// quinn when the Wu-2023 preamble is enabled.
+///
+/// quinn sizes datagrams - and its MTU-discovery probes - as though the socket
+/// were transparent, but `mirage_quic_obfs` prepends a salt, a Gecko frame tag
+/// and a VARIABLE-length preamble. Left alone, quinn probes its way up to a
+/// 1452 B datagram, which becomes up to `1452 + WU_MAX_WIRE_OVERHEAD` B on the
+/// wire - past the Ethernet MTU. Worse, because the preamble length is random,
+/// a probe can succeed with a short draw and a later data packet then fail with
+/// a long one, so quinn sees loss it reads as congestion. Lowering the discovery
+/// ceiling by the worst-case overhead makes every datagram fit whatever the
+/// preamble draws.
+fn apply_obfs_mtu_headroom(t: &mut quinn::TransportConfig, wu: bool) {
+    if !wu {
+        return;
+    }
+    let mut mtu = quinn::MtuDiscoveryConfig::default();
+    mtu.upper_bound(mirage_quic_obfs::mtu_upper_bound_with_overhead());
+    t.mtu_discovery_config(Some(mtu));
 }
 
 /// A TLS certificate verifier that accepts any certificate.
@@ -638,16 +764,36 @@ impl Hysteria2Server {
             }
             (None, None) => None,
         };
+        // The preamble only rides obfuscated datagrams, so headroom is reserved
+        // only when both are on.
+        let wu_on = config.obfs_key.is_some() && config.quic_wu_evasion;
         let server_cfg = build_server_quinn_config(
             config.send_rate_bps,
             &hostname,
             cert_key_der,
             config.brutal_cc,
+            wu_on,
         )?;
         let endpoint = match config.obfs_key {
             // Gecko/Salamander QUIC obfuscation on the UDP socket.
-            Some(key) => mirage_quic_obfs::server_endpoint(addr, server_cfg, key)
-                .map_err(|e| TransportError::Other(format!("obfs server bind {addr}: {e}")))?,
+            Some(key) => {
+                // The bridge shapes what it SENDS: the downstream half of the
+                // cover. Seeded from the shared obfs key so both ends draw from
+                // the same cover selection.
+                let shape = build_quic_shape(
+                    true,
+                    u64::from_le_bytes(key[..8].try_into().expect("key is 32 bytes")),
+                    config.quic_wu_evasion,
+                );
+                mirage_quic_obfs::server_endpoint_shaped(
+                    addr,
+                    server_cfg,
+                    key,
+                    config.quic_wu_evasion,
+                    shape,
+                )
+                .map_err(|e| TransportError::Other(format!("obfs server bind {addr}: {e}")))?
+            }
             None => quinn::Endpoint::server(server_cfg, addr)
                 .map_err(|e| TransportError::Other(format!("server bind {addr}: {e}")))?,
         };
@@ -700,10 +846,17 @@ impl Hysteria2Server {
                     .await
                     .map_err(|e| TransportError::Other(format!("accept_bi: {e}")))?;
 
-                let mut token_buf = [0u8; KNOCK_TOKEN_LEN];
-                recv.read_exact(&mut token_buf)
+                let mut first = [0u8; KNOCK_TOKEN_LEN + PACE_SEED_LEN];
+                recv.read_exact(&mut first)
                     .await
                     .map_err(|e| TransportError::Other(format!("knock token read: {e}")))?;
+                let mut token_buf = [0u8; KNOCK_TOKEN_LEN];
+                token_buf.copy_from_slice(&first[..KNOCK_TOKEN_LEN]);
+                let pace_seed = u64::from_le_bytes(
+                    first[KNOCK_TOKEN_LEN..]
+                        .try_into()
+                        .expect("slice is PACE_SEED_LEN bytes"),
+                );
 
                 // Constant-time compare - match the rest of the codebase
                 // (ws/meek/token). This is only a cheap pre-auth knock, not
@@ -723,7 +876,8 @@ impl Hysteria2Server {
                 }
 
                 Ok::<Hysteria2Stream, TransportError>(
-                    Hysteria2Stream::new(send, recv, remote_addr).with_h3_control(h3_control),
+                    Hysteria2Stream::with_seed(send, recv, remote_addr, pace_seed)
+                        .with_h3_control(h3_control),
                 )
             })
             .await
@@ -776,7 +930,10 @@ pub async fn hysteria2_client_connect(
     // BRUTAL is a server-downlink feature (the censored direction is usually the
     // bridge->client download); the client keeps BBR to stay a good network
     // citizen on its uplink.
-    let client_cfg = build_client_quinn_config(config.send_rate_bps, false)?;
+    // The preamble only rides obfuscated datagrams, so headroom is reserved only
+    // when both are on. MUST match the bridge, which reserves the same headroom.
+    let wu_on = config.obfs_key.is_some() && config.quic_wu_evasion;
+    let client_cfg = build_client_quinn_config(config.send_rate_bps, false, wu_on)?;
 
     // Bind the client on the appropriate wildcard address.
     let bind_addr: SocketAddr = if addr.is_ipv6() {
@@ -786,8 +943,17 @@ pub async fn hysteria2_client_connect(
     };
     let mut endpoint = match config.obfs_key {
         // Gecko/Salamander QUIC obfuscation on the UDP socket.
-        Some(key) => mirage_quic_obfs::client_endpoint(bind_addr, key)
-            .map_err(|e| TransportError::Other(format!("obfs client endpoint: {e}")))?,
+        Some(key) => {
+            // The client shapes what it SENDS: the upstream half. Seeded from the
+            // shared obfs key so both ends draw from the same cover selection.
+            let shape = build_quic_shape(
+                false,
+                u64::from_le_bytes(key[..8].try_into().expect("key is 32 bytes")),
+                config.quic_wu_evasion,
+            );
+            mirage_quic_obfs::client_endpoint_shaped(bind_addr, key, config.quic_wu_evasion, shape)
+                .map_err(|e| TransportError::Other(format!("obfs client endpoint: {e}")))?
+        }
         None => quinn::Endpoint::client(bind_addr)
             .map_err(|e| TransportError::Other(format!("client endpoint: {e}")))?,
     };
@@ -818,7 +984,15 @@ pub async fn hysteria2_client_connect(
         // and is distinguishable by an active h3-speaking prober in plain-QUIC
         // mode. Keep obfs on (default) so the whole handshake is XOR-hidden. See
         // [`HYSTERIA2_ALPN`].
-        send.write_all(&knock_token)
+        let mut seed_bytes = [0u8; PACE_SEED_LEN];
+        getrandom::fill(&mut seed_bytes)
+            .map_err(|e| TransportError::Other(format!("pace seed: {e}")))?;
+        let mut first = [0u8; KNOCK_TOKEN_LEN + PACE_SEED_LEN];
+        first[..KNOCK_TOKEN_LEN].copy_from_slice(&knock_token);
+        first[KNOCK_TOKEN_LEN..].copy_from_slice(&seed_bytes);
+        // One write: the knock and the seed are one flight, and splitting them
+        // would put a 32-byte segment on the wire where the peer expects 40.
+        send.write_all(&first)
             .await
             .map_err(|e| TransportError::Other(format!("knock token write: {e}")))?;
         send.flush()
@@ -826,7 +1000,12 @@ pub async fn hysteria2_client_connect(
             .map_err(|e| TransportError::Other(format!("knock token flush: {e}")))?;
 
         let remote_addr = connection.remote_address();
-        Ok::<Hysteria2Stream, TransportError>(Hysteria2Stream::new(send, recv, remote_addr))
+        Ok::<Hysteria2Stream, TransportError>(Hysteria2Stream::with_seed(
+            send,
+            recv,
+            remote_addr,
+            u64::from_le_bytes(seed_bytes),
+        ))
     })
     .await
     .map_err(|_| TransportError::Timeout(deadline))?
@@ -898,7 +1077,8 @@ mod tests {
         let deadline = Duration::from_secs(5);
 
         // Exercise the Gecko/Salamander obfuscation path end-to-end (both sides
-        // share the same key). The echo roundtrip must survive obfuscation.
+        // share the same key), WITH the Wu-2023 evasion preamble on, so the whole
+        // obfs+preamble stack roundtrips a real QUIC handshake + echo.
         let obfs = Some(mirage_quic_obfs::key_from_password(b"hy2-test-obfs"));
         let server_config = Hysteria2ServerConfig {
             bridge_static_pk: pk,
@@ -908,12 +1088,14 @@ mod tests {
             cert_der_path: None,
             key_der_path: None,
             brutal_cc: false,
+            quic_wu_evasion: true,
         };
         let client_config = Hysteria2ClientConfig {
             bridge_static_pk: pk,
             send_rate_bps: 10_000_000,
             hostname: DEFAULT_HYSTERIA2_HOSTNAME.into(),
             obfs_key: obfs,
+            quic_wu_evasion: true,
         };
 
         // Channel to signal when the server has written the echo.
@@ -977,12 +1159,14 @@ mod tests {
             cert_der_path: None,
             key_der_path: None,
             brutal_cc: false,
+            quic_wu_evasion: false,
         };
         let client_config = Hysteria2ClientConfig {
             bridge_static_pk: client_pk,
             send_rate_bps: 0,
             hostname: DEFAULT_HYSTERIA2_HOSTNAME.into(),
             obfs_key: None,
+            quic_wu_evasion: false,
         };
 
         let server_task = tokio::spawn(async move {

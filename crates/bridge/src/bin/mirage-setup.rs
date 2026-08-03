@@ -8,6 +8,7 @@
 //!   3. Client only     - generates client.json from an invite URL
 
 use mirage_common::process_hardening::harden_process;
+use mirage_cover::CoverBudget;
 use mirage_crypto::ed25519_dalek::{Signer, SigningKey};
 use mirage_crypto::x25519_dalek::{PublicKey, StaticSecret};
 use mirage_discovery::invite::{MasterInvite, MAX_BOOTSTRAP_TOKENS};
@@ -277,6 +278,100 @@ enum Profile {
     Stealth,
     BehindCdn,
     Custom,
+}
+
+/// What Proteus will cost, and whether to switch it on.
+///
+/// Asked as its own step because it is the single decision with the largest
+/// effect on what users experience, and because its cost is invisible unless
+/// somebody says it out loud: cover runs around the clock whether or not anyone
+/// is using the tunnel, so the daily budget is ALSO the ceiling on throughput.
+///
+/// The default follows the profile the operator already chose - Stealth means
+/// they asked for the lowest profile and should get it - rather than a blanket
+/// yes or no. Turning it on silently would hand every user a tunnel two orders
+/// of magnitude slower than they expect; leaving it off silently would withhold
+/// the defence the tool is built around.
+fn ask_proteus(profile: Profile) -> ProteusChoice {
+    println!();
+    note(
+        "Proteus makes the FLOW look real, not just the connection. It replays a real \n           recorded traffic envelope, so an idle tunnel and a busy one look alike to a \n           traffic-analysis classifier. Reality hides what the connection IS; Proteus hides \n           what it is DOING.",
+    );
+    note(
+        "It is not free, and the cost is 1:1. A record leaves on every schedule tick \n  \
+         whether or not the user has data - idle time is filled with padding, busy \n  \
+         time replaces that padding with their bytes. Identical on the wire either \n  \
+         way, which is the entire point: it is what makes idle and busy look alike.",
+    );
+    note(
+        "So cover does NOT ramp with demand, and an idle user costs exactly what a \n  \
+         busy one does. Ramping with demand IS the activity signal - measured at \n  \
+         0.699 separability against a 0.544 control when it was tried. The bill runs \n  \
+         only while a session is OPEN, so it is rate x session-hours, not rate x 24 \n  \
+         unless clients stay connected.",
+    );
+    let want = prompt_yn(
+        "Enable Proteus (traffic-shape cover)?",
+        matches!(profile, Profile::Stealth),
+    );
+    if !want {
+        return ProteusChoice {
+            enabled: false,
+            max_gb_day: None,
+        };
+    }
+    note(
+        "Per-session bandwidth limit. This is the ONE number that matters: cover runs \n  \
+         while a session is open, so the envelope's rate is also the ceiling on what \n  \
+         that session can move. 1:1 - a 5 Mbit/s limit gives the session 5 Mbit/s and \n  \
+         costs 54 GB per session-DAY, meaning 24h of connected time.",
+    );
+    note(
+        "It is NOT a concealment setting. A censor-vantage matrix measured every \n  \
+         budget equally undetectable, so a bigger number buys speed, not stealth. \n  \
+         Enter Mbit/s, or 'unlimited' to let the recorded captures run at whatever \n  \
+         rate they naturally have.",
+    );
+    loop {
+        let raw = prompt_str(
+            "  Per-session bandwidth limit (Mbit/s, or 'unlimited')",
+            "5",
+        );
+        let t = raw.trim().to_ascii_lowercase();
+        if matches!(t.as_str(), "unlimited" | "none" | "off" | "uncapped") {
+            println!("  -> unlimited: each session runs at whatever the captured cover carries.");
+            return ProteusChoice {
+                enabled: true,
+                max_gb_day: Some(CoverBudget::Named("unlimited".to_string())),
+            };
+        }
+        match t.parse::<f64>() {
+            Ok(mbit) if mbit > 0.0 => {
+                let gb = mirage_cover::gb_day_from_mbit(mbit);
+                println!(
+                    "  -> {mbit} Mbit/s per session = {gb:.1} GB per session-day \
+                     ({:.2} GB/hour connected).",
+                    gb / 24.0
+                );
+                if gb > 200.0 {
+                    println!(
+                        "     That is a large continuous bill. Multiply by your client count."
+                    );
+                }
+                return ProteusChoice {
+                    enabled: true,
+                    max_gb_day: Some(CoverBudget::GbPerDay(gb)),
+                };
+            }
+            _ => println!("  Enter a positive number of Mbit/s, or the word 'unlimited'."),
+        }
+    }
+}
+
+/// The operator's Proteus answer.
+struct ProteusChoice {
+    enabled: bool,
+    max_gb_day: Option<CoverBudget>,
 }
 
 fn ask_profile() -> Profile {
@@ -881,6 +976,7 @@ fn mint_invite(
     endpoint_str: &str,
     transports: &TransportChoices,
     params: &InviteParams,
+    proteus: bool,
 ) -> String {
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -914,6 +1010,13 @@ fn mint_invite(
     // Fallback: at least one cap bit should be set
     if t_caps == 0 {
         t_caps = transport_caps::REALITY_V2;
+    }
+    if proteus {
+        // A precondition, not a transport. Pacing adds framing and the session
+        // handshake runs INSIDE it, so a client that cannot pace gets zero bytes
+        // rather than an unpaced tunnel - it must be told at dial time, not left
+        // to debug a bridge that looks unreachable.
+        t_caps |= transport_caps::PROTEUS_REQUIRED;
     }
 
     let mut announcement = Announcement {
@@ -1288,7 +1391,7 @@ fn write_systemd_unit(path: &str, bridge_cfg_path: &str, bind: &str) {
 }
 
 fn setup_bridge_and_client(generate_client: bool) {
-    let total_steps: u8 = if generate_client { 6 } else { 5 };
+    let total_steps: u8 = if generate_client { 7 } else { 6 };
 
     section(1, total_steps, "Where the bridge listens");
     note("The bind address is what the bridge opens locally. 0.0.0.0 means");
@@ -1329,7 +1432,9 @@ fn setup_bridge_and_client(generate_client: bool) {
     let profile = ask_profile();
     let transports = ask_bridge_transports(profile);
 
-    section(3, total_steps, "Capacity and invite lifetime");
+    let proteus = ask_proteus(profile);
+
+    section(4, total_steps, "Capacity and invite lifetime");
     let max_sessions = prompt_u64("Max concurrent sessions", 4096);
     let n_tokens_raw = prompt_u64(
         "Bootstrap tokens (client uses one per session until invite expires)",
@@ -1397,10 +1502,28 @@ fn setup_bridge_and_client(generate_client: bool) {
         token_ttl_hours,
         invite_ttl_hours,
     };
-    let invite_url = mint_invite(&keys, &public_addr, &transports, &invite_params);
+    let invite_url = mint_invite(
+        &keys,
+        &public_addr,
+        &transports,
+        &invite_params,
+        proteus.enabled,
+    );
 
     // Build bridge config
     let mut bridge_cfg = build_bridge_config(&bind, &keys, &transports, max_sessions);
+    if proteus.enabled {
+        let m = bridge_cfg
+            .as_object_mut()
+            .expect("bridge config is an object");
+        m.insert("proteus".to_string(), json!(true));
+        if let Some(b) = proteus.max_gb_day.as_ref() {
+            m.insert(
+                "proteus_max_gb_day".to_string(),
+                serde_json::to_value(b).expect("cover budget serialises"),
+            );
+        }
+    }
     if relay_enabled {
         bridge_cfg
             .as_object_mut()
@@ -1487,6 +1610,21 @@ fn setup_bridge_and_client(generate_client: bool) {
             if let Some(ref zone) = transports.dnstt_domain {
                 m.insert("dnstt_enabled".to_string(), json!(true));
                 m.insert("dnstt_domain".to_string(), json!(zone));
+            }
+            // Proteus is a PER-CONNECTION property both ends must agree on: the
+            // session handshake runs inside the pacer, so a client without it
+            // sends an unframed handshake to a peer reading frame headers and
+            // the session dies with zero bytes. Writing it into the generated
+            // client config is what stops the operator shipping a pair that
+            // cannot talk to each other.
+            if proteus.enabled {
+                m.insert("proteus".to_string(), json!(true));
+                if let Some(b) = proteus.max_gb_day.as_ref() {
+                    m.insert(
+                        "proteus_max_gb_day".to_string(),
+                        serde_json::to_value(b).expect("cover budget serialises"),
+                    );
+                }
             }
             // Whole-device VPN. Always compiled into the client; this only flips
             // the runtime switch (it additionally needs CAP_NET_ADMIN, or

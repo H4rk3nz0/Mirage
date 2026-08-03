@@ -250,7 +250,6 @@ async fn main() {
         netfatal(format!("stdout write: {e}"));
     }
     let _ = out.flush();
-    let _ = AcceptAnyVerifier; // silence unused-struct lint if features change
 }
 
 /// Best-effort DER summary for the operator's eye. Walks just

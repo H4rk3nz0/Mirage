@@ -24,6 +24,7 @@ pub mod cohort_client;
 pub mod cohort_gossip;
 pub mod cohort_gossip_tcp;
 pub mod cohort_persist;
+pub mod cover_sync;
 pub mod derive;
 pub mod error;
 pub mod invite;

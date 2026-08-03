@@ -325,6 +325,20 @@ pub mod transport_caps {
     /// RESERVED (HLS transport was removed - bit kept reserved so it is never
     /// reused; bit 6 is similarly poisoned). Never advertised.
     pub const HLS: u32 = 1 << 12;
+    /// This bridge PACES every authenticated session (Proteus), so a client
+    /// without a cover library cannot use it.
+    ///
+    /// Not a transport - a precondition. Pacing adds framing and the session
+    /// handshake runs inside it, so a client that cannot pace does not connect
+    /// unpaced, it fails with zero bytes and no explanation. Advertising it lets
+    /// the client say WHY at dial time instead of leaving the user staring at an
+    /// unreachable bridge.
+    ///
+    /// It is deliberately NOT a negotiation. Letting a client opt out would hand
+    /// a censor a downgrade: connect without cover, and the bridge stops pacing
+    /// that session. A half-paced flow is also more conspicuous than either end
+    /// alone, which is why pacing has to stay symmetric.
+    pub const PROTEUS_REQUIRED: u32 = 1 << 13;
     /// Mask of all bits defined for v0.1.
     pub const MASK_V0_1: u32 = REALITY_V2 | QUIC_MASQUE | OBFS_TCP;
     /// Mask of all bits defined for any v0.x.
@@ -340,7 +354,8 @@ pub mod transport_caps {
         | VLESS
         | MEEK
         | CIRCUIT_RELAY
-        | HLS;
+        | HLS
+        | PROTEUS_REQUIRED;
 
     /// Stable transport names, in bit order. Indexes match the
     /// per-bit `1 << k` shift exactly so a bitfield can be mapped

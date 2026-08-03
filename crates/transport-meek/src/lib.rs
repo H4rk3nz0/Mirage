@@ -291,6 +291,9 @@ pub struct MeekClientStream {
     outbound_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// Signal to the driver: "I just flushed, send a POST now."
     flush_tx: mpsc::UnboundedSender<()>,
+    /// Per-session pace seed derived from the auth nonce in the first POST - the
+    /// same bytes the server derives its seed from, so both ends replay one flow.
+    pace_seed: u64,
 }
 
 impl MeekClientStream {
@@ -336,6 +339,18 @@ impl MeekClientStream {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        // Derive the seed before the prefix is handed to the driver. A DoH dial
+        // builds its auth frame inside this constructor, so reading it here is the
+        // only place both carriers can share one derivation.
+        let pace_seed = first_post_prefix
+            .as_ref()
+            .filter(|f| f.len() >= 8)
+            .map_or(0, |f| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&f[..8]);
+                u64::from_le_bytes(b)
+            });
+
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (flush_tx, flush_rx) = mpsc::unbounded_channel::<()>();
@@ -357,7 +372,16 @@ impl MeekClientStream {
             inbound_buf: VecDeque::new(),
             outbound_tx,
             flush_tx,
+            pace_seed,
         }
+    }
+
+    /// Per-session Proteus pace seed (identical on both endpoints). One paced
+    /// token becomes one HTTP POST, because the driver fires a POST per flush and
+    /// the pump flushes per frame.
+    #[must_use]
+    pub fn pace_seed(&self) -> u64 {
+        self.pace_seed
     }
 }
 
@@ -444,6 +468,8 @@ pub struct MeekServerStream {
     /// are drained from `inbound_rx`, mirroring the producer's increments, so
     /// the session's inbound buffer is bounded by `MEEK_MAX_SESSION_BUFFER`.
     inbound_buffered: Arc<AtomicUsize>,
+    /// Per-session pace seed shared with the peer (see [`Self::pace_seed`]).
+    pace_seed: u64,
 }
 
 impl MeekServerStream {
@@ -452,6 +478,7 @@ impl MeekServerStream {
         outbound_tx: mpsc::UnboundedSender<Vec<u8>>,
         flush_tx: mpsc::UnboundedSender<()>,
         inbound_buffered: Arc<AtomicUsize>,
+        pace_seed: u64,
     ) -> Self {
         Self {
             inbound_rx,
@@ -459,7 +486,17 @@ impl MeekServerStream {
             outbound_tx,
             flush_tx,
             inbound_buffered,
+            pace_seed,
         }
+    }
+
+    /// Per-session Proteus pace seed (identical on both endpoints). Feed to
+    /// `mirage_transport_reality::maybe_pace_stream`; one paced token becomes one
+    /// HTTP POST, because the driver fires a POST per flush and the pump flushes
+    /// per frame.
+    #[must_use]
+    pub fn pace_seed(&self) -> u64 {
+        self.pace_seed
     }
 }
 
@@ -635,6 +672,7 @@ where
         outbound_tx,
         flush_tx,
         Arc::new(AtomicUsize::new(0)),
+        meek_pace_seed(auth_frame),
     ))
 }
 
@@ -969,6 +1007,7 @@ where
         outbound_tx,
         flush_tx,
         inbound_buffered,
+        meek_pace_seed(auth_frame),
     )))
 }
 
@@ -2081,6 +2120,22 @@ where
 ///
 /// The MAC is `BLAKE3_keyed(key=bridge_static_pk, data="mirage-meek-v1" ||
 /// nonce || timestamp_be)`.
+/// Per-session Proteus pace seed derived from the 32-byte auth nonce.
+///
+/// Envelope pacing is coherent only if both ends replay the same trace from the
+/// same offset, so they need a shared per-session value. The auth frame's nonce is
+/// already exactly that - the client generates it, the server reads it out of the
+/// first POST - so no extra exchange and no extra bytes on the wire. Deriving from
+/// a per-bridge key instead would give every session the identical envelope, which
+/// is a fingerprint in its own right.
+#[must_use]
+pub fn meek_pace_seed(frame: &[u8; MEEK_AUTH_FRAME_LEN]) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&frame[..8]);
+    u64::from_le_bytes(b)
+}
+
+/// Build the 72-byte meek auth frame: `nonce[32] || mac[32] || timestamp[8]`.
 pub fn build_auth_frame(bridge_static_pk: &[u8; 32]) -> Result<[u8; MEEK_AUTH_FRAME_LEN], String> {
     let mut nonce = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut nonce);
@@ -2226,6 +2281,35 @@ mod tests {
     //    RFC 7231 IMF-fixdate format exactly (a malformed Date header would be
     //    a worse tell than none). Canonical vectors below.
 
+    /// Envelope pacing is coherent only if both endpoints replay the same trace
+    /// from the same offset, so the seed the client derives from the auth frame it
+    /// sends must equal the seed the server derives from the frame it reads. The
+    /// pacer adds framing, so a divergence here is not a weaker disguise - one
+    /// side frames and the other does not, and the connection hangs.
+    #[test]
+    fn both_ends_derive_the_same_pace_seed_from_the_auth_frame() {
+        let pk = [0x31u8; 32];
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let frame = build_auth_frame(&pk).expect("build auth frame");
+            // Server reads the identical bytes off the first POST body.
+            let as_read: [u8; MEEK_AUTH_FRAME_LEN] = frame;
+            assert_eq!(
+                meek_pace_seed(&frame),
+                meek_pace_seed(&as_read),
+                "client and server must derive the same seed"
+            );
+            seen.insert(meek_pace_seed(&frame));
+        }
+        // Per-SESSION, not per-bridge: a fixed seed would give every session to a
+        // bridge the identical envelope, which is a fingerprint of its own.
+        assert!(
+            seen.len() > 32,
+            "seed must vary per session, got {} distinct across 64",
+            seen.len()
+        );
+    }
+
     #[test]
     fn http_date_matches_rfc7231() {
         // Unix epoch.
@@ -2313,6 +2397,104 @@ mod tests {
             extracted, original_id,
             "session_id round-trips through base64 sid cookie"
         );
+    }
+
+    /// A PACED meek pair must still carry data both ways.
+    ///
+    /// Pacing is a per-connection property both ends must agree on: the pacer adds
+    /// framing, so one side framing and the other not is a protocol mismatch that
+    /// HANGS - not a weaker disguise. Twice this session a carrier was wired on one
+    /// side only and nothing failed at build or test time, so this exercises the
+    /// real client and server streams through the real pacer rather than trusting
+    /// that the two call sites match. The podman harness cannot run meek (it needs
+    /// CDN fronting), which makes this the only place the property is checkable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paced_meek_pair_still_carries_data() {
+        // Point the pacer at a class-based schedule so it engages without needing
+        // a capture on disk; the framing is identical either way.
+        mirage_transport_reality::set_pace_override("browse", None, None);
+
+        let pk = [0x51u8; 32];
+        let store = MeekSessionStore::new();
+        let (client_end, server_end) = tokio::io::duplex(1 << 20);
+        let session_id = [0xC1u8; 32];
+        let auth_frame = build_auth_frame(&pk).expect("build_auth_frame");
+
+        let serve = tokio::spawn(async move {
+            meek_bridge_serve_multconn(
+                server_end,
+                &store,
+                &pk,
+                Duration::from_secs(10),
+                "application/octet-stream",
+                &mirage_transport::SeenNonceSet::new(Duration::from_secs(60)),
+            )
+            .await
+        });
+
+        let client = MeekClientStream::new_with_content_type(
+            client_end,
+            "cdn.example.com".to_string(),
+            "/mirage".to_string(),
+            session_id,
+            Some(auth_frame.to_vec()),
+            B64.encode(session_id),
+            "application/octet-stream".to_string(),
+        )
+        .await;
+
+        // Both ends must derive the SAME seed, or they replay different traces.
+        let client_seed = client.pace_seed();
+        assert_eq!(
+            client_seed,
+            meek_pace_seed(&auth_frame),
+            "client seed must come from the auth frame it sent"
+        );
+
+        let mut paced_client = mirage_transport_reality::maybe_pace_stream(
+            client,
+            mirage_transport_reality::pacer::Dir::Up,
+            client_seed,
+            // HTTP-mediated: no fixed per-record cost.
+            mirage_transport_reality::Carrier::raw(),
+        );
+
+        let outcome = serve.await.expect("serve task").expect("serve");
+        let MeekServeOutcome::NewSession(server) = outcome else {
+            panic!("first POST must yield NewSession");
+        };
+        assert_eq!(
+            server.pace_seed(),
+            client_seed,
+            "server must derive the client's seed from the same auth frame"
+        );
+        let mut paced_server = mirage_transport_reality::maybe_pace_stream(
+            server,
+            mirage_transport_reality::pacer::Dir::Down,
+            client_seed,
+            // HTTP-mediated: no fixed per-record cost.
+            mirage_transport_reality::Carrier::raw(),
+        );
+
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let payload = b"paced meek carries data".to_vec();
+        let expect = payload.clone();
+        let reader = tokio::spawn(async move {
+            let mut got = vec![0u8; expect.len()];
+            paced_server.read_exact(&mut got).await.map(|_| got)
+        });
+        paced_client
+            .write_all(&payload)
+            .await
+            .expect("client write");
+        paced_client.flush().await.expect("client flush");
+
+        let got = tokio::time::timeout(Duration::from_secs(20), reader)
+            .await
+            .expect("a paced pair must not hang")
+            .expect("reader task")
+            .expect("server read");
+        assert_eq!(got, payload, "payload must survive the paced meek carrier");
     }
 
     // Additional: MAC determinism and cross-protocol label isolation

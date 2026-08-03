@@ -42,6 +42,7 @@
 #![warn(missing_docs)]
 
 pub mod cell_io;
+pub mod circuit_stream;
 pub mod driver;
 pub mod multi_entry;
 pub mod pool;

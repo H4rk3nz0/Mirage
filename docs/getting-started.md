@@ -35,22 +35,24 @@ cargo build --release --workspace
 ### Graphical client
 
 ```sh
-mirage-client-gui
+mirage-client-gui                 # or: mirage-client-gui client.json  (opens already connecting)
 ```
 
-Paste the invite (or click **Browse...** to pick a `client.json`), then click **Connect**. A
-connection orb shows live status, the carrier it settled on, and the bridge it is using.
+Paste the invite (or click **Browse...** to pick a `client.json`), then click **Connect** (or
+press **Enter** in the field). A connection orb shows live status, the carrier it settled on, and
+the bridge it is using; click the **SOCKS address** to copy it. Passing a `client.json` on the
+command line opens the app already connecting to it.
 
 The app is built to keep you in control of both ends:
 
 - **Profiles** - save an invite or `client.json` under a name and switch between them with one
-  click (persisted locally, so they survive restarts).
+  click (persisted locally, owner-only `0600`, so they survive restarts without leaking the invite).
 - **Re-discover** - force the client to walk its rendezvous channels (DHT / Nostr / DNS) again
   right now instead of waiting for the next periodic sweep. The **Discovery** panel shows which
   channels are in play and how many bridges it has found.
 - **Reconnect** - drop and re-establish the tunnel.
-- **Paranoid** - flip on the strongest posture (Reality + replay pacing + fail-closed) without
-  editing config.
+- **Paranoid** - flip on the strongest posture (Reality + Proteus + fail-closed) without
+  editing config. The bridge must have Proteus on too, or the session will not come up.
 
 Install it from the native installer for your platform - **AppImage/`.deb`** (Linux),
 **`.dmg`** (macOS), or **`.msi`** (Windows) - see **[install.md](install.md)** (installers are

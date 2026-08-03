@@ -1,8 +1,13 @@
 # Minimal runtime image for Mirage end-to-end Podman tests.
 # Arch base matches the host glibc (binaries are built on the host, not in-image).
 # curl/iptables/iproute2 are for driving traffic + simulating transport blocks.
+# tcpdump captures the carrier from the censor's vantage point (the cover-shaping
+# experiment in cover-traffic.sh reads the real wire, not instrumented internals).
+# ethtool turns OFF segmentation offload for that capture: with GSO/TSO on, tcpdump
+# inside the container sees 16 KB super-segments the kernel has not split yet, which
+# is NOT what crosses the wire and would make any packet-size measurement fiction.
 FROM docker.io/library/archlinux:latest
-RUN pacman -Sy --noconfirm --needed curl iptables iproute2 socat python \
+RUN pacman -Sy --noconfirm --needed curl iptables iproute2 socat python tcpdump ethtool \
     && pacman -Scc --noconfirm
 COPY mirage-bridge mirage-client mirage-keygen /usr/local/bin/
 COPY udp_socks_test.py /usr/local/bin/udp_socks_test.py

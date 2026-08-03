@@ -24,30 +24,42 @@
 //! - [`MigrationPolicy`] - operator-tunable thresholds
 //!   (validation timeout, max-migration-rate, etc).
 //!
-//! # [warn] NOT ON A LIVE PATH - pre-integration (connection migration is NOT live)
+//! # [warn] SUPERSEDED - do not wire this; QUIC already does it
 //!
-//! **This crate is a complete, tested state machine that is wired
-//! into nothing.** No crate depends on `mirage-migration`, and
-//! nothing anywhere constructs a [`MigrationState`] on a live path
-//! (verified by grep - the only references outside this crate are
-//! doc-comment mentions). Release notes and readers MUST NOT assume
-//! Mirage performs live connection migration: today a Wi-Fi -> cell
-//! handoff still forces a full tunnel re-handshake.
+//! **This crate is a complete, tested state machine that should not be
+//! wired, because the thing it implements already works.** Nothing depends
+//! on it and nothing constructs a [`MigrationState`] on a live path.
 //!
-//! v0.1w ships the data types + state machine only. Wiring requires a
-//! UDP/MASQUE transport that keys received datagrams by [`Cid`]
-//! instead of by 5-tuple; that transport is scaffolded but does not
-//! yet ship live I/O.
+//! The v0.2 task this crate was written for - "key inbound datagrams by
+//! [`Cid`] instead of by 5-tuple, then validate the new path" - is
+//! precisely what QUIC does natively, and Mirage's QUIC carriers get it
+//! from `quinn` for free. Checked, rather than assumed:
 //!
-//! **Exact wiring step (the documented v0.2 task):** in the
-//! UDP/MASQUE transport's accept/receive loop, on each inbound
-//! datagram (1) parse its [`Cid`], (2) look up the connection by CID
-//! rather than by source 5-tuple, and (3) when the CID arrives from a
-//! new `(src_ip, src_port)`, drive [`MigrationState`] - emit a
-//! [`PathChallenge`] to the new path and only migrate once the
-//! matching [`PathResponse`] validates it (anti-spoof), subject to
-//! the [`MigrationPolicy`] rate cap. Until that accept loop exists
-//! and calls into this state machine, this crate is inert.
+//! - `ObfsSocket::poll_recv` passes the REAL source address through to
+//!   quinn in `RecvMeta.addr`, so obfuscation does not hide a path change
+//!   from the layer that handles it.
+//! - No `.migration(false)` call exists anywhere in the workspace, so
+//!   quinn's default - migration ENABLED, with its own `PATH_CHALLENGE`
+//!   validation and rate limiting - is what runs.
+//!
+//! So wiring this crate into hysteria2 or h3/MASQUE would build a second,
+//! weaker path-validation stack underneath one that already works. And for
+//! the TCP carriers (Reality, WebSocket, SS-2022) it cannot help at all: a
+//! TCP connection is bound to its 5-tuple and cannot migrate by any means.
+//!
+//! ## What WOULD be worth building, and is not this
+//!
+//! The genuinely missing capability is one layer up: resuming a **Mirage
+//! session** across a fresh carrier connection without a full re-handshake,
+//! so a Wi-Fi -> cell handoff costs one round trip instead of a fresh
+//! Noise/ML-KEM exchange on a new TCP socket. QUIC does not provide that,
+//! because the session is Mirage's, not QUIC's.
+//!
+//! That is a different design - session resumption keyed on a
+//! resumption secret, with replay defence - and these types
+//! ([`Cid`], [`PathChallenge`]) are a reasonable starting point for it, but
+//! it is not what this crate implements today. Until someone builds it,
+//! treat this crate as reference material rather than pending work.
 //!
 //! # Threat-model fit
 //!

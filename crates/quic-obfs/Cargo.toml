@@ -7,6 +7,7 @@ license.workspace = true
 description = "QUIC packet obfuscation (Salamander XOR + Gecko fragmentation) for Mirage's QUIC carriers (hysteria2 / h3), defeating QUIC-protocol and packet-size DPI fingerprinting."
 
 [dependencies]
+mirage-common = { workspace = true }
 quinn = { workspace = true }
 tokio = { workspace = true }
 blake3 = { workspace = true }

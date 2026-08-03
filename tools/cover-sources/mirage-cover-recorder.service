@@ -1,9 +1,15 @@
-# Self-driving Proteus cover recorder - keeps the replay library fresh on its own.
+# Self-driving Proteus cover recorder - keeps a PINNED replay library fresh.
+#
+# You probably do not need this. `proteus: true` makes the daemon source and
+# refresh its own library in-process; this unit is only for an operator who has
+# pinned `proteus_profile` to a specific library (which turns auto-sourcing off)
+# and still wants it topped up.
+#
 # Install: edit the paths/User below, then
 #   sudo cp mirage-cover-recorder.service /etc/systemd/system/
 #   sudo systemctl enable --now mirage-cover-recorder
 # Point the bridge/client at the class dir it fills:
-#   reality_pace: "replay", reality_pace_profile: "/opt/mirage/library/video"
+#   proteus: "replay", proteus_profile: "/opt/mirage/library/video"
 # For a browse-class library too, run a second copy with `--mode browse`.
 # Self-contained: mirage-cover-record needs no external tools or extra capabilities.
 [Unit]

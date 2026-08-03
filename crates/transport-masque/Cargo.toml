@@ -20,6 +20,8 @@ rustls = { workspace = true }
 getrandom = "0.3"
 rcgen = { workspace = true }
 mirage-quic-obfs = { workspace = true }
+# Source of the replay cover's record sequence for datagram-layer shaping.
+mirage-transport-reality = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

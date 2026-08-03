@@ -222,6 +222,77 @@ where
     /// relay executor's per-link pump; drained by the run loop into
     /// `process_inbound_from_next`.
     next_hop_events: Option<Receiver<Cell>>,
+    /// Hidden-service rendezvous routing, when the bridge offers it.
+    ///
+    /// Shared across every session on the bridge, because that is the whole
+    /// point: a service registers its introduction point on ITS session and a
+    /// client introduces on a different one, so no session task can complete
+    /// the exchange alone.
+    rendezvous: Option<crate::rendezvous_router::SharedRendezvousRouter>,
+    /// This session's bridge-unique handle in the router. Combined with a
+    /// circuit id it forms a `CircuitRef`; circuit ids are per-session, so the
+    /// handle is what stops two clients' circuit 1 colliding.
+    rv_handle: u64,
+    /// Cells the router addressed to circuits on THIS session.
+    rv_rx: Option<Receiver<crate::rendezvous_router::Delivery>>,
+    /// Circuits on this session that hold a rendezvous role, so teardown can
+    /// release them and report any orphaned partner.
+    rv_circuits: std::collections::HashSet<u32>,
+}
+
+/// Await the next router-addressed cell, or never when this session has no
+/// rendezvous channel. Mirrors `recv_exit_event` so the select arm is a no-op
+/// on bridges that do not offer hidden services.
+async fn recv_rendezvous(
+    rx: &mut Option<Receiver<crate::rendezvous_router::Delivery>>,
+) -> Option<crate::rendezvous_router::Delivery> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Is this relay sub-command part of the hidden-service rendezvous plane?
+///
+/// These terminate at this bridge - it is acting as an introduction or
+/// rendezvous point - so they must never reach the exit path and become a TCP
+/// connect to somewhere.
+fn is_rendezvous_cmd(cmd: u8) -> bool {
+    matches!(
+        cmd,
+        mirage_circuit::CMD_ESTABLISH_INTRO
+            | mirage_circuit::CMD_ESTABLISH_RENDEZVOUS
+            | mirage_circuit::CMD_INTRODUCE
+            | mirage_circuit::CMD_RENDEZVOUS
+    )
+}
+
+/// Releases this session's rendezvous roles when the task ends, however it ends.
+///
+/// A `Drop` impl rather than a cleanup call at the end of `run`, because `run`
+/// returns early on read timeout, EOF and several session-fatal errors - and a
+/// leaked registration would keep an introduction key claimed by a service that
+/// is gone, so nobody could re-register it until the TTL expired.
+impl<S, E> Drop for SessionTask<S, E>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    E: NextHopExecutor,
+{
+    fn drop(&mut self) {
+        if let Some(r) = &self.rendezvous {
+            let circs: Vec<u32> = self.rv_circuits.iter().copied().collect();
+            let orphans = r.forget_session(self.rv_handle, &circs);
+            if !orphans.is_empty() {
+                // The other half of a joined pair is now talking to nobody.
+                // Logged rather than acted on here: this session no longer owns
+                // a way to reach it, and its own task will see the channel close.
+                tracing::debug!(
+                    orphaned = orphans.len(),
+                    "rendezvous: session ended, partner circuits left dangling"
+                );
+            }
+        }
+    }
 }
 
 impl<S, E> SessionTask<S, E>
@@ -240,7 +311,24 @@ where
             exit_events: None,
             stream_to_circ: HashMap::new(),
             next_hop_events: None,
+            rendezvous: None,
+            rv_handle: 0,
+            rv_rx: None,
+            rv_circuits: std::collections::HashSet::new(),
         }
+    }
+
+    /// Attach hidden-service rendezvous routing to this session.
+    #[must_use]
+    pub fn with_rendezvous(
+        mut self,
+        router: crate::rendezvous_router::SharedRendezvousRouter,
+    ) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::rendezvous_router::DELIVERY_QUEUE);
+        self.rv_handle = router.register_session(tx);
+        self.rendezvous = Some(router);
+        self.rv_rx = Some(rx);
+        self
     }
 
     /// Attach the next-hop-inbound receiver so cells the next hop sends back
@@ -360,10 +448,161 @@ where
                         }
                     }
                 }
+                // Rendezvous return path: a cell the ROUTER addressed to a
+                // circuit on this session, put there by a DIFFERENT session's
+                // task. This arm is the only reason cross-session hidden-service
+                // routing can work at all.
+                Some(d) = recv_rendezvous(&mut self.rv_rx) => {
+                    self.deliver_rendezvous(d).await?;
+                }
                 _ = tick_interval.tick() => {
                     let actions = self.state.tick(std::time::Instant::now());
                     self.execute_actions(actions).await?;
+                    if let Some(r) = &self.rendezvous {
+                        // Sweep expired registrations and parked cookies on the
+                        // same cadence as circuit reaping.
+                        let _ = r.tick(std::time::Instant::now());
+                    }
                 }
+            }
+        }
+    }
+
+    /// Drive one hidden-service rendezvous cell.
+    ///
+    /// Every arm is best-effort by design: a refusal here is a protocol error by
+    /// ONE peer (a bad signature, a cookie nobody parked, a service that went
+    /// away) and must not tear down a session that may be carrying other
+    /// circuits. The peer learns it failed by not receiving an ack.
+    async fn handle_rendezvous(
+        &mut self,
+        in_circ_id: u32,
+        cmd: u8,
+        body: &[u8],
+    ) -> Result<(), DaemonError> {
+        use mirage_circuit::rendezvous::CircuitRef;
+        let Some(router) = self.rendezvous.clone() else {
+            return Ok(());
+        };
+        let circ = CircuitRef::new(self.rv_handle, in_circ_id);
+        let now = std::time::Instant::now();
+
+        match cmd {
+            mirage_circuit::CMD_ESTABLISH_INTRO => match router.establish_intro(circ, body, now) {
+                Ok(_) => {
+                    self.rv_circuits.insert(in_circ_id);
+                    self.send_rendezvous_ack(in_circ_id, mirage_circuit::CMD_ESTABLISH_INTRO_OK)
+                        .await?;
+                }
+                Err(e) => {
+                    tracing::debug!(circ_id = in_circ_id, error = ?e, "rendezvous: establish-intro refused");
+                }
+            },
+            mirage_circuit::CMD_ESTABLISH_RENDEZVOUS => {
+                match router.establish_rendezvous(circ, body, now) {
+                    Ok(_) => {
+                        self.rv_circuits.insert(in_circ_id);
+                        self.send_rendezvous_ack(in_circ_id, mirage_circuit::CMD_RENDEZVOUS_OK)
+                            .await?;
+                    }
+                    Err(e) => {
+                        tracing::debug!(circ_id = in_circ_id, error = ?e, "rendezvous: establish-rendezvous refused");
+                    }
+                }
+            }
+            mirage_circuit::CMD_INTRODUCE => {
+                // The addressed service is named by the intro key the client
+                // used; everything after it is opaque and forwarded verbatim,
+                // because an introduction point is not entitled to read it.
+                if body.len() < 32 {
+                    return Ok(());
+                }
+                let mut pk = [0u8; 32];
+                pk.copy_from_slice(&body[..32]);
+                if let Err(e) = router.introduce(&pk, &body[32..], now) {
+                    tracing::debug!(circ_id = in_circ_id, error = ?e, "rendezvous: introduce not delivered");
+                }
+            }
+            mirage_circuit::CMD_RENDEZVOUS => match router.rendezvous(circ, body, now) {
+                Ok(_) => {
+                    self.rv_circuits.insert(in_circ_id);
+                }
+                Err(e) => {
+                    tracing::debug!(circ_id = in_circ_id, error = ?e, "rendezvous: cookie did not match");
+                }
+            },
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Hand a joined circuit's payload to its rendezvous partner.
+    ///
+    /// This is the meeting point's whole job once a cookie has matched: the two
+    /// circuits terminate here, and the bridge ferries sub-cells between them
+    /// without interpreting the bodies (the end-to-end layer above is keyed
+    /// between the client and the service, and a rendezvous point that could
+    /// read it would defeat the point of meeting through one).
+    ///
+    /// Never fatal. A circuit whose partner has gone, or is not draining, loses
+    /// the cell - the alternative is tearing down a session carrying unrelated
+    /// circuits because one stranger's peer disappeared.
+    async fn relay_between_partners(&mut self, in_circ_id: u32, sub: mirage_circuit::RelaySubCell) {
+        use mirage_circuit::rendezvous::CircuitRef;
+        let Some(router) = self.rendezvous.clone() else {
+            return;
+        };
+        let from = CircuitRef::new(self.rv_handle, in_circ_id);
+        if let Err(e) = router.relay_to_partner(from, sub.command, sub.body) {
+            tracing::debug!(circ_id = in_circ_id, error = ?e,
+                "rendezvous: payload dropped, no partner to hand it to");
+        }
+    }
+
+    /// Write a cell the router addressed to one of this session's circuits.
+    async fn deliver_rendezvous(
+        &mut self,
+        d: crate::rendezvous_router::Delivery,
+    ) -> Result<(), DaemonError> {
+        self.send_rendezvous_sub(d.circ_id, d.cmd, d.body).await
+    }
+
+    /// Send a rendezvous control cell back to this session's peer.
+    async fn send_rendezvous_ack(&mut self, in_circ_id: u32, cmd: u8) -> Result<(), DaemonError> {
+        self.send_rendezvous_sub(in_circ_id, cmd, Vec::new()).await
+    }
+
+    /// Send one rendezvous sub-cell toward the peer that owns `in_circ_id`.
+    ///
+    /// Goes through `inject_exit_response`, the same path every other reverse
+    /// cell takes, so the sub-cell is onion-sealed under the circuit's reverse
+    /// key and its reverse sequence advances. Writing the cell directly would put
+    /// it on the wire in the clear, where a conforming peer - which opens every
+    /// reverse `CMD_RELAY` with `Circuit::relay_open` - cannot read it, and where
+    /// the reverse sequence the peer expects would silently diverge.
+    async fn send_rendezvous_sub(
+        &mut self,
+        in_circ_id: u32,
+        cmd: u8,
+        body: Vec<u8>,
+    ) -> Result<(), DaemonError> {
+        let sub = mirage_circuit::RelaySubCell { command: cmd, body };
+        // A control cell that will not encode is a bug here, not a peer error, so
+        // drop it rather than kill a session carrying other circuits.
+        let Ok(payload) = sub.encode() else {
+            return Ok(());
+        };
+        let now = std::time::Instant::now();
+        match self.state.inject_exit_response(in_circ_id, &payload, now) {
+            // Boxed because this sits on a cycle with `execute_actions`, not
+            // because the cycle runs: `inject_exit_response` yields `SendToPrev`
+            // actions only, and `SendToPrev` never re-enters this function.
+            Ok(actions) => Box::pin(self.execute_actions(actions)).await,
+            Err(e) => {
+                // The circuit was reaped between the request and this reply.
+                tracing::debug!(circ_id = in_circ_id, cmd, error = %e,
+                    "rendezvous: reply dropped, circuit gone");
+                Ok(())
             }
         }
     }
@@ -524,6 +763,29 @@ where
                     // Parse the sub-cell command to detect BEGIN (new stream)
                     // and END (stream close). Errors are ignored - the
                     // dispatcher will reject malformed payloads independently.
+                    // Hidden-service rendezvous cells terminate HERE - they are
+                    // for this bridge acting as an introduction or rendezvous
+                    // point, not traffic to forward upstream. Handled before the
+                    // exit path so they never reach a TCP connect.
+                    if let Ok(sub) = mirage_circuit::RelaySubCell::decode(&payload) {
+                        if self.rendezvous.is_some() && is_rendezvous_cmd(sub.command) {
+                            self.handle_rendezvous(in_circ_id, sub.command, &sub.body)
+                                .await?;
+                            continue;
+                        }
+                        // A circuit holding a rendezvous role is NEVER an exit.
+                        // Once two circuits are joined this bridge is their
+                        // meeting point, so everything else they carry is
+                        // end-to-end traffic to hand to the partner; and a
+                        // circuit that registered a role but has no partner has
+                        // nothing legitimate to say here. Falling through to the
+                        // exit path in either case would turn a service's own
+                        // introduction circuit into a TCP connect on its behalf.
+                        if self.rv_circuits.contains(&in_circ_id) {
+                            self.relay_between_partners(in_circ_id, sub).await;
+                            continue;
+                        }
+                    }
                     if let Ok(sub) = mirage_circuit::RelaySubCell::decode(&payload) {
                         match sub.command {
                             CMD_BEGIN => {
@@ -871,5 +1133,74 @@ mod tests {
         // so a stuck reassembly is reaped within at most
         // 2x `pending_extend_timeout`.
         assert!(c.tick_interval < c.policy.pending_extend_timeout);
+    }
+
+    /// Two SESSION TASKS complete a rendezvous through the shared router.
+    ///
+    /// This is the property the whole rendezvous plane exists for and the one
+    /// no single session could ever demonstrate: the service registers on its
+    /// own session and the client introduces on a different one, so the cell
+    /// has to cross a task boundary. Both use circuit id 1 on purpose - that
+    /// collision is exactly what a bare circ_id table would have mishandled.
+    #[tokio::test]
+    async fn a_rendezvous_crosses_two_session_tasks() {
+        use crate::rendezvous_router::{Delivery, RendezvousRouter, DELIVERY_QUEUE};
+        use mirage_circuit::rendezvous::{CircuitRef, EstablishIntroBody};
+        use mirage_crypto::ed25519_dalek::SigningKey;
+
+        let router = std::sync::Arc::new(RendezvousRouter::new());
+        let (svc_tx, mut svc_rx) = tokio::sync::mpsc::channel::<Delivery>(DELIVERY_QUEUE);
+        let (cli_tx, _cli_rx) = tokio::sync::mpsc::channel::<Delivery>(DELIVERY_QUEUE);
+        let svc = router.register_session(svc_tx);
+        let cli = router.register_session(cli_tx);
+        let now = std::time::Instant::now();
+
+        // Service registers its introduction point on ITS session, circuit 1.
+        let sk = SigningKey::from_bytes(&[21u8; 32]);
+        router
+            .establish_intro(
+                CircuitRef::new(svc, 1),
+                &EstablishIntroBody::new(&sk, 1).encode(),
+                now,
+            )
+            .expect("service registers");
+
+        // Client introduces from a DIFFERENT session, also circuit 1.
+        let pk = sk.verifying_key().to_bytes();
+        let delivered = router
+            .introduce(&pk, b"sealed introduce payload", now)
+            .expect("router crossed the session boundary");
+        assert_eq!(delivered, CircuitRef::new(svc, 1));
+        assert_ne!(svc, cli, "the two sessions are distinct");
+
+        // The service's session task would receive this on its rv_rx arm.
+        let got = svc_rx.try_recv().expect("service session got the cell");
+        assert_eq!(got.circ_id, 1);
+        assert_eq!(got.cmd, mirage_circuit::CMD_INTRODUCE);
+        assert_eq!(got.body, b"sealed introduce payload".to_vec());
+    }
+
+    #[test]
+    fn rendezvous_commands_never_reach_the_exit_path() {
+        // These terminate at this bridge. If one leaked through to the exit
+        // path it would become a TCP connect somewhere, which is both wrong
+        // and a way to make an introduction point emit attacker-chosen traffic.
+        for c in [
+            mirage_circuit::CMD_ESTABLISH_INTRO,
+            mirage_circuit::CMD_ESTABLISH_RENDEZVOUS,
+            mirage_circuit::CMD_INTRODUCE,
+            mirage_circuit::CMD_RENDEZVOUS,
+        ] {
+            assert!(is_rendezvous_cmd(c), "cmd {c:#04x} must be intercepted");
+        }
+        // And ordinary stream traffic must NOT be intercepted.
+        for c in [
+            mirage_circuit::CMD_BEGIN,
+            mirage_circuit::CMD_DATA,
+            mirage_circuit::CMD_END,
+            mirage_circuit::CMD_PADDING,
+        ] {
+            assert!(!is_rendezvous_cmd(c), "cmd {c:#04x} must pass through");
+        }
     }
 }

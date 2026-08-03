@@ -43,7 +43,11 @@ export struct ChannelRow {
 }
 
 export component AppWindow inherits Window {
-    title: "Mirage";
+    // Reflect connection state in the titlebar / taskbar entry.
+    title: root.running ? "Mirage - Connected"
+        : root.starting ? "Mirage - Connecting"
+        : root.is-error ? "Mirage - Disconnected"
+        : "Mirage";
     icon: @image-url("../assets/icon.png");
     default-font-size: 14px;
     preferred-width: 480px;
@@ -70,6 +74,8 @@ export component AppWindow inherits Window {
     in property <string> via-carrier;                // e.g. "Reality"
     in property <string> via-bridge;                 // short bridge fingerprint
     in property <string> session-streams;            // open mux streams
+    in property <string> throughput-up;              // live send rate, e.g. "1.2 MB/s"
+    in property <string> throughput-down;            // live receive rate
     in property <bool> paranoid;                     // strong posture on?
 
     // Discovery status (from /api/status).
@@ -202,40 +208,59 @@ export component AppWindow inherits Window {
             VerticalBox {
                 padding: 18px;
                 spacing: 16px;
+                // Pack content at the top; a sparse (disconnected) screen leaves the
+                // slack at the bottom instead of a dead gap floating in the middle.
+                alignment: LayoutAlignment.start;
 
                 // ---- Connection hero: the orb + state ----
                 VerticalLayout {
                     spacing: 12px;
                     padding-top: 6px;
                     padding-bottom: 2px;
-                    // Orb: concentric teal circles + a breathing ring.
+                    // Orb: layered concentric glow, a crisp definition ring, and a
+                    // breathing ring while connected. State colour cross-fades on
+                    // connect/disconnect so nothing snaps.
                     Rectangle {
-                        height: 96px;
+                        height: 104px;
+                        // Soft outer glow.
                         Rectangle {
-                            width: 96px; height: 96px; border-radius: 48px;
+                            width: 104px; height: 104px; border-radius: 52px;
                             x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
                             background: root.state-color;
                             opacity: 0.10;
+                            animate background { duration: 450ms; }
+                        }
+                        // Crisp definition ring (always present, gives the orb an edge).
+                        Rectangle {
+                            width: 72px; height: 72px; border-radius: 36px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            border-width: 1px;
+                            border-color: root.state-color;
+                            opacity: 0.30;
+                            animate border-color { duration: 450ms; }
                         }
                         // Breathing ring (only while connected).
                         if root.running: Rectangle {
-                            width: root.pulse ? 82px : 54px;
-                            height: root.pulse ? 82px : 54px;
+                            width: root.pulse ? 92px : 60px;
+                            height: root.pulse ? 92px : 60px;
                             border-radius: self.width / 2;
                             x: (parent.width - self.width) / 2;
                             y: (parent.height - self.height) / 2;
                             border-width: 2px;
                             border-color: root.accent;
-                            opacity: root.pulse ? 0.05 : 0.5;
+                            opacity: root.pulse ? 0.0 : 0.55;
                             animate width, height, opacity { duration: 2400ms; easing: ease-in-out; }
                         }
                         // Core glow.
                         Rectangle {
-                            width: 30px; height: 30px; border-radius: 15px;
+                            width: 34px; height: 34px; border-radius: 17px;
                             x: (parent.width - self.width) / 2;
                             y: (parent.height - self.height) / 2;
                             background: root.state-color;
-                            opacity: 0.28;
+                            opacity: 0.30;
+                            animate background { duration: 450ms; }
                         }
                         // Core.
                         Rectangle {
@@ -243,6 +268,7 @@ export component AppWindow inherits Window {
                             x: (parent.width - self.width) / 2;
                             y: (parent.height - self.height) / 2;
                             background: root.state-color;
+                            animate background { duration: 450ms; }
                         }
                     }
                     Text {
@@ -254,11 +280,35 @@ export component AppWindow inherits Window {
                         font-weight: 700;
                         horizontal-alignment: center;
                     }
-                    if root.running: Text {
-                        text: "socks5://" + root.bind-addr;
-                        color: root.muted;
-                        font-size: 12px;
-                        horizontal-alignment: center;
+                    // SOCKS address as a click-to-copy pill (with a brief "copied" flash).
+                    if root.running: HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            border-radius: 7px;
+                            background: copy-ta.pressed ? root.surface-2
+                                : (copy-ta.has-hover ? root.surface : transparent);
+                            animate background { duration: 120ms; }
+                            copy-ta := TouchArea { clicked => { root.copy-bind(); } }
+                            HorizontalLayout {
+                                padding-left: 10px; padding-right: 10px;
+                                padding-top: 3px; padding-bottom: 3px;
+                                spacing: 7px;
+                                Text {
+                                    // socks5h:// (not socks5://) so apps resolve DNS at the
+                                    // bridge, over the tunnel - never leaking queries locally.
+                                    text: root.copied ? "copied to clipboard" : "socks5h://" + root.bind-addr;
+                                    color: root.copied ? root.accent : root.muted;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: root.copied ? "" : "copy";
+                                    color: copy-ta.has-hover ? root.azure : root.line-2;
+                                    font-size: 10px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
                     }
                     if root.running && root.via-carrier != "": Text {
                         text: "via " + root.via-carrier + (root.paranoid ? " + Proteus" : "")
@@ -272,18 +322,26 @@ export component AppWindow inherits Window {
                 // ---- Control row (connected) ----
                 if root.running: HorizontalLayout {
                     spacing: 8px;
-                    // Re-discover
+                    // Re-discover (disabled + relabelled while a walk is in flight)
                     Rectangle {
                         height: 46px;
                         horizontal-stretch: 1;
                         border-radius: 10px;
-                        background: rd-touch.pressed ? root.surface-2 : root.surface;
+                        background: rd-touch.pressed && !root.discovery-active ? root.surface-2 : root.surface;
                         border-width: 1px;
-                        border-color: rd-touch.has-hover ? root.azure : root.line;
-                        rd-touch := TouchArea { clicked => { root.rediscover(); } }
+                        border-color: root.discovery-active ? root.line
+                            : (rd-touch.has-hover ? root.azure : root.line);
+                        animate background, border-color { duration: 120ms; }
+                        rd-touch := TouchArea {
+                            enabled: !root.discovery-active;
+                            clicked => { root.rediscover(); }
+                        }
                         Text {
-                            text: "Re-discover";
-                            color: root.text-hi; font-size: 12px; font-weight: 600;
+                            text: root.discovery-active ? "Searching" : "Re-discover";
+                            color: root.discovery-active ? root.azure : root.text-hi;
+                            font-size: 12px; font-weight: 600;
+                            opacity: root.discovery-active && root.pulse ? 0.6 : 1.0;
+                            animate opacity { duration: 700ms; }
                         }
                     }
                     // Reconnect
@@ -294,6 +352,7 @@ export component AppWindow inherits Window {
                         background: rc-touch.pressed ? root.surface-2 : root.surface;
                         border-width: 1px;
                         border-color: rc-touch.has-hover ? root.azure : root.line;
+                        animate background, border-color { duration: 120ms; }
                         rc-touch := TouchArea { clicked => { root.reconnect(); } }
                         Text {
                             text: "Reconnect";
@@ -308,6 +367,7 @@ export component AppWindow inherits Window {
                         background: root.paranoid ? #14283f : (pn-touch.pressed ? root.surface-2 : root.surface);
                         border-width: 1px;
                         border-color: root.paranoid ? root.azure : (pn-touch.has-hover ? root.azure : root.line);
+                        animate background, border-color { duration: 120ms; }
                         pn-touch := TouchArea { clicked => { root.toggle-paranoid(); } }
                         Text {
                             text: "Paranoid";
@@ -320,7 +380,7 @@ export component AppWindow inherits Window {
                 // Disconnect (connected) - subordinate, full-width, coral text.
                 if root.running || root.starting: Rectangle {
                     height: 38px;
-                    border-radius: 9px;
+                    border-radius: 10px;
                     background: dc-touch.pressed ? #2a1a20 : root.surface-2;
                     border-width: 1px;
                     border-color: root.line;
@@ -328,9 +388,34 @@ export component AppWindow inherits Window {
                     Text { text: "Disconnect"; color: root.coral; font-size: 12px; font-weight: 600; }
                 }
 
+                // ---- Live throughput (up = azure, down = violet) ----
+                if root.running: HorizontalLayout {
+                    spacing: 9px;
+                    Rectangle {
+                        horizontal-stretch: 1; height: 54px; border-radius: 12px;
+                        background: root.surface; border-width: 1px; border-color: root.line;
+                        HorizontalLayout {
+                            padding-left: 14px; padding-right: 14px; spacing: 10px;
+                            Text { text: "Up"; color: root.muted; font-size: 11px; font-weight: 700; vertical-alignment: center; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Text { text: root.throughput-up; color: root.azure; font-size: 16px; font-weight: 700; vertical-alignment: center; }
+                        }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1; height: 54px; border-radius: 12px;
+                        background: root.surface; border-width: 1px; border-color: root.line;
+                        HorizontalLayout {
+                            padding-left: 14px; padding-right: 14px; spacing: 10px;
+                            Text { text: "Down"; color: root.muted; font-size: 11px; font-weight: 700; vertical-alignment: center; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Text { text: root.throughput-down; color: root.violet; font-size: 16px; font-weight: 700; vertical-alignment: center; }
+                        }
+                    }
+                }
+
                 // ---- Error banner ----
                 if root.error-text != "": Rectangle {
-                    border-radius: 9px;
+                    border-radius: 10px;
                     background: #241519;
                     border-width: 1px;
                     border-color: #5c2830;
@@ -357,6 +442,12 @@ export component AppWindow inherits Window {
                         invite-edit := LineEdit {
                             placeholder-text: "mirage://...";
                             text <=> root.invite;
+                            accepted => {
+                                if (root.invite != "" || root.config-path != "") {
+                                    root.show-connect = false;
+                                    root.start();
+                                }
+                            }
                         }
                         HorizontalBox {
                             spacing: 8px;
@@ -364,10 +455,17 @@ export component AppWindow inherits Window {
                                 placeholder-text: "or select a client.json";
                                 text <=> root.config-path;
                                 horizontal-stretch: 1;
+                                accepted => {
+                                    if (root.invite != "" || root.config-path != "") {
+                                        root.show-connect = false;
+                                        root.start();
+                                    }
+                                }
                             }
                             Rectangle {
-                                width: 92px; border-radius: 9px;
-                                background: br-touch.pressed ? root.surface-2 : #223247;
+                                width: 92px; border-radius: 10px;
+                                background: br-touch.pressed ? root.surface-2 : (br-touch.has-hover ? #2a3c53 : #223247);
+                                animate background { duration: 120ms; }
                                 br-touch := TouchArea { clicked => { root.browse(); } }
                                 Text { text: "Browse"; color: root.text-hi; font-size: 13px; }
                             }
@@ -380,8 +478,9 @@ export component AppWindow inherits Window {
                                 horizontal-stretch: 1;
                             }
                             Rectangle {
-                                width: 92px; border-radius: 9px;
-                                background: sv-touch.pressed ? root.surface-2 : #223247;
+                                width: 92px; border-radius: 10px;
+                                background: sv-touch.pressed ? root.surface-2 : (sv-touch.has-hover ? #2a3c53 : #223247);
+                                animate background { duration: 120ms; }
                                 opacity: (root.profile-name != "" && (root.invite != "" || root.config-path != "")) ? 1.0 : 0.45;
                                 sv-touch := TouchArea {
                                     clicked => {
@@ -395,7 +494,9 @@ export component AppWindow inherits Window {
                         }
                         Rectangle {
                             height: 46px; border-radius: 10px;
-                            background: cn-touch.pressed ? root.azure.darker(0.2) : root.azure;
+                            background: cn-touch.pressed ? root.azure.darker(0.25)
+                                : (cn-touch.has-hover ? root.azure-bright : root.azure);
+                            animate background { duration: 120ms; }
                             opacity: (root.invite != "" || root.config-path != "") ? 1.0 : 0.45;
                             cn-touch := TouchArea {
                                 clicked => {
@@ -431,11 +532,15 @@ export component AppWindow inherits Window {
                         }
                     }
                     for p in root.profiles: Rectangle {
-                        height: 50px;
-                        border-radius: 11px;
-                        background: p.active ? #12233a : (prow-touch.pressed ? root.surface-2 : root.surface);
+                        height: 52px;
+                        border-radius: 12px;
+                        background: p.active ? #12233a
+                            : (prow-touch.pressed ? root.surface-2
+                            : (prow-touch.has-hover ? #182438 : root.surface));
                         border-width: 1px;
-                        border-color: p.active ? root.azure : root.line;
+                        border-color: p.active ? root.azure
+                            : (prow-touch.has-hover ? root.line-2 : root.line);
+                        animate background, border-color { duration: 120ms; }
                         prow-touch := TouchArea { clicked => { root.load-profile(p.name); } }
                         HorizontalLayout {
                             padding-left: 13px;
@@ -466,11 +571,16 @@ export component AppWindow inherits Window {
                                 vertical-alignment: center;
                             }
                             Rectangle {
-                                width: 28px; height: 28px; border-radius: 6px;
+                                width: 28px; height: 28px; border-radius: 8px;
                                 y: (parent.height - self.height) / 2;
-                                background: del-touch.pressed ? #3a1a1f : transparent;
+                                background: del-touch.pressed ? #3a1a1f : (del-touch.has-hover ? #241a1f : transparent);
+                                animate background { duration: 120ms; }
                                 del-touch := TouchArea { clicked => { root.delete-profile(p.name); } }
-                                Text { text: "x"; color: root.muted; font-size: 14px; }
+                                Text {
+                                    text: "x";
+                                    color: del-touch.has-hover ? root.coral : root.muted;
+                                    font-size: 14px;
+                                }
                             }
                         }
                     }
@@ -538,7 +648,7 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         spacing: 9px;
                         Rectangle {
-                            horizontal-stretch: 1; height: 62px; border-radius: 11px;
+                            horizontal-stretch: 1; height: 62px; border-radius: 12px;
                             background: root.surface; border-width: 1px; border-color: root.line;
                             VerticalLayout {
                                 padding: 12px; spacing: 5px;
@@ -550,7 +660,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         Rectangle {
-                            horizontal-stretch: 1; height: 62px; border-radius: 11px;
+                            horizontal-stretch: 1; height: 62px; border-radius: 12px;
                             background: root.surface; border-width: 1px; border-color: root.line;
                             VerticalLayout {
                                 padding: 12px; spacing: 5px;
@@ -559,7 +669,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         Rectangle {
-                            horizontal-stretch: 1; height: 62px; border-radius: 11px;
+                            horizontal-stretch: 1; height: 62px; border-radius: 12px;
                             background: root.surface; border-width: 1px; border-color: root.line;
                             VerticalLayout {
                                 padding: 12px; spacing: 5px;
@@ -580,7 +690,7 @@ export component AppWindow inherits Window {
                     }
                     for b in root.bridges: Rectangle {
                         height: 42px;
-                        border-radius: 9px;
+                        border-radius: 10px;
                         background: root.surface;
                         border-width: 1px;
                         border-color: root.line;
@@ -591,8 +701,8 @@ export component AppWindow inherits Window {
                             Rectangle {
                                 width: 4px;
                                 background: b.id-color;
-                                border-top-left-radius: 9px;
-                                border-bottom-left-radius: 9px;
+                                border-top-left-radius: 10px;
+                                border-bottom-left-radius: 10px;
                             }
                             Rectangle {
                                 width: 9px; height: 9px; border-radius: 5px;
@@ -673,6 +783,18 @@ export component AppWindow inherits Window {
     if root.show-browser: Rectangle {
         background: #000000cc;
         TouchArea { clicked => { root.browser-cancel(); } }
+        // Esc closes the picker (grabs focus when the modal opens).
+        FocusScope {
+            init => { self.focus(); }
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    root.browser-cancel();
+                    accept
+                } else {
+                    reject
+                }
+            }
+        }
 
         Rectangle {
             x: (parent.width - self.width) / 2;

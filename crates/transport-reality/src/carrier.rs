@@ -530,6 +530,7 @@ where
                 shs_key,
                 shs_iv,
                 inputs.cert_verify_override_pk.copied(),
+                inputs.server_name,
             )
             .await;
         }
@@ -559,6 +560,7 @@ async fn finish_client_handshake_linear<S>(
     _shs_key: mirage_crypto::zeroize::Zeroizing<Vec<u8>>,
     _shs_iv: [u8; AEAD_IV_LEN],
     cert_verify_override_pk: Option<[u8; 33]>,
+    cover_host: &str,
 ) -> Result<RealityStream<S>, CarrierError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -659,7 +661,11 @@ where
         send: DirKeys::from_key_iv(record_cipher, cat_key, cat_iv),
         recv: DirKeys::from_key_iv(record_cipher, sat_key, sat_iv),
     };
-    Ok(RealityStream::with_keys(stream, keys))
+    // Target-conditioned replay keys on the cover host (== our SNI). The bridge
+    // sets the same host from the ClientHello, so up/down stays coherent.
+    let mut rs = RealityStream::with_keys(stream, keys);
+    rs.set_cover_host(cover_host);
+    Ok(rs)
 }
 
 /// Plan for the concatenated server flight plaintext.
@@ -1454,9 +1460,13 @@ where
         send: DirKeys::from_key_iv(record_cipher, sat_key, sat_iv),
         recv: DirKeys::from_key_iv(record_cipher, cat_key, cat_iv),
     };
-    Ok(AcceptOutcome::Authenticated(RealityStream::with_keys(
-        stream, keys,
-    )))
+    // Target-conditioned replay keys on the client's SNI (the cover host both ends
+    // agree on), so the down-envelope wears the same site as the client's up.
+    let mut rs = RealityStream::with_keys(stream, keys);
+    if let Some(sni) = extract_sni(&ch_bytes) {
+        rs.set_cover_host(sni);
+    }
+    Ok(AcceptOutcome::Authenticated(rs))
 }
 
 /// Extract the first SNI (host_name) from a ClientHello record.
@@ -1661,6 +1671,10 @@ pub struct RealityStream<S> {
     /// so both endpoints derive the identical value with nothing on the wire. Used
     /// only when an envelope pacer wraps this stream ([`Self::pace_seed`]).
     pace_seed: u64,
+    /// The Reality cover host this session mimics (client SNI / bridge cover host).
+    /// When set, target-conditioned envelope replay keys the profile library on it
+    /// so the flow wears the claimed site's shape. Both ends set the same host.
+    cover_host: Option<String>,
 }
 
 enum RxState {
@@ -1696,6 +1710,7 @@ impl<S> RealityStream<S> {
             inner,
             passthrough: false,
             pace_seed,
+            cover_host: None,
             rx: RxState::Header {
                 got: 0,
                 buf: [0u8; RECORD_HEADER_LEN],
@@ -1756,6 +1771,19 @@ impl<S> RealityStream<S> {
     /// pacer stacked above controls each record's wire size 1:1. Off by default.
     pub fn set_passthrough(&mut self, on: bool) {
         self.passthrough = on;
+    }
+
+    /// Record the Reality cover host this session mimics, so target-conditioned
+    /// envelope replay can wear that specific site's shape. The client sets its
+    /// SNI; the bridge sets the matching cover host; both must agree for coherent
+    /// up/down. See [`crate::paced`].
+    pub fn set_cover_host(&mut self, host: impl Into<String>) {
+        self.cover_host = Some(host.into());
+    }
+
+    /// The Reality cover host, if set. Consumed by [`crate::paced::maybe_pace`].
+    pub fn cover_host(&self) -> Option<&str> {
+        self.cover_host.as_deref()
     }
 }
 
@@ -2690,6 +2718,8 @@ mod tests {
                 rs,
                 crate::pacer::ScheduleStream::new(proc, seed),
                 crate::pacer::Dir::Up,
+                // Reality passthrough: one pump frame -> one TLS 1.3 record.
+                crate::paced::Carrier::tls(),
             );
             let (mut rd, mut wr) = tokio::io::split(paced);
             let w = tokio::spawn(async move {
@@ -2726,6 +2756,8 @@ mod tests {
                         rs,
                         crate::pacer::ScheduleStream::new(proc, seed),
                         crate::pacer::Dir::Down,
+                        // Reality passthrough: one pump frame -> one TLS 1.3 record.
+                        crate::paced::Carrier::tls(),
                     );
                     let (mut rd, mut wr) = tokio::io::split(paced);
                     let w = tokio::spawn(async move {
@@ -2796,6 +2828,8 @@ mod tests {
             rs,
             crate::pacer::ScheduleStream::new(proc, seed),
             Dir::Down,
+            // Reality passthrough: one pump frame -> one TLS 1.3 record.
+            crate::paced::Carrier::tls(),
         );
         let payload = vec![0xABu8; 40_000]; // 40 KB of real demand
         let writer = tokio::spawn(async move {
@@ -2911,6 +2945,8 @@ mod tests {
                 rs,
                 crate::pacer::ScheduleStream::new(proc, seed),
                 crate::pacer::Dir::Up,
+                // Reality passthrough: one pump frame -> one TLS 1.3 record.
+                crate::paced::Carrier::tls(),
             );
             // Client is the initiator: write a small msg, read the echo, repeat.
             for i in 0u8..3 {
@@ -2951,6 +2987,8 @@ mod tests {
                         rs,
                         crate::pacer::ScheduleStream::new(proc, seed),
                         crate::pacer::Dir::Down,
+                        // Reality passthrough: one pump frame -> one TLS 1.3 record.
+                        crate::paced::Carrier::tls(),
                     );
                     for _ in 0u8..3 {
                         let mut got = [0u8; 5];

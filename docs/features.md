@@ -53,6 +53,14 @@ Ride on top of any carrier.
 | **Cover traffic** | Fetches real decoy pages while idle, so "idle" doesn't stand out. | `cover_destinations` |
 | **Encrypted SNI (ECH)** | Encrypts the inner TLS hostname behind a CDN (RFC 9180 HPKE), so the CDN edge doesn't reveal which site you reach. TLS carriers (meek / DoH / WebSocket). | invite (`INVITE_EXT_ECH_CONFIG`) or `carrier_ech_config` |
 
+> **ECH caveat (honest):** ECH hides the inner SNI, but on the meek/DoH/WebSocket
+> carriers it currently rides rustls's default ClientHello, whose JA3 is *not* a
+> browser's. In the wild ECH is sent almost only by browsers, so ECH on a non-browser
+> fingerprint can itself be a distinguisher. It is most useful where the carrier
+> already blends; a browser-matching ClientHello for this path (a Rust uTLS-equivalent)
+> is future work. The Reality carrier separately sends Chrome-style GREASE ECH as part
+> of its browser fingerprint.
+
 ---
 
 ## Discovery
@@ -109,6 +117,7 @@ network.
 | **Replay protection** | Recorded handshakes being replayed. Bounded replay window, optionally persisted. |
 | **Epoch-rotated rendezvous** | Bulk bridge enumeration via discovery. |
 | **Capability tokens** | Unauthorised use. Every session presents a signed, expiring token. |
+| **Forward-secure tokens** | A stolen operator key forging *past* sessions. Tokens carry an inline root->epoch-subkey certificate (a fresh subkey per token, so an invite's batch can't be cohort-linked at the bridge); the bridge verifies the chain against the operator key, with a grace window for the previous key during rotation. |
 | **Post-quantum session keys** | "Harvest now, decrypt later." ML-KEM-768 is mixed into the Noise handshake. |
 | **Padding + jitter** | ML/DPI flow classifiers. |
 | **Replay pacing** (`paranoid` mode) | Traffic-analysis. The flow's packet sizes/timing replay a real recorded video-streaming envelope instead of a generated one; build the library with `tools/cover-sources`. |
@@ -135,7 +144,7 @@ Every one is in the standard build.
 | **`mirage-publish`** | Publishes bridge announcements to Nostr / DNS / DHT. Run on your workstation. |
 | **`mirage-rotate`** | Key and invite rotation. |
 | **`mirage-cover-fetch`** | Downloads a real TLS transcript to use as cover material. |
-| **`mirage-cover-record`** | Records real traffic (video or web-browsing) into the Proteus replay library (paranoid mode). Self-contained - no external tools. |
+| **`mirage-cover-record`** | Records real traffic (video, web-browsing, or upload) into a Proteus replay library. Optional - `proteus = true` makes the daemon source its own; this is for pinning a specific envelope. Self-contained, no external tools. |
 | **`mirage-cohort-refresh`** | Diagnostic: asks a bridge for a cohort update. |
 | **`mirage-pt-client`** | Tor pluggable-transport (PT 2.1) adapter - run Mirage as a Tor PT. |
 

@@ -57,6 +57,12 @@
 //! - Multi-hop circuit construction and `.mirage` onion resolution.
 //! - Cover-traffic scheduling (record-level `PaddedStream` exists but is not
 //!   driven from this facade).
+//! - Proteus on carriers OTHER than Reality. [`MirageConfig::proteus`] turns the
+//!   envelope pacer on and [`Transport::Reality`] wears it, which is the only
+//!   carrier here a bridge also paces - the plain and obfs paths are unpaced on
+//!   both ends, so they match. If this facade grows the WebSocket or SS-2022
+//!   carriers, each has to pass its own `mirage_transport_reality::Carrier` so
+//!   the pacer sizes frames against the framing that carrier actually adds.
 //!
 //! These are additive: the [`MirageCore::open_tunnel`] signature is
 //! stable, so consumers building against it today keep working when
@@ -153,6 +159,26 @@ pub enum Transport {
     Obfs,
 }
 
+/// Proteus envelope pacing for [`MirageConfig::proteus`].
+///
+/// `profile_up` is NOT optional in practice. The shipped default on both the
+/// client and the bridge points the upstream at the recorded `upstream` class,
+/// and the two directions are merged into ONE replay schedule - so an endpoint
+/// that omits it builds a different schedule from the peer that supplies it.
+/// Both ends must select the same trace bytes or the replay is not joint, and a
+/// pair replaying two unrelated captures has an up/down relationship no real
+/// flow has, which is worse than not pacing at all.
+#[derive(Debug, Clone)]
+pub struct ProteusSetting {
+    /// Pacing mode, e.g. `"replay"`. Empty disables.
+    pub mode: String,
+    /// Cover library for the DOWNSTREAM envelope (a trace file or a directory).
+    pub profile: Option<String>,
+    /// Cover library for the UPSTREAM envelope. Supply the peer's `upstream`
+    /// class here; omitting it silently diverges from a peer that has it.
+    pub profile_up: Option<String>,
+}
+
 /// Configuration for [`MirageCore`].
 ///
 /// Fields are public so applications can construct a config
@@ -165,6 +191,25 @@ pub struct MirageConfig {
     pub handshake_timeout: Duration,
     /// Carrier transport to ride. Default [`Transport::PlainTcp`].
     pub transport: Transport,
+    /// Proteus envelope pacing, and the cover library to replay.
+    ///
+    /// `None` leaves the process-wide setting alone (which an embedder can also
+    /// drive with the `MIRAGE_PROTEUS` / `MIRAGE_PROTEUS_PROFILE` environment
+    /// variables). `Some((mode, profile))` applies it in-process at
+    /// [`MirageCore::new`], which is the only way an embedded application can
+    /// turn Proteus on without setting environment variables on itself.
+    ///
+    /// **This has to match the bridge.** Pacing is a per-connection property
+    /// both ends agree on, not something negotiated: the session handshake runs
+    /// INSIDE the pacer, so an unpaced client talking to a paced bridge reads a
+    /// frame header where a handshake should be, and the connection HANGS rather
+    /// than degrading. It surfaces as `mirage handshake timed out`, which points
+    /// at the network instead of at this field - so if a bridge advertises
+    /// Proteus and tunnels never open, look here first.
+    ///
+    /// Only the Reality carrier is paced in this crate; the plain and obfs
+    /// transports are unpaced on both ends, so they are unaffected.
+    pub proteus: Option<ProteusSetting>,
 }
 
 impl MirageConfig {
@@ -198,6 +243,10 @@ impl MirageConfig {
             invite,
             handshake_timeout: Duration::from_secs(10),
             transport: Transport::default(),
+            // Leave the process-wide setting alone: an embedder that already set
+            // MIRAGE_PROTEUS keeps it, and one that has not is not silently
+            // switched into a mode its bridge may not be in.
+            proteus: None,
         })
     }
 }
@@ -275,6 +324,12 @@ pub struct MirageCore {
 impl MirageCore {
     /// Construct from a config. Cheap (no network I/O).
     pub fn new(config: MirageConfig) -> Self {
+        // Apply Proteus before any dial, because pacing is a property of the
+        // connection rather than of a request: the first tunnel this core opens
+        // has to already be paced or it hangs against a paced bridge.
+        if let Some(p) = config.proteus.clone() {
+            mirage_transport_reality::set_pace_override(p.mode, p.profile, p.profile_up);
+        }
         Self {
             config,
             token_cursor: Arc::new(AtomicUsize::new(0)),
@@ -360,9 +415,11 @@ impl MirageCore {
                 )
                 .await
                 .map_err(|e| CoreError::Transport(format!("reality handshake: {e}")))?;
-                // Shaper-v2: opt-in envelope pacing (MIRAGE_REALITY_PACE). Off by
-                // default - returns the carrier stream unchanged. The client writes
-                // upstream, so it paces the `Up` direction.
+                // Proteus: envelope pacing, from `MirageConfig::proteus` or the
+                // MIRAGE_PROTEUS environment. Off by default - returns the carrier
+                // stream unchanged. The client writes upstream, so it paces `Up`.
+                // It MUST match the bridge; see `MirageConfig::proteus` for why a
+                // mismatch hangs instead of degrading.
                 Ok(Box::pin(mirage_transport_reality::maybe_pace(
                     reality,
                     mirage_transport_reality::pacer::Dir::Up,
@@ -533,11 +590,44 @@ mod tests {
         )
     }
 
+    #[test]
+    fn proteus_in_the_config_reaches_the_pacer() {
+        // Without this the field is decoration: an embedder sets it, nothing
+        // applies it, and the tunnel hangs against a paced bridge with a message
+        // that blames the network. `pace_profile()` reads the process-wide
+        // setting the pacer itself consults, so a green test here means a dial
+        // would pace.
+        let dir = std::env::temp_dir().join("mirage-core-proteus-test");
+        let up = dir.join("upstream");
+        let mut cfg = dummy_config();
+        cfg.proteus = Some(ProteusSetting {
+            mode: "replay".to_string(),
+            profile: Some(dir.display().to_string()),
+            profile_up: Some(up.display().to_string()),
+        });
+        let _core = MirageCore::new(cfg);
+        assert_eq!(
+            mirage_transport_reality::pace_profile().as_deref(),
+            Some(dir.display().to_string().as_str()),
+            "MirageCore::new must apply the config's Proteus setting before any dial"
+        );
+        assert_eq!(
+            mirage_transport_reality::pace_profile_up().as_deref(),
+            Some(up.display().to_string().as_str()),
+            "the UPSTREAM library must reach the pacer too - dropping it builds a \
+             different schedule from the peer and the replay is no longer joint"
+        );
+        // Leave the process as we found it - this is global state and the other
+        // tests in this binary share it.
+        mirage_transport_reality::set_pace_override("", None, None);
+    }
+
     fn dummy_config() -> MirageConfig {
         MirageConfig {
             invite: dummy_invite(),
             handshake_timeout: Duration::from_secs(10),
             transport: Transport::PlainTcp,
+            proteus: None,
         }
     }
 
@@ -703,6 +793,7 @@ mod tests {
             invite,
             handshake_timeout: Duration::from_secs(5),
             transport,
+            proteus: None,
         });
 
         let mut tunnel = core.open_tunnel().await.expect("open_tunnel");
@@ -751,6 +842,7 @@ mod tests {
             invite,
             handshake_timeout: Duration::from_millis(200),
             transport: Transport::PlainTcp,
+            proteus: None,
         };
         cfg.invite.bootstrap_tokens.clear();
         let core = MirageCore::new(cfg);

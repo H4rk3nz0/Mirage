@@ -329,6 +329,15 @@ pub struct ScheduleStream {
 }
 
 impl ScheduleStream {
+    /// True when this stream replays a captured profile (vs a generative process).
+    /// The pacer pins a replay's clock to the shared capture origin (both endpoints
+    /// seed-derive the same start token), so the up/down request-response coupling
+    /// of the real flow survives - rather than each direction pinning to its own
+    /// first token, which offsets the joint timeline by the up/down start gap.
+    pub fn is_replay(&self) -> bool {
+        self.replay.is_some()
+    }
+
     /// Start a continuous stream for `proc`, deterministic from `seed`.
     pub fn new(proc: CoverProcess, seed: u64) -> Self {
         let mut r = Prng::new(seed);

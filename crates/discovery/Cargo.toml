@@ -27,5 +27,10 @@ fs2 = "0.4"
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Test-only: the cover-sync client speaks SOCKS5 to the bridge, and the bridge
+# uses THIS server code to parse it. Reproducing the real server half in a test
+# is the only way to catch a client/server disagreement without a live cluster -
+# which is exactly the bug this dependency was added to find.
+mirage-socks5 = { workspace = true }
 tempfile = "3"
 

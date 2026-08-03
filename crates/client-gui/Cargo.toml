@@ -24,6 +24,11 @@ slint = { version = "=1.9.2", default-features = false, features = [
     "backend-winit",
     "renderer-software",
 ] }
+# Direct handle to the winit backend (already in the tree via Slint's
+# `backend-winit`, `default = []`, so this pulls no new crates) to set the window
+# icon programmatically: Slint's declarative `icon:` is a no-op under the software
+# renderer (verified: `_NET_WM_ICON` stays empty), so we push it to winit ourselves.
+i-slint-backend-winit = "=1.9.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 # NOT imported directly - this pins a TRANSITIVE dep of Slint's build toolchain

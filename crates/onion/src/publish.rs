@@ -240,13 +240,20 @@ mod tests {
             bridge_ed25519_pk: [tag; 32],
             bridge_x25519_pk: [tag.wrapping_add(1); 32],
             intro_auth_key: [tag.wrapping_add(2); 32],
+            endpoint: "198.51.100.1:443".to_string(),
         }
     }
 
     fn make_signed_desc(now: u64) -> (OnionDescriptor, [u8; 32]) {
         let (sk, pk) = make_service_keypair();
-        let mut d =
-            OnionDescriptor::new(now, now + 3600, pk, vec![make_intro(1), make_intro(2)]).unwrap();
+        let mut d = OnionDescriptor::new(
+            now,
+            now + 3600,
+            pk,
+            [0xC5u8; 32],
+            vec![make_intro(1), make_intro(2)],
+        )
+        .unwrap();
         d.sign(&sk).unwrap();
         (d, pk)
     }
@@ -318,7 +325,9 @@ mod tests {
         // Build a descriptor that's expired-at-now.
         let now = 2_000_000_000;
         let (sk, pk) = make_service_keypair();
-        let mut d = OnionDescriptor::new(1_000_000, 1_000_010, pk, vec![make_intro(1)]).unwrap();
+        let mut d =
+            OnionDescriptor::new(1_000_000, 1_000_010, pk, [0xC5u8; 32], vec![make_intro(1)])
+                .unwrap();
         d.sign(&sk).unwrap();
         let epoch = 100;
         let ch: Arc<dyn DiscoveryChannel> = Arc::new(InMemoryChannel::new("ch"));

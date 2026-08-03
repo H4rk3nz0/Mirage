@@ -4,7 +4,7 @@
 
 <p align="center">
   Pluggable carriers &middot; epoch-rotated discovery &middot; authenticated session crypto &middot; replay-based traffic shaping &middot; onion routing<br>
-  <sub>behind one local SOCKS5 proxy or a full-device VPN</sub>
+  <sub>All behind one local SOCKS5 proxy or a full-device VPN</sub>
 </p>
 
 <p align="center">
@@ -49,15 +49,84 @@ traffic-analysis classifiers key on exactly that. Proteus closes it: it records 
 direction, timing - with your data hidden inside the encrypted record bodies.
 
 The point is *replay, not fake*. A generated "video-like" pattern is always subtly wrong,
-and subtly-wrong is detectable; a real recorded envelope, replayed byte-for-byte, is not.
-We proved it on the wire: the paced tunnel's TLS records match the recorded profile exactly.
+and subtly-wrong is detectable; a real recorded envelope carries no invented structure to
+be wrong about. The size axis is closed on the wire: the paced tunnel's records match the
+recorded profile exactly, per carrier.
+
+**Timing is not closed yet, and the docs say so.** Replicated censor-vantage measurement
+still separates an active tunnel from an idle one at about AUC 0.57 against a 0.53 control
+- far from the 1.0 an unshaped tunnel gives, and not the indistinguishability the design
+aims at. Two causes were found and fixed this cycle; the remainder is unattributed. See
+[proteus.md](docs/proteus.md), which carries the numbers and the failed hypotheses rather
+than only the successes.
+
+Turning it on is one line, on the bridge and on the client:
+
+```json
+{ "proteus": true }
+```
+
+That is the whole procedure. With nothing else configured, each end records and refreshes
+its own cover library in the background - measured at 2 seconds from a cold start to
+wearing a real envelope. There is no recorder to run, no timer to install and no capture
+files to copy anywhere.
 
 | | |
 |---|---|
 | **Both directions** | Client shapes what it sends up, bridge shapes what it sends down - a censor watching either sees real traffic. |
 | **Never twice the same** | Each session chains a random shuffle of real traces, so there's no fixed fingerprint and nothing loops. |
-| **Cover classes** | Streaming video *or* web browsing - pick the shape that matches your pretext. |
-| **Self-contained** | `mirage-cover-record` builds the library from real open sources (PeerTube, Wikipedia) - one shipped binary, no external tools. |
+| **Cover classes** | Web browsing by default; video too on the `balanced` tier - a video capture is the better downstream disguise, but its upstream is too sparse to carry a handshake, so the two get paired. |
+| **Self-contained** | The recorder pulls from real open sources (PeerTube, Wikipedia) using its own TLS stack - no yt-dlp, ffmpeg, tcpdump or python. |
+| **Demand alignment** | Big records are steered to the moments your data is actually waiting. Same timing, same sizes, same bandwidth - just spent when it is wanted. Measured 10x throughput for zero extra cost. |
+| **Not every carrier** | Seven carriers wear the envelope. Plain TCP, obfs-tcp, dnstt and WebRTC do not, and nothing warns you - see [proteus.md](docs/proteus.md). |
+
+### What it costs, plainly
+
+Cover runs for as long as a session is open, busy or idle, so the envelope's rate is also a
+**ceiling on your throughput**. That is not a tuning problem, it is what constant-rate cover
+means. (Per session-day: a client connected two hours a day pays for two hours, not
+twenty-four.)
+
+| tier | cover bill | sustained |
+|---|---|---|
+| `lean` (default) | 2.5 GB/day | ~0.23 Mbit/s |
+| `balanced` | 6 GB/day | ~0.56 Mbit/s |
+
+Set your own instead of picking a tier - a number in GB/day, or `unlimited` for "I do not
+care, go fast":
+
+```json
+{ "proteus": true, "proteus_max_gb_day": 40 }
+```
+
+**Your throughput IS your cover budget, 1:1.** A record leaves on a schedule token whether
+or not you have data, so user bytes displace padding instead of adding to it. That identity
+is exactly what makes an idle tunnel and a busy one look alike - and it means the envelope's
+rate is also your ceiling. There is no arrangement of this design that avoids it.
+
+So the speed is a spending decision, not a property of the tool:
+
+| cover you wear | sustained | you pay | status |
+|---|---|---|---|
+| browse (the default classes) | ~1 Mbit/s | 2.5-6 GB/day | measured |
+| a real 1080p stream | ~5 Mbit/s | ~2 GB/hour connected | not yet validated |
+| a real 4K stream | 15-25 Mbit/s | 7-11 GB/hour connected | not yet validated |
+
+At the default tiers Proteus is a low-bandwidth channel - messaging, text, light browsing.
+It is not *inherently* one: browse cover is slow because web pages are small, and the
+budget is what admits a faster class. The video rows above are what the arithmetic says a
+real stream's envelope would carry; **they have not been run end to end**, so treat them as
+the design's intent rather than a shipped capability. A deployment that needs line rate and
+will not pay for it should run Reality or Shadowsocks-2022 *without* Proteus and accept
+that flow shape is then exposed to traffic analysis.
+
+Raising the budget also buys **latency**, not just throughput - bounding the cover's silent
+gaps is what stops short transfers waiting for the next burst. See
+[proteus.md](docs/proteus.md) for the measurements and the concavity argument behind it.
+
+Want a *specific* envelope - your own site, a particular stream? Record it with
+`mirage-cover-record` and set `proteus_profile`; that pins the library and turns
+auto-sourcing off. See [cover sources](tools/cover-sources/README.md).
 
 One switch turns on the whole strong posture: `"paranoid": true`. Details in the
 **[feature reference](docs/features.md)** and **[operator guide](docs/operators.md)**.
@@ -82,7 +151,7 @@ One switch turns on the whole strong posture: `"paranoid": true`. Details in the
 **Connect** - you need an invite (a `mirage://...` string) from someone running a bridge:
 
 ```sh
-mirage-client client.json      # then point your browser at socks5://127.0.0.1:1080
+mirage-client client.json      # then point your apps at socks5h://127.0.0.1:1080
 ```
 
 Or run `mirage-client-gui`, paste the invite, click **Connect**. The desktop app
@@ -123,7 +192,9 @@ fingerprinting), stream multiplexing, and single-port dispatch across every carr
 
 **Encrypted SNI (ECH)** - on CDN-fronted TLS carriers (meek / DoH / WebSocket), the real
 inner hostname is encrypted with RFC 9180 HPKE, so a censor watching the CDN edge can't see
-which site you are really reaching. Delivered in the invite or set in config.
+which site you are really reaching. Delivered in the invite or set in config. (It hides the
+SNI, but currently rides a non-browser TLS fingerprint - see the
+[ECH caveat](docs/features.md#layers).)
 
 **Finding bridges** - epoch-rotated rendezvous over **Nostr**, **DNS TXT**, and the
 **BitTorrent DHT**, so there's no single list to seize.
@@ -135,7 +206,7 @@ which site you are really reaching. Delivered in the invite or set in config.
 separately, so no single bridge sees both who you are and where you're going.
 
 **Paranoid mode** - one switch puts on the strongest posture at once: Reality carrier,
-handshake padding, fail-closed, and **Proteus** replay pacing (see above). Set
+handshake padding, fail-closed, and **Proteus** (see above). Set
 `"paranoid": true` in config, pass `--paranoid` to `mirage-client`, or flip the toggle in
 the GUI.
 

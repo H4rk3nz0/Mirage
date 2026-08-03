@@ -38,6 +38,7 @@ pub mod leak_detector;
 pub mod next_hop_link;
 pub mod next_hop_pool;
 pub mod probe_defense;
+pub mod rendezvous_router;
 pub mod session_task;
 pub mod stream_dispatcher;
 

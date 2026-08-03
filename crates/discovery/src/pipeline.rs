@@ -37,9 +37,7 @@ use mirage_crypto::ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use mirage_crypto::zeroize::{Zeroize, Zeroizing};
 
 use crate::channel::MAX_PUBLISH_BYTES;
-use crate::derive::{
-    cipher_key, cipher_nonce, info_hash, INFO_HASH_LEN, NAMESPACE_CLIENT_TO_BRIDGE,
-};
+use crate::derive::{info_hash, INFO_HASH_LEN, NAMESPACE_CLIENT_TO_BRIDGE};
 use crate::error::DiscoveryError;
 use crate::ratchet::fs_info_hash;
 use crate::router::{DiscoveryRouter, FetchSummary, PublishSummary};
@@ -469,21 +467,14 @@ enum Verified {
     Revocation(Revocation),
 }
 
-// Helper: silence unused warnings for cipher_key/cipher_nonce; the open/seal
-// helpers already pull them through. These explicit re-exports make it easy
-// for tests or external tools to re-derive the same key material without
-// round-tripping through seal::seal. Keeping them here documents the
-// derivation tree.
+// Explicit re-exports so tests and external tools can re-derive the same key
+// material without round-tripping through seal::seal, and so the derivation
+// tree is visible from one place.
 
 /// Per-epoch ChaCha20-Poly1305 key (32 B). Thin re-export.
 pub use crate::derive::cipher_key as derive_cipher_key;
 /// Per-epoch ChaCha20-Poly1305 nonce (12 B). Thin re-export.
 pub use crate::derive::cipher_nonce as derive_cipher_nonce;
-#[allow(dead_code)]
-fn _ensure_used() {
-    let _ = cipher_key;
-    let _ = cipher_nonce;
-}
 
 // Tests
 

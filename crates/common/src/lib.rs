@@ -7,8 +7,10 @@
 #![warn(missing_docs)]
 
 pub mod process_hardening;
+pub mod proteus_switch;
 pub mod replay_nonce;
 pub mod secure_file;
+pub mod wu_preamble;
 
 pub use replay_nonce::{SeenNonceSet, DEFAULT_SEEN_NONCE_CAPACITY};
 

@@ -42,6 +42,7 @@ block. Each is selected at runtime - nothing to recompile.
 | `ws_enabled`, `ws_path` | `false`, `/` | WebSocket carrier and its request path. |
 | `quic_obfs_password` | - | Shared password for QUIC (Hysteria2/H3) obfuscation. |
 | `quic_obfs_disable` | `false` | Turn QUIC obfuscation off (must match the bridge). |
+| `wu_evasion` | `false` | Wear the Wu-2023 printable preamble on the high-entropy carriers (obfuscated QUIC + Shadowsocks-2022) so their uniform-random wire clears the GFW's fully-encrypted-traffic classifier. A per-network posture; must match the bridge. Also lets Shadowsocks stand alone under entropy DPI (see `allow_ss2022_outer`). |
 | `dnstt_enabled`, `dnstt_domain`, `dnstt_resolver` | `false` | DNS-tunnel carrier, its zone, and the resolver to use. |
 | `meek_front_domain`, `meek_path` | - | Domain-fronting (meek) front host and path. |
 | `doh_front_domain` | - | DNS-over-HTTPS front domain. |
@@ -51,7 +52,7 @@ block. Each is selected at runtime - nothing to recompile.
 
 ### Whole-device VPN (TUN)
 
-See [getting-started §4](getting-started.md#4-whole-device-vpn-optional). Linux
+See [getting-started section 4](getting-started.md#4-whole-device-vpn-optional). Linux
 only today; fails closed elsewhere.
 
 | Key | Default | Meaning |
@@ -71,6 +72,34 @@ only today; fails closed elsewhere.
 | `dht_enabled` | `false` | Discover bridges over the BitTorrent mainline DHT. |
 | `dht_bootstrap_addrs` | `[]` | Custom DHT bootstrap nodes. |
 | `discovery_interval_secs` | `300` | How often to re-fetch announcements. |
+
+### Proteus (traffic shaping)
+
+Makes the tunnel's wire shape a real recorded flow's instead of its own. Applies to every
+paced carrier, not just Reality. **Both ends must agree**: Proteus adds framing, so one
+side shaping and the other not hangs the session rather than merely looking different.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `proteus` | - | `true` turns it on and is normally all you need - the daemon sources and refreshes its own cover library in the background. Also accepts a cost tier: `lean` (default, 2.5 GB/day = ~0.23 Mbit/s sustained) or `balanced` (6 GB/day = ~0.56 Mbit/s). A tier is a THROUGHPUT and LATENCY choice, not a concealment one - both measured indistinguishable from each other (which is not the same as undetectable; a small residual activity signal remains on every budget tested, see docs/proteus.md). Measured medians on the dwelled cover these tiers were taken against: lean 9-13 KB/s, balanced 13-21 KB/s. At the default tiers Proteus is a low-bandwidth channel, but that is the BUDGET, not the design - see `proteus_max_gb_day` and docs/proteus.md. Also accepts an explicit mode: `"replay"` (what `true` means) or the weaker generative classes `"video"`/`"browse"`. |
+| `proteus_max_gb_day` | the tier's ceiling | Your own cover budget instead of a tier's, as a number in GB/day (`40`) or the string `"unlimited"`. **This is the throughput dial**: cover rate and tunnel rate are the same quantity, 1:1, so doubling the budget doubles the ceiling. It also sets worst-case LATENCY, because cheap cover cannot also be smooth - see [Proteus](proteus.md). `"unlimited"` means no capture is ever rejected for cost, and admits the high-bitrate video class - the only cover fast enough to carry a tunnel at line speed, though that path is not yet validated end to end (see [Proteus](proteus.md)). Billed only while a session is open. |
+| `proteus_sources` | `global` | Where cover is recorded FROM: `global`, a region (`cn`, `ir`, `ru`, `tr`), or a comma-separated list of your own URLs. **The default is Wikipedia + PeerTube, which is blocked in several of the places this tool is for** - set a region or your own list on a censored client. |
+| `proteus_profile` | - | Pin a specific trace file or library directory instead. **Setting this turns auto-sourcing off**, and also turns off the bridge-library sync. |
+| `proteus_profile_up` | - | Separate library for the UPSTREAM direction. Self-sourcing sets this to the dense `upstream` class automatically; if you pin `proteus_profile` by hand you should set this too, or the tunnel inherits a 20x-slower download. Note that pointing `proteus_profile` at a library ROOT pools the class subdirs for downstream but deliberately EXCLUDES `upstream/`, which is recorded dense to carry flow control and is the wrong shape to wear as downstream browsing. See [Proteus](proteus.md). |
+
+Cost ceilings cap what an envelope costs to replay, by **rejecting a capture and recording a
+different one** - every trace stays a real capture, so a budget changes which real flow gets
+worn and never synthesises a cheaper-looking one. The same accept-or-re-record machinery
+enforces the latency ceiling, the opening-silence check and the upstream-gap check; a
+capture that fails any of them is replaced rather than repaired.
+
+The auto-sourced library lands in `$MIRAGE_STATE_DIR/cover`, else `$XDG_STATE_HOME/mirage/cover`,
+else `~/.local/state/mirage/cover`. Env equivalents: `MIRAGE_PROTEUS`,
+`MIRAGE_PROTEUS_PROFILE`, `MIRAGE_PROTEUS_PROFILE_UP`.
+
+`paranoid: true` turns Proteus on as part of the strong posture. Details, including
+per-site target-conditioned replay and what a given envelope costs to replay
+continuously: [cover sources](../tools/cover-sources/README.md).
 
 ### Privacy & cover traffic
 
@@ -125,9 +154,14 @@ only today; fails closed elsewhere.
 | `obfs_enabled`, `obfs_bind` | `false` | obfs-tcp carrier and its listener. |
 | `ws_enabled` | `false` | Accept the WebSocket carrier. |
 | `quic_obfs_password`, `quic_obfs_secret_hex`, `quic_obfs_disable` | - | QUIC obfuscation credentials. `quic_obfs_secret_hex` also keys the anti-probe knock - set it, and it's embedded in invites automatically. |
+| `wu_evasion` | `false` | Wear the Wu-2023 printable preamble on the high-entropy carriers (obfuscated QUIC + Shadowsocks-2022). For QUIC it must match the client; Shadowsocks is auto-detected per connection. Enable on networks running GFW-class entropy DPI. |
 | `dnstt_enabled`, `dnstt_domain`, `dnstt_bind` | `false` | DNS-tunnel carrier. |
 | `vless_uuid_hex` | - | VLESS credential. |
 | `shadow_target`, `http_shadow_target` | - | Where unauthenticated/probe traffic is transparently forwarded (the cover). |
+
+The bridge takes the same `proteus` / `proteus_profile` / `proteus_profile_up` keys as the
+client, with the same meanings - see [Proteus](#proteus-traffic-shaping). Both ends must
+have it on.
 
 ### Multi-hop
 
@@ -167,7 +201,7 @@ by `replay_log_path` / `claim_log_path` and their `_fsync` toggles.
 ### Admin web UI
 
 An optional local web UI to view live counters, edit this config, and restart the
-service - see [operators.md §8](operators.md#8-admin-web-ui-optional). Enable it
+service - see [operators.md section 8](operators.md#8-admin-web-ui-optional). Enable it
 with the `--admin-ui` flag or these keys:
 
 | Key | Default | Meaning |

@@ -29,8 +29,16 @@ const MGMT_ADDR: &str = "127.0.0.1:19443";
 const DEFAULT_SOCKS_BIND: &str = "127.0.0.1:1080";
 /// Ring-buffer cap for the log panel.
 const LOG_CAP: usize = 500;
-/// How often the poll thread refreshes status.
-const POLL_INTERVAL: Duration = Duration::from_millis(1500);
+/// Base poll tick. Throughput + connection state refresh at this rate so the
+/// up/down speed reacts within a fraction of a second, not a couple of seconds.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// The heavier snapshot (bridge list, log panel, discovery) refreshes every Nth
+/// tick (~1.5s), so it stays cheap and the log doesn't churn under the cursor.
+const FULL_SNAPSHOT_TICKS: u32 = 3;
+/// EMA weight for the throughput rate: a light smoothing of the 500ms-window
+/// samples that stays responsive (a step change shows within a fraction of a
+/// second) without jittering on bursty TCP.
+const RATE_EMA_ALPHA: f64 = 0.6;
 
 #[derive(Clone, PartialEq)]
 enum DaemonState {
@@ -51,6 +59,9 @@ struct Shared {
     paranoid: Mutex<bool>,
     /// Name of the saved profile currently connected (empty = ad-hoc invite).
     active_profile: Mutex<String>,
+    /// Last time a re-discover was fired, to debounce rapid clicks (the button
+    /// gate has poll-lag, so this prevents a POST flurry in that window).
+    last_rediscover: Mutex<Option<std::time::Instant>>,
 }
 
 impl Shared {
@@ -61,6 +72,7 @@ impl Shared {
             state: Mutex::new(DaemonState::Stopped),
             paranoid: Mutex::new(false),
             active_profile: Mutex::new(String::new()),
+            last_rediscover: Mutex::new(None),
         }
     }
 
@@ -161,17 +173,11 @@ fn find_client_binary() -> Option<std::path::PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
-/// Write the invite-only temp config owner-only (0600), refusing to follow a
+/// Write `bytes` to `path` owner-only (0600 on Unix), refusing to follow a
 /// symlink so another local user can't pre-plant one to read/redirect the write.
-fn write_temp_config(invite: &str) -> std::io::Result<std::path::PathBuf> {
-    let tmp = std::env::temp_dir().join("mirage-gui-client.json");
-    let cfg = serde_json::json!({
-        "local_bind": DEFAULT_SOCKS_BIND,
-        "invite": invite,
-        "handshake_timeout_secs": 10
-    });
-    let cfg_str = serde_json::to_string_pretty(&cfg).expect("json serialization cannot fail");
-    let _ = std::fs::remove_file(&tmp); // drop any stale file/symlink
+/// Used for anything holding a bearer invite (temp config, saved profiles).
+fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(path); // drop any stale file/symlink
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -180,17 +186,41 @@ fn write_temp_config(invite: &str) -> std::io::Result<std::path::PathBuf> {
         opts.write(true).create_new(true).mode(0o600);
         #[cfg(target_os = "linux")]
         opts.custom_flags(libc::O_NOFOLLOW);
-        opts.open(&tmp)
-            .and_then(|mut f| f.write_all(cfg_str.as_bytes()))?;
+        opts.open(path).and_then(|mut f| f.write_all(bytes))?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(&tmp, cfg_str.as_bytes())?;
+        std::fs::write(path, bytes)?;
     }
+    Ok(())
+}
+
+/// Write the invite-only temp config owner-only (0600).
+fn write_temp_config(invite: &str) -> std::io::Result<std::path::PathBuf> {
+    let tmp = std::env::temp_dir().join("mirage-gui-client.json");
+    let cfg = serde_json::json!({
+        "local_bind": DEFAULT_SOCKS_BIND,
+        "invite": invite,
+        "handshake_timeout_secs": 10
+    });
+    let cfg_str = serde_json::to_string_pretty(&cfg).expect("json serialization cannot fail");
+    write_secret_file(&tmp, cfg_str.as_bytes())?;
     Ok(tmp)
 }
 
 fn launch_client(shared: &Arc<Shared>, invite: String, config_path: String) {
+    // Defensive: never leave a previous daemon orphaned if a caller launched
+    // without stopping first (all callbacks run on the UI thread, so this is a
+    // race-free reap). Also frees the SOCKS/management ports before the relaunch.
+    {
+        let mut child = shared.child.lock().expect("child lock");
+        if let Some(ref mut c) = *child {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        *child = None;
+    }
+
     let binary = match find_client_binary() {
         Some(p) => p,
         None => {
@@ -394,8 +424,10 @@ fn save_profiles(list: &[Profile]) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    // Profiles hold bearer invites, so write owner-only (0600) - never with the
+    // default umask, which would leave them world-readable on a shared host.
     if let Ok(s) = serde_json::to_string_pretty(list) {
-        let _ = std::fs::write(&path, s);
+        let _ = write_secret_file(&path, s.as_bytes());
     }
 }
 
@@ -523,8 +555,19 @@ fn latency_color(ms: u64) -> slint::Color {
 // Background poll thread -> UI
 
 fn spawn_poll_thread(ui: slint::Weak<AppWindow>, shared: Arc<Shared>) {
+    // Previous cumulative byte counters, to turn them into a live rate.
+    let mut prev_up = 0u64;
+    let mut prev_down = 0u64;
+    // EMA-smoothed rates (bytes/sec) so a step change appears fast but doesn't jitter.
+    let mut ema_up = 0.0f64;
+    let mut ema_down = 0.0f64;
+    // Last active profile rendered, so we only rebuild the picker on real changes.
+    let mut last_active = String::new();
+    let mut tick = 0u32;
     std::thread::spawn(move || loop {
         std::thread::sleep(POLL_INTERVAL);
+        tick = tick.wrapping_add(1);
+        let do_full = tick % FULL_SNAPSHOT_TICKS == 0;
 
         // Detect unexpected child death.
         let child_alive = {
@@ -545,12 +588,14 @@ fn spawn_poll_thread(ui: slint::Weak<AppWindow>, shared: Arc<Shared>) {
             let mut st = shared.state.lock().expect("state lock");
             if *st == DaemonState::Running || *st == DaemonState::Starting {
                 *st = DaemonState::Error("mirage-client exited unexpectedly".into());
+                // The daemon died on its own: no profile is connected any more, so
+                // the picker's active highlight must clear (drives a model rebuild).
+                shared.active_profile.lock().expect("profile lock").clear();
             }
         }
 
-        // Poll status + bridges (only meaningful while a child is up).
+        // Poll /api/status every (fast) tick for throughput + the state transition.
         let mut status: Option<serde_json::Value> = None;
-        let mut bridges: Vec<BridgeStat> = Vec::new();
         if child_alive {
             if let Some(body) = http_get(MGMT_ADDR, "/api/status") {
                 status = serde_json::from_str(&body).ok();
@@ -561,26 +606,99 @@ fn spawn_poll_thread(ui: slint::Weak<AppWindow>, shared: Arc<Shared>) {
                     }
                 }
             }
-            if let Some(body) = http_get(MGMT_ADDR, "/api/bridges") {
-                bridges = serde_json::from_str(&body).unwrap_or_default();
-            }
         }
+
+        // Throughput: instantaneous rate over the 500ms window, EMA-smoothed.
+        let secs = POLL_INTERVAL.as_secs_f64().max(0.001);
+        if let Some(v) = status.as_ref() {
+            let up = v["total_bytes_up"].as_u64().unwrap_or(0);
+            let down = v["total_bytes_down"].as_u64().unwrap_or(0);
+            ema_up = ema_rate(ema_up, prev_up, up, secs, RATE_EMA_ALPHA);
+            ema_down = ema_rate(ema_down, prev_down, down, secs, RATE_EMA_ALPHA);
+            prev_up = up;
+            prev_down = down;
+        } else if !child_alive {
+            // Stopped: snap to idle and drop the baseline (a fresh daemon starts at 0).
+            ema_up = 0.0;
+            ema_down = 0.0;
+            prev_up = 0;
+            prev_down = 0;
+        } else {
+            // Transient status miss while running: decay toward 0 but keep the
+            // baseline, so one dropped poll neither spikes nor zeroes the next rate.
+            ema_up *= 1.0 - RATE_EMA_ALPHA;
+            ema_down *= 1.0 - RATE_EMA_ALPHA;
+        }
+        let up_rate = format_rate(ema_up);
+        let down_rate = format_rate(ema_down);
 
         let state = shared.state.lock().expect("state lock").clone();
         let active_profile = shared.active_profile();
-        let logs: Vec<String> = shared
-            .logs
-            .lock()
-            .expect("logs lock")
-            .iter()
-            .cloned()
-            .collect();
+        // Only rebuild the profiles model when the active profile actually changes
+        // (connect / disconnect / switch / daemon-death). Rebuilding every tick
+        // re-read disk and churned the model, resetting hover and flickering rows.
+        let profiles_changed = active_profile != last_active;
+        last_active = active_profile.clone();
 
-        // Marshal into UI-thread update.
-        let _ = ui.upgrade_in_event_loop(move |ui| {
-            apply_snapshot(&ui, &state, status, bridges, logs, &active_profile);
-        });
+        // Fast tick: push just state + throughput (cheap). Full tick: also fetch
+        // the bridge list + log and do the heavier snapshot, so those don't churn
+        // at the fast rate while the speed readout stays reactive.
+        if do_full {
+            let bridges: Vec<BridgeStat> = if child_alive {
+                http_get(MGMT_ADDR, "/api/bridges")
+                    .and_then(|b| serde_json::from_str(&b).ok())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let logs: Vec<String> = shared
+                .logs
+                .lock()
+                .expect("logs lock")
+                .iter()
+                .cloned()
+                .collect();
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                apply_snapshot(
+                    &ui,
+                    &state,
+                    status,
+                    bridges,
+                    logs,
+                    &active_profile,
+                    profiles_changed,
+                );
+                ui.set_throughput_up(up_rate.into());
+                ui.set_throughput_down(down_rate.into());
+            });
+        } else {
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                apply_fast(&ui, &state, &active_profile, profiles_changed);
+                ui.set_throughput_up(up_rate.into());
+                ui.set_throughput_down(down_rate.into());
+            });
+        }
     });
+}
+
+/// One EMA step for the throughput rate from a new cumulative-counter sample.
+/// `saturating_sub` clamps a daemon-restart counter reset to a 0 delta (never a
+/// negative or huge spike). A high `alpha` reacts fast; a low one smooths more.
+fn ema_rate(prev_ema: f64, prev_bytes: u64, cur_bytes: u64, secs: f64, alpha: f64) -> f64 {
+    let inst = cur_bytes.saturating_sub(prev_bytes) as f64 / secs.max(0.001);
+    alpha * inst + (1.0 - alpha) * prev_ema
+}
+
+/// Human-readable transfer rate ("1.2 MB/s"), for the GUI throughput readout.
+fn format_rate(bytes_per_sec: f64) -> String {
+    let bps = bytes_per_sec.max(0.0);
+    if bps < 1024.0 {
+        format!("{bps:.0} B/s")
+    } else if bps < 1024.0 * 1024.0 {
+        format!("{:.1} KB/s", bps / 1024.0)
+    } else {
+        format!("{:.1} MB/s", bps / (1024.0 * 1024.0))
+    }
 }
 
 /// Prettify a wire transport name for display ("reality" -> "Reality").
@@ -618,14 +736,9 @@ fn prettify_channel(c: &str) -> String {
     }
 }
 
-fn apply_snapshot(
-    ui: &AppWindow,
-    state: &DaemonState,
-    status: Option<serde_json::Value>,
-    bridges: Vec<BridgeStat>,
-    logs: Vec<String>,
-    active_profile: &str,
-) {
+/// The fast-changing bits pushed every (500ms) tick: connection state, error
+/// text, and the active-profile highlight. Cheap - no bridge/log/discovery work.
+fn apply_fast(ui: &AppWindow, state: &DaemonState, active_profile: &str, profiles_changed: bool) {
     let (state_str, err) = match state {
         DaemonState::Stopped => ("stopped", String::new()),
         DaemonState::Starting => ("starting", String::new()),
@@ -635,8 +748,24 @@ fn apply_snapshot(
     ui.set_daemon_state(state_str.into());
     ui.set_error_text(err.into());
     ui.set_active_profile(active_profile.into());
-    // Keep the profile list (and its active highlight) in sync with disk + state.
-    ui.set_profiles(profiles_model(&load_profiles(), active_profile));
+    // Only rebuild the picker when the active profile changed (see poll thread):
+    // per-tick rebuilds re-read disk and reset row hover. Add/remove still refresh
+    // immediately from their callbacks.
+    if profiles_changed {
+        ui.set_profiles(profiles_model(&load_profiles(), active_profile));
+    }
+}
+
+fn apply_snapshot(
+    ui: &AppWindow,
+    state: &DaemonState,
+    status: Option<serde_json::Value>,
+    bridges: Vec<BridgeStat>,
+    logs: Vec<String>,
+    active_profile: &str,
+    profiles_changed: bool,
+) {
+    apply_fast(ui, state, active_profile, profiles_changed);
 
     if let Some(v) = status {
         ui.set_bind_addr(v["local_bind"].as_str().unwrap_or("").into());
@@ -741,7 +870,10 @@ fn identity_color(id: &str) -> slint::Color {
         h ^= u64::from(byte);
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
-    let hue = (h % 360) as f64;
+    // Constrain the hue to the brand arc (teal -> azure -> violet, ~160-280 deg)
+    // so per-bridge swatches stay distinct yet cohesive with the palette instead
+    // of landing on a jarring green/yellow/red.
+    let hue = 160.0 + (h % 120) as f64;
     // HSV(hue, 0.55, 0.85) -> RGB.
     let (s, v) = (0.55_f64, 0.85_f64);
     let c = v * s;
@@ -786,8 +918,10 @@ fn main() -> Result<(), slint::PlatformError> {
                 println!(
                     "mirage-client-gui {}\n\n\
                      A desktop UI that supervises the mirage-client daemon.\n\
-                     Run with no arguments to open the window. The mirage-client binary must be\n\
-                     alongside this one or on PATH.\n\n\
+                     Run with no arguments to open the window, or pass a client.json to open\n\
+                     already connecting to it. The mirage-client binary must be alongside this\n\
+                     one or on PATH.\n\n\
+                     Usage: mirage-client-gui [client.json]\n\n\
                      Options:\n  \
                        --version, -V   Print version and exit.\n  \
                        --help, -h      Print this help and exit.",
@@ -798,6 +932,9 @@ fn main() -> Result<(), slint::PlatformError> {
             _ => {}
         }
     }
+
+    // An optional config-path argument opens the GUI already connecting to it.
+    let autostart_config = std::env::args().nth(1).filter(|a| !a.starts_with('-'));
 
     let ui = AppWindow::new()?;
     let shared = Arc::new(Shared::new());
@@ -846,9 +983,19 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     // Re-discover: ask the running daemon to walk the rendezvous channels now
     // (POST /api/rediscover). Non-blocking; the poll loop reflects the result.
+    // Debounced to match the daemon's own 5s rate limit, so a click that passes
+    // here always fires rather than getting silently throttled server-side.
     {
+        let shared = Arc::clone(&shared);
         ui.on_rediscover(move || {
-            std::thread::spawn(|| http_post_control(MGMT_ADDR, "/api/rediscover"));
+            let now = std::time::Instant::now();
+            let mut last = shared.last_rediscover.lock().expect("rediscover lock");
+            let fire = last.is_none_or(|t| now.duration_since(t) > Duration::from_secs(5));
+            if fire {
+                *last = Some(now);
+                drop(last);
+                std::thread::spawn(|| http_post_control(MGMT_ADDR, "/api/rediscover"));
+            }
         });
     }
     // Paranoid toggle: flip the launch flag and, if connected, restart into the
@@ -982,7 +1129,10 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_copy_bind(move || {
             if let Some(ui) = ui_weak.upgrade() {
                 let addr = ui.get_bind_addr().to_string();
-                if !addr.is_empty() && copy_to_clipboard(&addr) {
+                // Copy the full socks5h:// URL shown in the UI: pasteable straight
+                // into `curl -x` or an app's proxy field, with remote DNS (the h).
+                let url = format!("socks5h://{addr}");
+                if !addr.is_empty() && copy_to_clipboard(&url) {
                     ui.set_copied(true);
                     let w = ui.as_weak();
                     // Clear the "copied!" flash after a moment.
@@ -1016,15 +1166,160 @@ fn main() -> Result<(), slint::PlatformError> {
 
     spawn_poll_thread(ui.as_weak(), Arc::clone(&shared));
 
+    // Push the app icon to the winit window once the loop has created it (see
+    // schedule_window_icon). Slint's declarative `icon:` is a no-op under the
+    // software renderer, verified: `_NET_WM_ICON` stays empty without this.
+    schedule_window_icon(ui.as_weak());
+
+    // Auto-connect from a config-path argument once the loop is up.
+    if let Some(cfg) = autostart_config {
+        let ui_weak = ui.as_weak();
+        slint::Timer::single_shot(Duration::from_millis(80), move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_config_path(cfg.into());
+                ui.invoke_start();
+            }
+        });
+    }
+
     let run = ui.run();
     // Belt-and-suspenders: ensure the child is reaped even on a clean loop exit.
     stop_client(&shared);
     run
 }
 
+/// Set the window icon directly on winit, since Slint's `Window::icon` is not
+/// applied by the software-renderer backend. The backing winit window is created
+/// lazily when the event loop starts, so this is scheduled on a short timer and
+/// re-arms until the window exists. The icon ships as raw pre-decoded RGBA so no
+/// PNG decoder is linked at runtime. A no-op on backends without a winit window
+/// (e.g. Wayland, which takes the icon from the desktop entry).
+fn schedule_window_icon(ui_weak: slint::Weak<AppWindow>) {
+    slint::Timer::single_shot(Duration::from_millis(30), move || {
+        use i_slint_backend_winit::winit::window::Icon;
+        use i_slint_backend_winit::WinitWindowAccessor;
+        const ICON_RGBA: &[u8] = include_bytes!("../assets/icon-128.rgba");
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let applied = ui
+            .window()
+            .with_winit_window(|w| {
+                if let Ok(icon) = Icon::from_rgba(ICON_RGBA.to_vec(), 128, 128) {
+                    w.set_window_icon(Some(icon));
+                }
+            })
+            .is_some();
+        if !applied {
+            schedule_window_icon(ui_weak.clone());
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
-    use super::list_dir;
+    use super::{
+        format_rate, identity_color, list_dir, prettify_carrier, prettify_channel,
+        profile_subtitle, write_secret_file, Profile,
+    };
+
+    #[test]
+    fn ema_rate_reacts_fast_and_survives_counter_reset() {
+        let (secs, alpha) = (0.5, super::RATE_EMA_ALPHA); // 500ms samples
+        let target = 1_000_000.0; // 1 MB/s, i.e. 500_000 bytes per 500ms sample
+        let step = 500_000u64;
+
+        // From idle, a step change is visible within the first 500ms sample and
+        // is most of the way there within ~1s (was a couple of seconds before).
+        let mut ema = 0.0;
+        let mut prev = 0u64;
+        let s1 = step;
+        ema = super::ema_rate(ema, prev, s1, secs, alpha);
+        prev = s1;
+        assert!(ema >= target * 0.5, "reacts within one 500ms sample: {ema}");
+        for i in 2..=3u64 {
+            ema = super::ema_rate(ema, prev, step * i, secs, alpha);
+            prev = step * i;
+        }
+        assert!(ema >= target * 0.9, "converges within ~1.5s: {ema}");
+
+        // A counter reset (daemon restart: cur < prev) yields 0, never a negative
+        // or a huge spurious spike.
+        let after_reset = super::ema_rate(target, 10_000_000, 0, secs, alpha);
+        assert!(
+            after_reset >= 0.0 && after_reset <= target,
+            "reset is safe: {after_reset}"
+        );
+    }
+
+    #[test]
+    fn format_rate_scales_and_never_negative() {
+        assert_eq!(format_rate(0.0), "0 B/s");
+        assert_eq!(format_rate(512.0), "512 B/s");
+        assert_eq!(format_rate(2048.0), "2.0 KB/s");
+        assert_eq!(format_rate(3.0 * 1024.0 * 1024.0), "3.0 MB/s");
+        // A negative delta (daemon-restart artifact) is clamped, never shown.
+        assert_eq!(format_rate(-5.0), "0 B/s");
+    }
+
+    #[test]
+    fn prettify_carrier_and_channel_map_known_names() {
+        assert_eq!(prettify_carrier("reality"), "Reality");
+        assert_eq!(prettify_carrier("ss2022"), "Shadowsocks");
+        assert_eq!(prettify_carrier("h3"), "MASQUE");
+        assert_eq!(prettify_carrier(""), "-");
+        assert_eq!(prettify_carrier("mystery"), "Mystery"); // capitalized fallback
+        assert_eq!(prettify_channel("dht"), "DHT");
+        assert_eq!(prettify_channel("nostr"), "Nostr");
+        assert_eq!(prettify_channel("dns"), "DNS TXT");
+    }
+
+    #[test]
+    fn profile_subtitle_prefers_config_filename_then_truncates_invite() {
+        let cfg = Profile {
+            name: "x".into(),
+            invite: String::new(),
+            config_path: "/home/u/mynet/client.json".into(),
+        };
+        assert_eq!(profile_subtitle(&cfg), "client.json");
+        let inv = Profile {
+            name: "y".into(),
+            invite: "mirage://AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIII".into(),
+            config_path: String::new(),
+        };
+        let sub = profile_subtitle(&inv);
+        assert!(sub.ends_with("..."), "long invites are truncated: {sub}");
+        assert!(sub.len() <= 34);
+    }
+
+    #[test]
+    fn identity_color_stays_on_the_brand_arc() {
+        // Every swatch hue is constrained to teal->azure->violet (160-280 deg), so
+        // blue is always a strong channel and never warm/red-leaning - no jarring
+        // green/yellow/orange/red swatch escapes across many ids.
+        for i in 0..500u32 {
+            let c = identity_color(&format!("bridge-{i}"));
+            let (r, g, b) = (c.red(), c.green(), c.blue());
+            assert!(
+                b >= 140 && b >= r,
+                "id {i} left the brand arc: rgb({r},{g},{b})"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_is_owner_only_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = std::env::temp_dir();
+        let mut b = [0u8; 8];
+        let _ = getrandom_fill(&mut b);
+        p.push(format!("mirage-gui-secret-{}.json", hex8(&b)));
+        write_secret_file(&p, b"{\"invite\":\"mirage://secret\"}").unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a file holding a bearer invite must be 0600");
+        std::fs::remove_file(&p).ok();
+    }
 
     #[test]
     fn list_dir_shows_dirs_and_json_only_dirs_first() {

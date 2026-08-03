@@ -77,6 +77,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod wu_stream;
+
 use async_trait::async_trait;
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
@@ -90,6 +92,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use wu_stream::MaybeWu;
 use zeroize::Zeroizing;
 
 // Constants
@@ -648,10 +651,15 @@ pub async fn ss2022_client_dial<S>(
     stream: S,
     psk: &[u8; 32],
     deadline: Duration,
-) -> Result<Ss2022Stream<S>, TransportError>
+    wu: bool,
+) -> Result<Ss2022Stream<MaybeWu<S>>, TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // When `wu`, the carrier wears a Wu-2023 printable preamble in both
+    // directions so its otherwise uniform-random wire clears the GFW's
+    // fully-encrypted-traffic classifier. Transparent to the handshake below.
+    let stream = MaybeWu::new(stream, wu);
     tokio::time::timeout(deadline, perform_client_handshake(stream, *psk))
         .await
         .map_err(|_| TransportError::Timeout(deadline))?
@@ -687,11 +695,12 @@ pub async fn ss2022_server_auth<S>(
     stream: S,
     psk: &[u8; 32],
     deadline: Duration,
-) -> Result<Ss2022Stream<S>, TransportError>
+    wu: bool,
+) -> Result<Ss2022Stream<MaybeWu<S>>, TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    ss2022_server_auth_with_replay(stream, psk, deadline, default_replay_set()).await
+    ss2022_server_auth_with_replay(stream, psk, deadline, wu, default_replay_set()).await
 }
 
 /// [`ss2022_server_auth`] with a caller-supplied request-salt replay set.
@@ -706,14 +715,19 @@ where
 ///
 /// Same as [`ss2022_server_auth`].
 pub async fn ss2022_server_auth_with_replay<S>(
-    mut stream: S,
+    stream: S,
     psk: &[u8; 32],
     deadline: Duration,
+    wu: bool,
     seen_salts: &SeenNonceSet,
-) -> Result<Ss2022Stream<S>, TransportError>
+) -> Result<Ss2022Stream<MaybeWu<S>>, TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // When `wu`, the carrier wears the Wu-2023 preamble: the first read strips
+    // the client's, the first write (the response header) prepends the server's.
+    // Transparent to `do_server_auth`, which reads/writes through the wrapper.
+    let mut stream = MaybeWu::new(stream, wu);
     tokio::time::timeout(deadline, do_server_auth(&mut stream, psk, seen_salts))
         .await
         .map_err(|_| TransportError::Timeout(deadline))?
@@ -1669,7 +1683,7 @@ mod tests {
             perform_client_handshake(client_half, client_psk).await
         });
 
-        let server_result = ss2022_server_auth(server_half, &server_psk, deadline).await;
+        let server_result = ss2022_server_auth(server_half, &server_psk, deadline, false).await;
 
         // Server should fail with Auth because the AEAD tag won't verify.
         assert!(
@@ -1719,7 +1733,7 @@ mod tests {
             .expect("write stale handshake");
         client_half.flush().await.expect("flush");
 
-        let result = ss2022_server_auth(server_half, &psk, deadline).await;
+        let result = ss2022_server_auth(server_half, &psk, deadline, false).await;
         assert!(
             matches!(result, Err(TransportError::Auth(_))),
             "stale timestamp must produce Auth error, got: {result:?}"
@@ -1737,7 +1751,7 @@ mod tests {
 
         // Run client and server concurrently.
         let server_task =
-            tokio::spawn(async move { ss2022_server_auth(server_io, &psk, deadline).await });
+            tokio::spawn(async move { ss2022_server_auth(server_io, &psk, deadline, false).await });
 
         // Client side: handshake then send some data.
         // perform_client_handshake consumes client_io and returns an owned Ss2022Stream.
@@ -1776,6 +1790,48 @@ mod tests {
         assert_eq!(client_recv.as_slice(), reply.as_ref());
     }
 
+    /// The same full roundtrip with the Wu-2023 evasion preamble on BOTH ends:
+    /// `ss2022_client_dial(wu=true)` wraps the carrier and the server auths with
+    /// `wu=true`, so the printable preamble is stripped transparently in both
+    /// directions and the SS-2022 handshake + data survive intact.
+    #[tokio::test]
+    async fn full_handshake_roundtrip_with_wu_preamble() {
+        let psk = [0x37u8; 32];
+        let (client_io, server_io) = duplex(65536);
+        let deadline = Duration::from_secs(5);
+
+        let server_task =
+            tokio::spawn(async move { ss2022_server_auth(server_io, &psk, deadline, true).await });
+
+        let mut client_stream = ss2022_client_dial(client_io, &psk, deadline, true)
+            .await
+            .expect("client dial (wu)");
+        let mut server_stream = server_task
+            .await
+            .expect("server task did not panic")
+            .expect("server auth (wu)");
+
+        let msg = b"wu-wrapped request \x00\x01\x02\xff bytes";
+        client_stream.write_all(msg).await.expect("client write");
+        client_stream.flush().await.expect("client flush");
+        let mut recv = vec![0u8; msg.len()];
+        server_stream
+            .read_exact(&mut recv)
+            .await
+            .expect("server read");
+        assert_eq!(recv.as_slice(), msg.as_ref());
+
+        let reply = b"wu-wrapped response \xde\xad\xbe\xef bytes";
+        server_stream.write_all(reply).await.expect("server write");
+        server_stream.flush().await.expect("server flush");
+        let mut client_recv = vec![0u8; reply.len()];
+        client_stream
+            .read_exact(&mut client_recv)
+            .await
+            .expect("client read reply");
+        assert_eq!(client_recv.as_slice(), reply.as_ref());
+    }
+
     /// Regression: decrypted plaintext bytes that happen to equal `0xF0` must
     /// NOT be reinterpreted as read-staging state. An earlier design tagged the
     /// ciphertext staging buffer with a leading `0xF0` sentinel and assumed
@@ -1794,7 +1850,7 @@ mod tests {
         let deadline = Duration::from_secs(5);
 
         let server_task =
-            tokio::spawn(async move { ss2022_server_auth(server_io, &psk, deadline).await });
+            tokio::spawn(async move { ss2022_server_auth(server_io, &psk, deadline, false).await });
         let mut client_stream = perform_client_handshake(client_io, psk)
             .await
             .expect("client handshake");
@@ -1840,7 +1896,7 @@ mod tests {
         let deadline = Duration::from_secs(5);
 
         let server = tokio::spawn(async move {
-            let mut s = ss2022_server_auth(server_io, &psk, deadline)
+            let mut s = ss2022_server_auth(server_io, &psk, deadline, false)
                 .await
                 .expect("server auth");
             // Server reads the client's 0-RTT request bytes first.
@@ -1904,7 +1960,7 @@ mod tests {
             .expect("write wrong-addr handshake");
         client_half.flush().await.expect("flush");
 
-        let result = ss2022_server_auth(server_half, &psk, deadline).await;
+        let result = ss2022_server_auth(server_half, &psk, deadline, false).await;
         assert!(
             matches!(result, Err(TransportError::Auth(_))),
             "wrong magic addr must produce Auth error, got: {result:?}"
@@ -1947,7 +2003,7 @@ mod tests {
             .expect("write wrong-port handshake");
         client_half.flush().await.expect("flush");
 
-        let result = ss2022_server_auth(server_half, &psk, deadline).await;
+        let result = ss2022_server_auth(server_half, &psk, deadline, false).await;
         assert!(
             matches!(result, Err(TransportError::Auth(_))),
             "wrong magic port must produce Auth error, got: {result:?}"

@@ -184,7 +184,7 @@ impl ClientTransport for WsClientTransport {
             .map_err(|_| TransportError::Timeout(inputs.deadline))?
             .map_err(TransportError::Io)?;
 
-        let stream = ws_client_connect(
+        let (stream, _seed) = ws_client_connect(
             tcp,
             inputs.bridge_static_pk,
             inputs.obfs_secret,
@@ -216,21 +216,46 @@ pub struct WsStream<S> {
     /// liveness Ping - silence is an instant active-probe distinguisher
     /// (DPI-R4). `None` when nothing is owed.
     pending_pong: Option<bytes::Bytes>,
+    /// Per-session Proteus pace seed, derived from the handshake nonce that BOTH
+    /// endpoints see. Envelope pacing is only coherent if the two ends replay the
+    /// same trace from the same offset, so the seed has to come from a value they
+    /// share without an extra round trip - the auth nonce already is one.
+    pace_seed: u64,
 }
 
 impl<S> WsStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Wrap a WebSocket stream.
-    pub fn new(ws: tokio_tungstenite::WebSocketStream<S>) -> Self {
+    /// Wrap a WebSocket stream with the per-session pace seed derived from the
+    /// handshake nonce (see [`ws_pace_seed`]).
+    pub fn new_with_seed(ws: tokio_tungstenite::WebSocketStream<S>, pace_seed: u64) -> Self {
         Self {
             inner: ws,
             read_buf: bytes::Bytes::new(),
             write_buf: Vec::new(),
             pending_pong: None,
+            pace_seed,
         }
     }
+
+    /// Per-session Proteus pace seed (identical on both endpoints). Feed to
+    /// `mirage_transport_reality::maybe_pace_stream` so the carrier wears the
+    /// same replayed envelope in both directions.
+    #[must_use]
+    pub fn pace_seed(&self) -> u64 {
+        self.pace_seed
+    }
+}
+
+/// Derive the per-session pace seed from the 32-byte handshake nonce. Both ends
+/// hold the nonce - the client generates it, the server reads it out of the auth
+/// frame - so both derive the same value with no extra exchange.
+#[must_use]
+pub fn ws_pace_seed(nonce: &[u8; 32]) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&nonce[..8]);
+    u64::from_le_bytes(b)
 }
 
 impl<S> AsyncRead for WsStream<S>
@@ -560,7 +585,7 @@ pub async fn ws_client_connect<S>(
     path: &str,
     host: &str,
     deadline: Duration,
-) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send, TransportError>
+) -> Result<(impl AsyncRead + AsyncWrite + Unpin + Send, u64), TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -627,7 +652,7 @@ async fn ws_client_connect_inner<S>(
     obfs_secret: Option<&[u8; 32]>,
     path: &str,
     host: &str,
-) -> Result<WsStream<S>, TransportError>
+) -> Result<(WsStream<S>, u64), TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -763,7 +788,14 @@ where
     )
     .await;
 
-    Ok(WsStream::new(ws))
+    // Seed from the nonce we just sent; the server derives the identical value
+    // from the same bytes in the auth frame.
+    let mut nonce = [0u8; 32];
+    nonce.copy_from_slice(&auth_frame[0..32]);
+    // The seed rides out alongside the stream: the stream type is opaque, and the
+    // caller needs the seed to drive envelope pacing coherently with the server.
+    let seed = ws_pace_seed(&nonce);
+    Ok((WsStream::new_with_seed(ws, seed), seed))
 }
 
 // Server-side 101 response persona (F20)
@@ -868,7 +900,7 @@ pub async fn ws_server_auth<S>(
     obfs_secret: Option<&[u8; 32]>,
     deadline: Duration,
     seen_nonces: &mirage_transport::SeenNonceSet,
-) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send, WsReject<S>>
+) -> Result<(impl AsyncRead + AsyncWrite + Unpin + Send, u64), WsReject<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -903,7 +935,7 @@ async fn ws_server_auth_inner<S>(
     bridge_static_pk: &[u8; 32],
     obfs_secret: Option<&[u8; 32]>,
     seen_nonces: &mirage_transport::SeenNonceSet,
-) -> Result<WsStream<S>, WsReject<S>>
+) -> Result<(WsStream<S>, u64), WsReject<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1068,7 +1100,9 @@ where
         None,
     )
     .await;
-    Ok(WsStream::new(ws))
+    // Pair the stream with the seed both ends derive from this same nonce.
+    let seed = ws_pace_seed(&nonce);
+    Ok((WsStream::new_with_seed(ws, seed), seed))
 }
 
 // Helper: endpoint -> SocketAddr
@@ -1301,11 +1335,19 @@ mod tests {
         });
 
         let (s, c) = tokio::join!(server, client);
-        let mut server_stream = s
+        let (mut server_stream, server_seed) = s
             .expect("server task")
             .map_err(|e| e.0)
             .expect("server auth");
-        let mut client_stream = c.expect("client task").expect("client connect");
+        let (mut client_stream, client_seed) = c.expect("client task").expect("client connect");
+        // Envelope pacing is only coherent if BOTH ends replay the same trace from
+        // the same offset, so the seed each derives from the shared handshake nonce
+        // must agree. If this ever drifts, the two halves would wear unrelated
+        // shapes - which is worse than not pacing at all.
+        assert_eq!(
+            client_seed, server_seed,
+            "both endpoints must derive the same pace seed from the handshake nonce"
+        );
 
         // Data-plane sanity: client -> server through the upgraded WS stream.
         client_stream

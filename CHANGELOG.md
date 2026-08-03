@@ -8,6 +8,40 @@ then, pre-releases may make breaking changes between versions.
 ## [Unreleased]
 
 ### Added
+- **A permutation-derived null for the flow distinguisher**
+  (`flow_classifier::null_model` / `NullModel::verdict`, used by
+  `examples/flow_auc`). The old verdict compared the best of 14 features against
+  ONE calibrated constant, and those features are not comparable statistics: an
+  extreme like `max_size` has a far fatter null tail than a mean. Measured on
+  captures with nothing to find, `max_size` and `size_range` reached 0.571
+  against a 0.552 pooled floor and were reported as the winning separator on two
+  null controls. The null is now permuted from the data itself (relabel the
+  pooled flows, 200 draws) and corrected for having looked fourteen times, using
+  max-T: per-feature thresholds fire on 20% of null data, max-T on 10%, against a
+  nominal 5%. A null control that still flags is a contaminated run and should be
+  discarded rather than averaged in.
+- `single_feature_auc` now computes the Mann-Whitney statistic by RANK SUM in
+  `O((n+m) log(n+m))` instead of the `O(n*m)` pairwise sweep. Same statistic,
+  mid-ranks reproducing the tie rule exactly (asserted against the old definition
+  across tie densities). This is what makes the permutation null affordable, and
+  it is the practical reason the floor was a hard-coded constant before.
+- `examples/feature_floor` - reports each feature's spread across a set of null
+  captures, so an unstable feature can be identified before it is believed.
+- **Aggregated separability scoring** (`flow_classifier::measure_aggregated`,
+  reported by `examples/flow_auc` after every verdict). A per-window AUC answers
+  "can a censor tell from ONE window", which is not the threat: a session emits
+  hundreds of windows from one host and nothing stops an observer averaging them,
+  with separation growing as `sqrt(N)` for independent samples. It reports the
+  margin over each pooling level's OWN floor, because pooling shrinks the sample
+  and the floor rises as samples fall - so raw accuracy climbs for two unrelated
+  reasons and only the margin separates them.
+- `tools/shaper-eval/segments.py` - tests whether an activity signal is TCP
+  segment merging rather than the pacer. The classifier keys on sizes only, so any
+  separability it reports is a size-sequence difference and cannot be a timing
+  artifact; the pacer's frames are token-determined and identical idle or busy, so
+  a difference must enter below it. Refuted for this carrier: runs longer than one
+  frame measured 0.3% idle against 0.4% active, with an unchanged histogram.
+- `tools/shaper-eval/capacity.py` and a README for the directory.
 - **Proteus - replay-based traffic shaping, the flagship Reality upgrade.**
   Reality makes the *connection* look real; Proteus makes the *flow* look real,
   replaying the exact wire envelope (record sizes, direction, timing) of a
@@ -63,6 +97,59 @@ then, pre-releases may make breaking changes between versions.
 ### Changed
 - The README now headlines Proteus as the flagship Reality upgrade; the feature
   and operator docs cover cover classes, paranoid mode, and the cover recorder.
+- **Proteus cover is selected for smoothness, not just cost.** `min(capacity,
+  demand)` is concave in capacity, so for a given budget the smoothest cover
+  delivers strictly the most - burstiness is pure loss rather than a trade
+  against detectability. The browse recorder's inter-page dwell is now bounded by
+  the tunnel's own latency ceiling (`max_gap_secs`, at 60% of it, leaving
+  headroom for the next page's time to first byte) and session length is governed
+  by target SPAN rather than page count, so the replay loop's period is preserved
+  while real pages replace artificial waiting. Measured on the chained timeline:
+  sustained 41.5 -> 124.7 KB/s, worst stall 14.28 -> 1.75 s, a 120 KB fetch's p90
+  10.64 -> 2.87 s. On a live cluster the same change took a 300-second window from
+  52 transfers with 12 failures to 123 with none, and the startup probe from 21 s
+  to 4 s.
+- Documentation now states plainly that throughput and cover cost are the same
+  quantity, 1:1, and that the low default speed is the BUDGET rather than the
+  design - browse cover sustains about 1 Mbit/s because web pages are small, while
+  real video cover reaches 5-25 Mbit/s at proportional cost. `proteus_max_gb_day`
+  is documented for the first time.
+
+### Fixed
+- **Cover acceptance measured gaps in one direction only.** `Cost` computed its
+  worst gap over downstream records while `paced_handshake_budget` correctly took
+  the worst over both, so nothing stopped a capture that supplies upstream from
+  being accepted with a minute-long upstream silence and then stalling every
+  handshake round trip. Captures now also report worst upstream gap and
+  time-to-first-token per direction, and are rejected on both. The asymmetry is
+  sharp in practice: this repo's video captures all have workable downstream gaps
+  (1.46-1.99 s) and mostly unusable upstream ones (2.45-5.37 s).
+- **Degenerate captures failed open.** A capture with no usable span yields an
+  all-zero `Cost`, and every acceptance ceiling is an upper bound, so it passed
+  the cost, latency and opening checks vacuously and was written to the library as
+  valid cover. Now rejected explicitly.
+- **Upstream-class captures were being worn as downstream cover.** Pointing the
+  downstream profile at a library root pooled every class subdir, including the
+  `upstream` class - which is recorded dense and gap-free to carry flow control,
+  making it a 2-3 second burst rather than a browsing session. It also made a
+  session's cover rate a lottery between classes (the same library produced
+  88.7 KiB/s of idle cover in one session and 125.3 KiB/s in another), which was
+  measured as a real activity signal: 0.663/0.683 separability against a matched
+  0.520/0.525 control. Excluding the class closes it: across four replicates each
+  the active-minus-control difference is +0.014 up and +0.008 down, which at these
+  variances is not significant. An upstream-only library still paces, since an
+  empty schedule hangs a session rather than degrading to unpaced.
+- **The censor-vantage harness could report a confident false positive.**
+  Randomised window assignment decorrelates the label from replay-loop position
+  across runs but not within one - each run still draws its own imbalance, about
+  `1/sqrt(15)` at 15 windows per class, and it is systematic within that run.
+  Measured with NO user traffic: one control scored 0.623 per window and grew to
+  an excess of +0.194 when 64 windows were pooled, while another stayed clean.
+  Windows are now emitted as matched PAIRS (one idle, one active, random order
+  within the pair) so adjacent windows sit at the same loop phase and it cancels.
+- Cover captures now also report worst upstream gap and time-to-first-token per
+  direction, so an operator reading a log can tell which ceiling a rejected
+  capture missed.
 
 ### Security
 - Admin web UI: the access token is no longer written to the structured log
@@ -73,7 +160,12 @@ then, pre-releases may make breaking changes between versions.
 - The new state-changing `POST /api/rediscover` endpoint requires POST plus a
   non-simple `X-Mirage-Control` header that a cross-origin web page cannot forge
   (its CORS preflight is never approved), on top of the existing
-  loopback-`Host` / DNS-rebinding check.
+  loopback-`Host` / DNS-rebinding check. It is additionally rate-limited
+  server-side (one manual walk per 5s, `429` when throttled) so a local caller
+  cannot spin the discovery loop into a rendezvous-query flood.
+- The desktop client writes its saved-profiles file (`gui-profiles.json`, which
+  holds bearer invites) owner-only (`0600`, no symlink follow), matching the
+  temp-config write instead of the default umask.
 
 ## [0.1.3-alpha.1] - 2026-07-21
 
@@ -91,7 +183,7 @@ then, pre-releases may make breaking changes between versions.
 - **Bridge operator admin web UI** (`mirage-bridge --admin-ui`, default
   `127.0.0.1:3825`). A local, token-gated, loopback-only web app to view live
   counters, edit the bridge config (secrets masked, written atomically `0600`),
-  and restart the service. See `docs/operators.md` §8.
+  and restart the service. See `docs/operators.md` section 8.
 - **Hysteria2 hardening knobs** - UDP **port-hopping** (`derived_port_*`),
   loss-immune **BRUTAL** congestion control (`hysteria2_brutal`), and serving a
   **real leaf cert** (`hysteria2_cert_der_path` / `hysteria2_key_der_path`)
@@ -204,7 +296,7 @@ then, pre-releases may make breaking changes between versions.
   because its uniform geometric autocorrelation is itself a signature real traffic
   lacks. The i.i.d. CDF remains the shaper default; genuinely closing the sequence
   gap for real traffic needs a capture-calibrated phase-state model, tracked as a
-  residual. (The marginal-preservation property `(1-a)*π + a*I => π` and the
+  residual. (The marginal-preservation property `(1-a)*pi + a*I => pi` and the
   distinguisher's new features are both genuinely useful and retained.)
 - **Epoch-ratcheted Reality anti-probe (closes pubkey-only bridge enumeration
   for invite-reached bridges; opt-in, and not yet possible for cohort bridges).**

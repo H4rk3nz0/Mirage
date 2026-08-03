@@ -8,9 +8,20 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tracing::{debug, trace, warn};
 
+use mirage_common::wu_preamble;
 use mirage_transport::DuplexStream;
 use mirage_transport_obfs::obfs_auth_verify_with_secret;
 use mirage_transport_vless::{vless_server_peek_auth, VlessConfig, VLESS_CLIENT_FRAME_LEN};
+
+/// Bytes needed to peek-verify an SS-2022 opening: `salt`(16) + the encrypted
+/// length chunk(18).
+const SS2022_MIN_PEEK: usize = 34;
+/// How long the mux waits for the rest of a wu-wrapped first flight when the
+/// preamble arrived in a segment of its own. Bounded so a stalled or hostile
+/// peer cannot hold an accept slot.
+const WU_SHORT_PEEK_BUDGET: Duration = Duration::from_millis(400);
+/// Poll granularity while waiting for that remainder.
+const WU_SHORT_PEEK_POLL: Duration = Duration::from_millis(5);
 
 // Public types
 
@@ -226,13 +237,14 @@ impl ProtocolMux {
         }
 
         // Step 2: For opaque bytes, peek 64 bytes and try each transport.
-        // 192 bytes: enough for the obfs (64) / VLESS (26) prefixes AND the full
+        // 256 bytes: enough for the obfs (64) / VLESS (26) prefixes AND the full
         // SS-2022 opening - salt(16) + length chunk(18) + header chunk (up to
-        // type/ts/atyp/addr/port/padlen = 18 + up to 64 padding + 16 tag) - so the
+        // type/ts/atyp/addr/port/padlen = 18 + up to 64 padding + 16 tag) - PLUS a
+        // Wu-2023 evasion preamble (up to 65 B) ahead of all of it, so the
         // freshness peek (red-team round 2) can decrypt the whole header
-        // non-consumingly.
-        let mut auth_buf = [0u8; 192];
-        let n = match tokio::time::timeout(deadline, stream.peek(&mut auth_buf)).await {
+        // non-consumingly even under wu.
+        let mut auth_buf = [0u8; 256];
+        let mut n = match tokio::time::timeout(deadline, stream.peek(&mut auth_buf)).await {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -241,8 +253,43 @@ impl ProtocolMux {
             }
         };
 
-        // Try obfs-tcp first: cheapest (one BLAKE3 verify, no I/O).
-        if self.config.obfs_enabled && n >= 64 {
+        // A wu-wrapped client's preamble may land in its own TCP segment (a
+        // middlebox, a retransmit boundary, or any peer that does not coalesce),
+        // leaving too few bytes to classify what is behind it. Give the rest of
+        // the first flight a bounded chance to arrive rather than dropping a
+        // legitimate client to the cover destination. Bounded by both a short
+        // budget and the caller's deadline, and only entered when a preamble is
+        // actually present, so it costs nothing on any other path.
+        if let Some(off) = detect_wu_preamble(&auth_buf[..n]) {
+            let budget = deadline.min(WU_SHORT_PEEK_BUDGET);
+            let started = std::time::Instant::now();
+            while n < off + SS2022_MIN_PEEK && started.elapsed() < budget {
+                tokio::time::sleep(WU_SHORT_PEEK_POLL).await;
+                match tokio::time::timeout(deadline, stream.peek(&mut auth_buf)).await {
+                    Ok(Ok(more)) if more > n => n = more,
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Wu-2023 evasion auto-detect: a wu-wrapped SS-2022 connection opens with
+        // a printable preamble (mirage_common::wu_preamble). A plain opaque stream
+        // (obfs / VLESS / bare SS) is uniform-random and practically never
+        // presents a full printable run of its declared length, so a detected
+        // preamble unambiguously marks wu-wrapped SS. When present we offset the
+        // SS classification past it and skip obfs/VLESS (never wu-wrapped); the
+        // (unconsumed) stream is handed to the wu-aware server auth, which strips
+        // the client preamble and prepends the server's. This lets one port serve
+        // wu-wrapped SS alongside every other transport with no per-connection
+        // config.
+        #[allow(clippy::indexing_slicing)]
+        let wu_off = detect_wu_preamble(&auth_buf[..n]);
+
+        // Try obfs-tcp first: cheapest (one BLAKE3 verify, no I/O). Skipped under
+        // a wu preamble (obfs-tcp is never wu-wrapped).
+        if wu_off.is_none() && self.config.obfs_enabled && n >= 64 {
             // SAFETY: slices are exactly 32 bytes - try_into() cannot fail.
             #[allow(clippy::indexing_slicing)]
             let nonce: &[u8; 32] = auth_buf[..32]
@@ -292,7 +339,9 @@ impl ProtocolMux {
         let ss_psks: [Option<[u8; 32]>; 2] = [self.config.ss_psk, self.config.relay_ss_psk];
         let ss_psks: Vec<[u8; 32]> = ss_psks.into_iter().flatten().collect();
         if !ss_psks.is_empty() {
-            if n >= 34 {
+            // Under a wu preamble the SS-2022 salt sits at `off`; otherwise byte 0.
+            let off = wu_off.unwrap_or(0);
+            if n >= off + SS2022_MIN_PEEK {
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -302,7 +351,7 @@ impl ProtocolMux {
                     #[allow(clippy::indexing_slicing)]
                     match mirage_transport_shadowsocks::ss2022_peek_verify_fresh(
                         psk,
-                        &auth_buf[..n],
+                        &auth_buf[off..n],
                         now_secs,
                     ) {
                         mirage_transport_shadowsocks::Ss2022PeekVerdict::Fresh => {
@@ -311,7 +360,7 @@ impl ProtocolMux {
                             #[allow(clippy::indexing_slicing)]
                             let salt_key = {
                                 let mut k = [0u8; 32];
-                                k[..16].copy_from_slice(&auth_buf[..16]);
+                                k[..16].copy_from_slice(&auth_buf[off..off + 16]);
                                 k
                             };
                             if seen_salts.check_and_insert(salt_key, std::time::Instant::now()) {
@@ -332,18 +381,25 @@ impl ProtocolMux {
                 }
                 if let Some(psk) = winner {
                     debug!("mux: Shadowsocks-2022 fresh peek ok - running server handshake");
-                    // The peek was non-consuming, so the salt + encrypted header are
-                    // still in the kernel buffer; the full server handshake re-reads
-                    // them, replies, and yields the decrypted carrier.
-                    let ss_stream =
-                        mirage_transport_shadowsocks::ss2022_server_auth(stream, &psk, deadline)
-                            .await
-                            .map_err(|e| {
-                                std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!("ss2022 server auth: {e}"),
-                                )
-                            })?;
+                    // The peek was non-consuming, so the (preamble +) salt +
+                    // encrypted header are still in the kernel buffer; the full
+                    // server handshake re-reads them, replies, and yields the
+                    // decrypted carrier. Under wu, `ss2022_server_auth(wu=true)`
+                    // wraps the stream so it strips the client preamble on the
+                    // first read and prepends the server preamble on the response.
+                    let ss_stream = mirage_transport_shadowsocks::ss2022_server_auth(
+                        stream,
+                        &psk,
+                        deadline,
+                        wu_off.is_some(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("ss2022 server auth: {e}"),
+                        )
+                    })?;
                     // Extract the pace seed before boxing loses the concrete type; the
                     // bridge applies the pacer (Dir::Down) with it.
                     let seed = ss_stream.pace_seed();
@@ -355,7 +411,7 @@ impl ProtocolMux {
             } else {
                 trace!(
                     "mux: only {n} bytes peeked - too few for SS-2022 ({} needed)",
-                    34
+                    SS2022_MIN_PEEK
                 );
             }
         }
@@ -366,7 +422,7 @@ impl ProtocolMux {
         // addon_len=0x00 at 17, command=0x01 at 18) avoids a full read_exact on
         // non-VLESS connections. The full auth (UUID + all fields) is validated
         // by vless_server_auth.
-        if let Some(vless_uuid) = self.config.vless_uuid {
+        if let Some(vless_uuid) = self.config.vless_uuid.filter(|_| wu_off.is_none()) {
             // Need at least 26 bytes in the peek buffer and a 64-byte buffer
             // only has 64 bytes, but VLESS header is 26 - within range.
             // Re-peek with a 26-byte window if the earlier peek was short.
@@ -427,6 +483,27 @@ impl ProtocolMux {
         warn!("mux: no transport matched - proxying to cover destination");
         Ok(MuxResult::Unknown(stream))
     }
+}
+
+/// Detect a Wu-2023 evasion preamble at the front of `buf`, returning the offset
+/// where the wrapped payload begins (`1 + L`) when a complete, well-formed
+/// printable preamble is present within the peeked bytes, else `None`.
+///
+/// A plain opaque stream (obfs / VLESS / bare SS) is uniform-random; the chance
+/// its leading byte is a valid preamble length AND the next `L` (>= 24) bytes
+/// are all printable is negligible, so a `Some` result reliably marks a
+/// wu-wrapped connection without stealing any other transport's traffic.
+fn detect_wu_preamble(buf: &[u8]) -> Option<usize> {
+    let len_byte = *buf.first()?;
+    let l = wu_preamble::preamble_body_len(len_byte)?;
+    let end = 1 + l;
+    if buf.len() < end {
+        return None;
+    }
+    if buf[1..end].iter().any(|b| !wu_preamble::is_alphabet(*b)) {
+        return None;
+    }
+    Some(end)
 }
 
 // Protocol detection

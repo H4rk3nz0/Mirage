@@ -182,7 +182,8 @@ impl From<&ChannelError> for ChannelErrorClass {
 /// Hard cap on a single published blob, enforced before handing bytes
 /// to the network layer. The per-channel protocol will enforce its own
 /// cap too (Nostr: [`mirage_discovery_nostr::wrap::MAX_CONTENT_LEN`]
-/// = 2048; DHT BEP-44: 1000). 4 KiB is generous relative to the
+/// = 8192, applied to the base64+framed event content, which is larger
+/// than this cap on purpose; DHT BEP-44: 1000). 4 KiB is generous relative to the
 /// announcement wire max (~800 B) and keeps worst-case sends bounded.
 pub const MAX_PUBLISH_BYTES: usize = 4096;
 

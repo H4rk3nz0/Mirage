@@ -1,0 +1,22 @@
+[package]
+name = "mirage-cover"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Self-contained cover-traffic recorder for Mirage's Proteus replay library"
+
+[dependencies]
+mirage-common = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+webpki-roots = "0.26"
+getrandom = "0.3"
+
+[lints]
+workspace = true

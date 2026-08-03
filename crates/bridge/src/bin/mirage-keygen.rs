@@ -41,6 +41,10 @@ fn rand_seed() -> [u8; 32] {
 }
 
 struct Args {
+    /// Advertise that this bridge REQUIRES Proteus. Not a transport - a
+    /// precondition, so a client without a cover library can say why at dial
+    /// time instead of failing inside the handshake with zero bytes.
+    proteus: bool,
     reveal_operator_sk: bool,
     bridge_endpoint: String,
     tokens: usize,
@@ -94,6 +98,7 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut args = Args {
+        proteus: false,
         reveal_operator_sk: false,
         bridge_endpoint: "127.0.0.1:8443".to_string(),
         tokens: 8,
@@ -165,6 +170,7 @@ fn parse_args() -> Args {
                 );
             }
             "--ws" => args.ws = true,
+            "--proteus" => args.proteus = true,
             "--vless" => args.vless = true,
             "--hysteria2" => args.hysteria2 = true,
             "--meek" => {
@@ -404,6 +410,12 @@ fn main() {
     }
     if args.doh_front_domain.is_some() {
         t_caps |= transport_caps::DOH_TUNNEL;
+    }
+    if args.proteus {
+        // A precondition, not a transport: pacing adds framing and the session
+        // handshake runs inside it, so a client that cannot pace fails with zero
+        // bytes rather than connecting unpaced.
+        t_caps |= transport_caps::PROTEUS_REQUIRED;
     }
 
     // Bootstrap announcement signed by operator.

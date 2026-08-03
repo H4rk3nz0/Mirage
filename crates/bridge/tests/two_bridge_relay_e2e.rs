@@ -176,10 +176,14 @@ async fn run_exit_bridge(
     // derived from the next-hop pubkey it dialed. In production the protocol mux
     // does this via `MuxConfig::relay_ss_psk`.
     let relay_psk = mirage_bridge::next_hop_link::derive_relay_ss_psk(&keys.x_pk);
-    let sock =
-        mirage_transport_shadowsocks::ss2022_server_auth(sock, &relay_psk, Duration::from_secs(10))
-            .await
-            .expect("exit: ss2022 unwrap relay leg");
+    let sock = mirage_transport_shadowsocks::ss2022_server_auth(
+        sock,
+        &relay_psk,
+        Duration::from_secs(10),
+        false,
+    )
+    .await
+    .expect("exit: ss2022 unwrap relay leg");
     // Transport accept, capturing the initiator (entry bridge) static key.
     let (session, peer_static) = {
         let mut v = TokenVerifier::new_shared(shared_replay.as_ref(), now);
@@ -493,10 +497,14 @@ async fn run_middle_bridge(
     sock.set_nodelay(true).ok();
     // C1: unwrap the SS-2022-wrapped relay leg (see run_exit_bridge).
     let relay_psk = mirage_bridge::next_hop_link::derive_relay_ss_psk(&keys.x_pk);
-    let sock =
-        mirage_transport_shadowsocks::ss2022_server_auth(sock, &relay_psk, Duration::from_secs(10))
-            .await
-            .expect("middle: ss2022 unwrap relay leg");
+    let sock = mirage_transport_shadowsocks::ss2022_server_auth(
+        sock,
+        &relay_psk,
+        Duration::from_secs(10),
+        false,
+    )
+    .await
+    .expect("middle: ss2022 unwrap relay leg");
     let (session, peer_static) = {
         let mut v = TokenVerifier::new_shared(shared_replay.as_ref(), now);
         accept_with_peer_static(sock, &keys.x_sk, &keys.ed_pk, &op_pk, &mut v)

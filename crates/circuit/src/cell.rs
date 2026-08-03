@@ -169,6 +169,56 @@ pub const CMD_EXTEND_CONT: u8 = 0x0F;
 /// Added in Phase 2G.
 pub const CMD_EXTEND_FINISH: u8 = 0x0E;
 
+// -- hidden-service rendezvous ------------------------------------------------
+//
+// The six commands below are the interactive plane of `mirage-onion`. The crate
+// already carried the address, descriptor and INTRODUCE-body formats; what was
+// missing - and what these add - is the pair of bridge ROLES that let a client
+// and a service meet without either learning the other's location.
+//
+//   service ---ESTABLISH_INTRO--> I        client ---ESTABLISH_RENDEZVOUS--> R
+//   client  ---INTRODUCE-------> I --> service
+//   service ---RENDEZVOUS------> R, which JOINS the two circuits
+//
+// I (introduction point) and R (rendezvous point) are ordinary bridges. Neither
+// learns anything it could use to locate the other party: I sees a service
+// circuit and a client circuit but no addresses, and R sees two circuits and a
+// cookie it cannot link to any identity.
+
+/// `ESTABLISH_INTRO`: service -> introduction-point bridge, on a circuit the
+/// service built and keeps open. Body =
+/// [`crate::rendezvous::EstablishIntroBody`]. The bridge records "this circuit
+/// is where INTRODUCE cells for `intro_auth_pk` go" after checking the
+/// signature, which binds the request to this circuit so a replay onto a
+/// different circuit cannot steal a service's introductions.
+pub const CMD_ESTABLISH_INTRO: u8 = 0x13;
+
+/// `ESTABLISH_INTRO_OK`: introduction point -> service, registration accepted.
+pub const CMD_ESTABLISH_INTRO_OK: u8 = 0x14;
+
+/// `ESTABLISH_RENDEZVOUS`: client -> rendezvous-point bridge. Body = a 32-byte
+/// cookie the client chose. The bridge parks the circuit against that cookie.
+/// The cookie is opaque to the bridge: it is the client's own random value, so
+/// R can match two circuits without learning who either party is.
+pub const CMD_ESTABLISH_RENDEZVOUS: u8 = 0x15;
+
+/// `RENDEZVOUS_OK`: rendezvous point -> client, cookie parked.
+pub const CMD_RENDEZVOUS_OK: u8 = 0x16;
+
+/// `INTRODUCE`: client -> introduction point. Body =
+/// [`mirage_onion::IntroduceCell`] bytes. The introduction point looks up the
+/// service circuit registered for the addressed `intro_auth_pk` and forwards the
+/// body verbatim - it cannot read the payload's meaning, and it never learns the
+/// rendezvous point's identity in a form it can act on.
+pub const CMD_INTRODUCE: u8 = 0x17;
+
+/// `RENDEZVOUS`: service -> rendezvous point. Body =
+/// [`crate::rendezvous::RendezvousBody`] - the cookie the client published in
+/// its INTRODUCE, plus the service's ephemeral public key for the client. On a
+/// cookie match the bridge JOINS the two circuits: subsequent cells on either
+/// are relayed to the other.
+pub const CMD_RENDEZVOUS: u8 = 0x18;
+
 // Errors
 
 /// Errors produced by cell encoding/decoding.

@@ -21,8 +21,10 @@ These docs come in two layers. Start at the top; go down as far as you need.
 
 | Doc | For |
 |---|---|
+| **[Proteus](proteus.md)** | Why the traffic shaper replays real captures instead of generating plausible ones, and what that costs. |
 | **[Internals](internals.md)** | Architecture, wire format, and what Mirage changes vs. existing protocols. |
 | **[Security model](security-model.md)** | The threat model, what is defended, and what is *not*. |
+| **[Unwired and unfinished code](dead-code.md)** | What is built but not reachable from a running daemon, and why - so "built" is never mistaken for "protecting you". |
 
 ---
 

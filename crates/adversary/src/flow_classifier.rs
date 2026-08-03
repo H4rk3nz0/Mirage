@@ -185,21 +185,248 @@ fn features(t: &FlowTrace) -> [f64; N_FEATURES] {
 /// probability the feature ranks a class-A flow above a class-B flow. `0.5` is
 /// chance. `O(|a|*|b|)`, fine for CI sample sizes.
 fn single_feature_auc(a: &[f64], b: &[f64]) -> f64 {
-    let total = (a.len() * b.len()) as f64;
+    let (na, nb) = (a.len(), b.len());
+    let total = (na * nb) as f64;
     if total == 0.0 {
         return 0.5;
     }
-    let mut wins = 0.0f64;
-    for &ai in a {
-        for &bj in b {
-            if ai > bj {
-                wins += 1.0;
-            } else if (ai - bj).abs() < f64::EPSILON {
-                wins += 0.5;
+    // Rank-sum form of the same statistic, O((n+m) log(n+m)) instead of the
+    // O(n*m) pairwise sweep this replaces. That matters because
+    // `permutation_floor` calls this hundreds of times: at 500 flows a class the
+    // pairwise version is 250k comparisons per feature per repetition, which
+    // makes a data-derived null distribution too slow to compute, which is why
+    // the floor was a hard-coded constant in the first place.
+    //
+    //   AUC = (R_a - n_a(n_a+1)/2) / (n_a * n_b)
+    //
+    // with MID-RANKS for ties, which reproduces the pairwise rule's half-credit
+    // for equal values exactly. `auc_matches_the_pairwise_definition` asserts the
+    // two agree, including on data that is mostly ties.
+    let mut all: Vec<(f64, bool)> = Vec::with_capacity(na + nb);
+    all.extend(a.iter().map(|&v| (v, true)));
+    all.extend(b.iter().map(|&v| (v, false)));
+    all.sort_by(|x, y| x.0.total_cmp(&y.0));
+
+    let mut rank_sum_a = 0.0f64;
+    let mut i = 0usize;
+    while i < all.len() {
+        // Span of exactly-equal values gets the average of the ranks it covers.
+        let mut j = i;
+        while j + 1 < all.len() && all[j + 1].0 == all[i].0 {
+            j += 1;
+        }
+        let mid = (i + j) as f64 / 2.0 + 1.0; // ranks are 1-based
+        for entry in &all[i..=j] {
+            if entry.1 {
+                rank_sum_a += mid;
             }
         }
+        i = j + 1;
     }
-    wins / total
+    let na_f = na as f64;
+    ((rank_sum_a - na_f * (na_f + 1.0) / 2.0) / total).clamp(0.0, 1.0)
+}
+
+/// Each feature's own null distribution, derived from the data by PERMUTATION.
+///
+/// # Why a constant floor is not good enough
+///
+/// [`noise_floor`] is one number for fourteen features whose sampling
+/// distributions are nothing alike, calibrated once on a synthetic size mixture.
+/// Measured on real null captures it understates the extremes badly enough to
+/// invent leaks: `max_size` and `size_range` reached 0.571 against its 0.552 on
+/// data with nothing to find, and were duly reported as the winning separator in
+/// two control runs.
+///
+/// This computes the real thing instead. Under the null hypothesis the two
+/// classes are the same distribution, so pooling every flow and RELABELLING at
+/// random produces draws from exactly that null. Doing it many times and taking a
+/// high quantile per feature gives each feature the floor its own tail earns,
+/// with no calibration constant and no extra capture runs.
+///
+/// `quantile` is the fraction of null draws a result must beat, e.g. `0.95` for
+/// a one-sided 5% false-positive rate PER FEATURE. Note that `measure` maximises
+/// over 14 features, so per-feature 5% is not 5% overall; compare with
+/// [`excess_over`], which ranks by margin over each feature's own floor and so
+/// stops an unstable feature winning on its tail alone.
+///
+/// `seed` makes it reproducible - a floor that moved run to run would be worse
+/// than a wrong constant.
+#[must_use]
+pub fn permutation_floor(
+    pooled: &[FlowTrace],
+    class_a_len: usize,
+    reps: usize,
+    quantile: f64,
+    seed: u64,
+) -> [f64; N_FEATURES] {
+    null_model(pooled, class_a_len, reps, quantile, seed).per_feature
+}
+
+/// The null distribution of the whole procedure, not of one feature.
+///
+/// Per-feature floors are necessary and NOT sufficient, which is easy to get
+/// wrong: thresholding each feature at its own 95th percentile controls that
+/// feature at 5%, but [`measure`] reports the MAXIMUM over fourteen of them, so
+/// the chance that at least one clears its own 95th percentile is far above 5%.
+/// Measured, that is not theoretical - a null control whose `max_size` sat at
+/// 0.571 cleared both a pooled floor of 0.552 AND its own permuted floor of
+/// 0.551, and was still nothing.
+///
+/// [`Self::familywise`] fixes it the standard way (max-T, Westfall-Young): each
+/// permutation draw contributes the LARGEST centred accuracy across all
+/// features, and the quantile of that maximum is the bar a real finding has to
+/// clear. Centring each feature on its own null median first stops a
+/// heavy-tailed feature dominating the maximum purely by being wide.
+#[derive(Debug, Clone, Copy)]
+pub struct NullModel {
+    /// Per-feature quantile of the folded accuracy under relabelling.
+    pub per_feature: [f64; N_FEATURES],
+    /// Per-feature median under relabelling: the centre to measure excess from.
+    pub median: [f64; N_FEATURES],
+    /// Quantile of `max over features of (accuracy - that feature's median)`.
+    /// A finding must beat THIS to survive the max-over-features selection.
+    pub familywise: f64,
+}
+
+impl NullModel {
+    /// Does this observation clear the family-wise bar, and on which feature?
+    ///
+    /// Returns `(feature, accuracy, margin)` where `margin` is the centred
+    /// excess minus [`Self::familywise`]. Positive means separable after paying
+    /// for having looked at fourteen features.
+    #[must_use]
+    pub fn verdict(
+        &self,
+        class_a: &[FlowTrace],
+        class_b: &[FlowTrace],
+    ) -> (&'static str, f64, f64) {
+        let aucs = measure_all(class_a, class_b);
+        let mut best = (FEATURE_NAMES[0], 0.5, f64::NEG_INFINITY);
+        for (i, &name) in FEATURE_NAMES.iter().enumerate() {
+            let acc = aucs[i].max(1.0 - aucs[i]);
+            let centred = acc - self.median[i];
+            if centred > best.2 {
+                best = (name, acc, centred);
+            }
+        }
+        (best.0, best.1, best.2 - self.familywise)
+    }
+}
+
+/// Build a [`NullModel`] by relabelling the pooled flows `reps` times.
+#[must_use]
+pub fn null_model(
+    pooled: &[FlowTrace],
+    class_a_len: usize,
+    reps: usize,
+    quantile: f64,
+    seed: u64,
+) -> NullModel {
+    let n = pooled.len();
+    let na = class_a_len.min(n);
+    if n < 4 || na == 0 || na == n || reps == 0 {
+        // Not enough to permute: fall back to the pooled estimate rather than
+        // returning 0.5, which would call everything separable.
+        let f = noise_floor(na.min(n.saturating_sub(na)).max(1));
+        return NullModel {
+            per_feature: [f; N_FEATURES],
+            median: [0.5; N_FEATURES],
+            familywise: f - 0.5,
+        };
+    }
+    let feats: Vec<[f64; N_FEATURES]> = pooled.iter().map(features).collect();
+    let mut idx: Vec<usize> = (0..n).collect();
+    let mut rng = seed | 1;
+    let mut next = || {
+        rng = rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut draws: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); N_FEATURES];
+    let (mut ai, mut bi) = (Vec::with_capacity(na), Vec::with_capacity(n - na));
+    for _ in 0..reps {
+        // Fisher-Yates, so every split is equally likely.
+        for k in (1..n).rev() {
+            let j = (next() % (k as u64 + 1)) as usize;
+            idx.swap(k, j);
+        }
+        for (f, slot) in draws.iter_mut().enumerate() {
+            ai.clear();
+            bi.clear();
+            for (pos, &i) in idx.iter().enumerate() {
+                if pos < na {
+                    ai.push(feats[i][f]);
+                } else {
+                    bi.push(feats[i][f]);
+                }
+            }
+            let auc = single_feature_auc(&ai, &bi);
+            slot.push(auc.max(1.0 - auc));
+        }
+    }
+    let q = quantile.clamp(0.0, 1.0);
+    let pick = |sorted: &[f64], q: f64| -> f64 {
+        let k = (((sorted.len() - 1) as f64) * q).round() as usize;
+        sorted[k.min(sorted.len() - 1)]
+    };
+    // Per-feature median first: it is the centre the family-wise statistic
+    // measures excess from, so a wide feature does not win the maximum just for
+    // being wide.
+    let mut median = [0.5f64; N_FEATURES];
+    let mut per_feature = [0.5f64; N_FEATURES];
+    let mut sorted: Vec<Vec<f64>> = Vec::with_capacity(N_FEATURES);
+    for slot in &draws {
+        let mut s = slot.clone();
+        s.sort_by(f64::total_cmp);
+        sorted.push(s);
+    }
+    for f in 0..N_FEATURES {
+        median[f] = pick(&sorted[f], 0.5);
+        per_feature[f] = pick(&sorted[f], q);
+    }
+    // max-T: for each draw, the largest centred accuracy across features. Its
+    // quantile is what a finding must beat, having been selected as a maximum.
+    let mut maxima: Vec<f64> = (0..reps)
+        .map(|r| {
+            (0..N_FEATURES)
+                .map(|f| draws[f][r] - median[f])
+                .fold(f64::NEG_INFINITY, f64::max)
+        })
+        .collect();
+    maxima.sort_by(f64::total_cmp);
+    NullModel {
+        per_feature,
+        median,
+        familywise: pick(&maxima, q),
+    }
+}
+
+/// The feature with the greatest margin over ITS OWN floor, and that margin.
+///
+/// This is the statistic to rank on. Ranking by raw accuracy lets whichever
+/// feature has the heaviest tail win on noise - which is exactly how `max_size`
+/// came to be reported as a leak on captures with nothing in them. Returns
+/// `(feature, accuracy, excess)`; a non-positive excess means nothing cleared
+/// its own null.
+#[must_use]
+pub fn excess_over(
+    class_a: &[FlowTrace],
+    class_b: &[FlowTrace],
+    floors: &[f64; N_FEATURES],
+) -> (&'static str, f64, f64) {
+    let aucs = measure_all(class_a, class_b);
+    let mut best = (FEATURE_NAMES[0], 0.5, f64::NEG_INFINITY);
+    for (i, &name) in FEATURE_NAMES.iter().enumerate() {
+        let acc = aucs[i].max(1.0 - aucs[i]);
+        let ex = acc - floors[i];
+        if ex > best.2 {
+            best = (name, acc, ex);
+        }
+    }
+    best
 }
 
 /// How separable two sets of flows are.
@@ -214,8 +441,83 @@ pub struct Distinguishability {
     pub top_auc: f64,
 }
 
-/// Minimum flows per class for a statistically meaningful verdict.
+/// Minimum flows per class before a verdict is attempted at all.
+///
+/// This is a floor for RUNNING, not for BELIEVING. At 16 flows per class the
+/// estimator reports a mean 0.681 and has been observed at 0.895 on data with
+/// nothing to find (see `the_metric_has_a_floor_above_one_half_when_nothing_separates`),
+/// so a verdict here is dominated by [`noise_floor`]. Compare against that, not
+/// against 0.5.
 pub const MIN_SAMPLES: usize = 16;
+
+/// What [`measure`] reports when the two classes are the SAME distribution.
+///
+/// `measure` maximises `max(auc, 1 - auc)` over 14 features on the sample it
+/// reports on. Both halves bias upward - the fold turns sampling noise into
+/// apparent signal even for one feature, and the max over 14 compounds it - so
+/// `best_accuracy` sits strictly above 0.5 for any data at all, by construction.
+/// The bias is a small-sample effect and decays as flows accumulate:
+///
+/// | flows/class | mean | worst seen |
+/// |---|---|---|
+/// | 16 | 0.681 | 0.895 |
+/// | 30 | 0.617 | 0.681 |
+/// | 66 | 0.574 | 0.628 |
+/// | 150 | 0.552 | 0.606 |
+///
+/// This is not a defect. A censor does get to pick whichever feature works best,
+/// so max-over-features is the right threat model. It only means a raw number
+/// cannot be read as "0.5 is chance, therefore 0.60 is signal".
+///
+/// Calibrated on a synthetic size mixture, so treat it as an estimate of the
+/// shape rather than an exact bound for any particular capture - the live
+/// `NULL_CONTROL` run in `scripts/podman-e2e/cover-traffic.sh` measures the real
+/// floor for a real run and remains the authority.
+///
+/// # It is ONE number for FOURTEEN incomparable features
+///
+/// That is the load-bearing caveat. `measure` maximises over features whose
+/// sampling distributions are nothing alike: a mean or a total concentrates
+/// quickly and sits well under this floor, while an EXTREME like `max_size` -
+/// and `size_range`, which is `max - min` and inherits it - is set by whichever
+/// rare record landed in the window, so it is heavy-tailed and its own floor is
+/// higher than this returns.
+///
+/// Measured on three null-control captures (nothing to detect), upstream at a
+/// 40-record window: `max_size` and `size_range` both reached 0.571 against this
+/// function's 0.552, and were duly reported as the "winning separator" in two
+/// control runs at 0.642 and 0.563. Those were artifacts.
+///
+/// The regime matters too, not just the feature: at a 60-record downstream
+/// window nearly every window's maximum is the MSS, so `max_size` is degenerate
+/// and pins at 0.500 while `lag1_autocorr` becomes the least stable one.
+///
+/// So: read this as a lower bound for the stable features and an UNDERESTIMATE
+/// for the extremes, and distrust a near-floor win on `max_size` or
+/// `size_range`. `examples/feature_floor` reports the per-feature spread across
+/// a set of null captures; a properly calibrated per-feature floor is the real
+/// fix and needs a batch of control runs to establish.
+#[must_use]
+pub fn noise_floor(flows_per_class: usize) -> f64 {
+    // Measured points, then log-linear interpolation between them: the bias
+    // falls roughly with the log of the sample size over this range.
+    const POINTS: [(f64, f64); 4] = [(16.0, 0.681), (30.0, 0.617), (66.0, 0.574), (150.0, 0.552)];
+    let n = (flows_per_class.max(1)) as f64;
+    if n <= POINTS[0].0 {
+        return POINTS[0].1;
+    }
+    for w in POINTS.windows(2) {
+        let ((n0, f0), (n1, f1)) = (w[0], w[1]);
+        if n <= n1 {
+            let t = (n.ln() - n0.ln()) / (n1.ln() - n0.ln());
+            return f0 + t * (f1 - f0);
+        }
+    }
+    // Past the calibrated range the bias keeps shrinking, but slowly; hold the
+    // last measured value rather than extrapolating toward 0.5 and understating
+    // the floor, which is the direction that turns noise into a finding.
+    POINTS[3].1
+}
 
 /// "Close enough to chance" bar: best single-feature classifier accuracy at or
 /// below this is treated as indistinguishable. `0.5` is perfect; `0.60` absorbs
@@ -246,6 +548,152 @@ pub fn measure(class_a: &[FlowTrace], class_b: &[FlowTrace]) -> Distinguishabili
         }
     }
     best
+}
+
+/// Every feature's AUC, not just the winner.
+///
+/// [`measure`] reports `max` over features, which is the right threat model - a
+/// censor picks whatever works - but it hides WHICH features are doing the
+/// separating and how stable each one is. That matters because [`noise_floor`]
+/// is a single number applied to all 14, calibrated on a synthetic size mixture,
+/// while the features are wildly different statistics: a mean concentrates
+/// quickly, an extreme like `max_size` is dominated by rare records and has a
+/// heavy-tailed sampling distribution, so its own floor is higher than the
+/// pooled estimate. Reading a `max_size` win against the pooled floor therefore
+/// overstates it.
+///
+/// Returned in [`FEATURE_NAMES`] order, as the raw AUC (which may be below 0.5
+/// when the feature is anti-correlated).
+#[must_use]
+pub fn measure_all(class_a: &[FlowTrace], class_b: &[FlowTrace]) -> [f64; N_FEATURES] {
+    let fa: Vec<[f64; N_FEATURES]> = class_a.iter().map(features).collect();
+    let fb: Vec<[f64; N_FEATURES]> = class_b.iter().map(features).collect();
+    let mut out = [0.5f64; N_FEATURES];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let ai: Vec<f64> = fa.iter().map(|f| f[i]).collect();
+        let bi: Vec<f64> = fb.iter().map(|f| f[i]).collect();
+        *slot = single_feature_auc(&ai, &bi);
+    }
+    out
+}
+
+/// Separability once an observer AGGREGATES several flows from the same target.
+///
+/// See [`measure_aggregated`]. Carries the group count and the floor for that
+/// count, because aggregation trades sample size for signal and reading the
+/// accuracy without the floor beside it inverts the conclusion.
+#[derive(Debug, Clone, Copy)]
+pub struct AggregatedDistinguishability {
+    /// Flows combined into one decision.
+    pub group_size: usize,
+    /// Decisions available per class after grouping.
+    pub groups_per_class: usize,
+    /// Best single-feature accuracy over the AGGREGATED samples.
+    pub best_accuracy: f64,
+    /// The most-discriminating feature at this aggregation level.
+    pub top_feature: &'static str,
+    /// [`noise_floor`] evaluated at `groups_per_class`, not at the flow count.
+    pub floor: f64,
+}
+
+impl AggregatedDistinguishability {
+    /// How far above this sample size's own floor the result sits. Negative or
+    /// near zero means the aggregation bought nothing that the smaller sample
+    /// does not explain on its own.
+    #[must_use]
+    pub fn excess(&self) -> f64 {
+        self.best_accuracy - self.floor
+    }
+}
+
+/// Separability when the observer pools `group_size` flows per decision.
+///
+/// # Why this exists
+///
+/// A per-flow AUC near the floor is routinely read as "indistinguishable", and
+/// for a ONE-SHOT observer it is. A real observer is not one-shot: a proxy
+/// session emits hundreds of windows from one host, and nothing stops a censor
+/// averaging them into a single per-host decision. For independent observations
+/// the separation grows as `sqrt(N)` in `d'`, so a per-flow AUC of 0.57
+/// (`d' ~ 0.25`) reaches `d' ~ 2.5` at N = 100, which is AUC ~ 0.96.
+///
+/// That arithmetic is why a small residual leak is not automatically a safe one,
+/// and this function is how to find out rather than assume. It aggregates by
+/// taking each feature's MEAN over the group - the natural statistic for a
+/// threshold classifier, and the one the `sqrt(N)` argument is about.
+///
+/// # The trap it is built to avoid
+///
+/// Grouping divides the sample count, and [`noise_floor`] RISES as samples fall.
+/// So aggregation inflates the raw accuracy for two quite different reasons -
+/// real signal accumulating, and the estimator getting noisier - and reading the
+/// number without its floor would credit the second to the first. The floor at
+/// the GROUP count travels with the result for exactly that reason; compare
+/// [`AggregatedDistinguishability::excess`] across levels, never the raw
+/// accuracy.
+///
+/// Returns `None` when there are not at least two groups per class, which is
+/// too few to say anything at all.
+///
+/// # Independence caveat
+///
+/// `sqrt(N)` is an upper bound. Windows from one session share a cover trace,
+/// a host and a network condition, so they are correlated and the real gain is
+/// smaller. That makes the measured curve the thing to trust and the arithmetic
+/// only a reason to look.
+#[must_use]
+pub fn measure_aggregated(
+    class_a: &[FlowTrace],
+    class_b: &[FlowTrace],
+    group_size: usize,
+) -> Option<AggregatedDistinguishability> {
+    let g = group_size.max(1);
+    let pool = |flows: &[FlowTrace]| -> Vec<[f64; N_FEATURES]> {
+        flows
+            .chunks(g)
+            // Drop a short trailing chunk: averaging fewer flows makes that
+            // group noisier than the rest, which shows up as separability the
+            // grouping invented.
+            .filter(|c| c.len() == g)
+            .map(|chunk| {
+                let mut acc = [0.0f64; N_FEATURES];
+                for t in chunk {
+                    let f = features(t);
+                    for (a, v) in acc.iter_mut().zip(f.iter()) {
+                        *a += *v;
+                    }
+                }
+                for a in &mut acc {
+                    *a /= chunk.len() as f64;
+                }
+                acc
+            })
+            .collect()
+    };
+    let (ga, gb) = (pool(class_a), pool(class_b));
+    if ga.len() < 2 || gb.len() < 2 {
+        return None;
+    }
+    let mut best_accuracy = 0.5;
+    let mut top_feature = FEATURE_NAMES[0];
+    for (i, &name) in FEATURE_NAMES.iter().enumerate() {
+        let ai: Vec<f64> = ga.iter().map(|f| f[i]).collect();
+        let bi: Vec<f64> = gb.iter().map(|f| f[i]).collect();
+        let auc = single_feature_auc(&ai, &bi);
+        let acc = auc.max(1.0 - auc);
+        if acc > best_accuracy {
+            best_accuracy = acc;
+            top_feature = name;
+        }
+    }
+    let groups_per_class = ga.len().min(gb.len());
+    Some(AggregatedDistinguishability {
+        group_size: g,
+        groups_per_class,
+        best_accuracy,
+        top_feature,
+        floor: noise_floor(groups_per_class),
+    })
 }
 
 /// **`DistinguisherAdversary` (concrete F4).** A passive flow classifier: given a
@@ -284,6 +732,369 @@ pub fn flow_shape_distinguisher(
 
 #[cfg(test)]
 mod tests {
+
+    /// The floor this metric reports when there is genuinely nothing to find.
+    ///
+    /// `measure` maximises `max(auc, 1 - auc)` over all 14 features on the same
+    /// sample it reports. Both halves of that bias upward: the fold means even a
+    /// single feature whose true AUC is 0.5 reports above 0.5 once sampling
+    /// noise is folded, and taking the max over 14 features compounds it. So
+    /// `best_accuracy` has a floor strictly above 0.5 BY CONSTRUCTION, for any
+    /// data whatsoever, and the floor grows as the sample shrinks.
+    ///
+    /// This is not a defect - a censor really does get to pick the feature that
+    /// works best - but it means a number near 0.5 cannot be read as "0.5 is
+    /// chance, so 0.55 is signal". It is why `cover-traffic.sh` measures a null
+    /// control, and why the live control (0.52-0.55 at 60-160 flows) lands where
+    /// it does rather than at 0.50.
+    ///
+    /// Both classes here are drawn from the SAME distribution, so any reported
+    /// separability is the estimator, not the data.
+    #[test]
+    fn auc_matches_the_pairwise_definition() {
+        // The rank-sum form is an optimisation, not a redefinition. It has to
+        // agree with the O(n*m) rule it replaced - including on data that is
+        // mostly ties, which is the case mid-ranks exist to handle and the case
+        // real size features actually produce (a downstream window where nearly
+        // every record is the MSS).
+        fn pairwise(a: &[f64], b: &[f64]) -> f64 {
+            let total = (a.len() * b.len()) as f64;
+            if total == 0.0 {
+                return 0.5;
+            }
+            let mut wins = 0.0;
+            for &ai in a {
+                for &bj in b {
+                    if ai > bj {
+                        wins += 1.0;
+                    } else if (ai - bj).abs() < f64::EPSILON {
+                        wins += 0.5;
+                    }
+                }
+            }
+            wins / total
+        }
+        let mut rng = 0xD15E_A5Eu64;
+        let mut next = || {
+            rng = rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = rng;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z ^ (z >> 31)
+        };
+        for buckets in [2u64, 5, 50, 1000] {
+            for _ in 0..30 {
+                let a: Vec<f64> = (0..17).map(|_| (next() % buckets) as f64).collect();
+                let b: Vec<f64> = (0..23).map(|_| (next() % buckets) as f64).collect();
+                let fast = single_feature_auc(&a, &b);
+                let slow = pairwise(&a, &b);
+                assert!(
+                    (fast - slow).abs() < 1e-9,
+                    "rank-sum {fast} != pairwise {slow} with {buckets} distinct values"
+                );
+            }
+        }
+        // Degenerate cases the caller can actually hit.
+        assert!((single_feature_auc(&[1.0; 5], &[1.0; 5]) - 0.5).abs() < 1e-12);
+        assert!((single_feature_auc(&[2.0, 3.0], &[0.0, 1.0]) - 1.0).abs() < 1e-12);
+        assert!((single_feature_auc(&[], &[1.0]) - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn maxt_controls_the_error_rate_that_per_feature_floors_do_not() {
+        // The defect: `measure` reports the MAXIMUM over 14 features, so
+        // thresholding each feature at its own 95th percentile leaves a
+        // family-wise false-positive rate far above 5%. This measures both rates
+        // on data with nothing to find and asserts max-T is the calibrated one.
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^ (z >> 31)
+            }
+        }
+        let mut rng = Rng(0x0BAD_C0DE);
+        let trials = 40;
+        let (mut per_feature_fp, mut maxt_fp) = (0usize, 0usize);
+        for _ in 0..trials {
+            // One distribution, split in two. Any "separation" is noise. The
+            // heavy tail on the maximum is what makes extremes misbehave.
+            let flows: Vec<FlowTrace> = (0..80)
+                .map(|_| {
+                    FlowTrace::new(
+                        (0..40)
+                            .map(|_| {
+                                if rng.next() % 15 == 0 {
+                                    (rng.next() % 9000) as u32 + 2000
+                                } else {
+                                    1448
+                                }
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+            let (a, b) = flows.split_at(40);
+            let nm = null_model(&flows, 40, 60, 0.95, rng.next());
+
+            // Per-feature rule: ANY feature over its own p95 counts as a find.
+            let aucs = measure_all(a, b);
+            if aucs
+                .iter()
+                .enumerate()
+                .any(|(i, &auc)| auc.max(1.0 - auc) > nm.per_feature[i])
+            {
+                per_feature_fp += 1;
+            }
+            // Family-wise rule.
+            if nm.verdict(a, b).2 > 0.0 {
+                maxt_fp += 1;
+            }
+        }
+        eprintln!(
+            "  false positives on null data: per-feature {per_feature_fp}/{trials}, \
+             max-T {maxt_fp}/{trials}"
+        );
+        assert!(
+            maxt_fp <= per_feature_fp,
+            "max-T must not be LOOSER than per-feature thresholds \
+             (max-T {maxt_fp}, per-feature {per_feature_fp})"
+        );
+        // The bar it has to clear: a nominal 5% rate, with slack for 40 trials.
+        assert!(
+            maxt_fp * 5 <= trials,
+            "max-T false-positive rate {maxt_fp}/{trials} is far above the nominal 5%"
+        );
+    }
+
+    #[test]
+    fn a_permutation_floor_beats_a_constant_on_the_unstable_features() {
+        // The defect this fixes: one constant floor across features whose
+        // sampling distributions differ wildly. `max_size` is an extreme, so its
+        // null tail is fatter than a mean's - measured on real null captures it
+        // cleared the pooled floor and was reported as a leak.
+        //
+        // Build data with NOTHING to find, in a shape that makes max heavy-tailed:
+        // mostly a constant, with occasional large outliers.
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z ^ (z >> 31)
+            }
+        }
+        let mut rng = Rng(0xFEED_FACE);
+        let flows: Vec<FlowTrace> = (0..120)
+            .map(|_| {
+                FlowTrace::new(
+                    (0..40)
+                        .map(|_| {
+                            if rng.next() % 20 == 0 {
+                                (rng.next() % 9000) as u32 + 2000
+                            } else {
+                                1448
+                            }
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let floors = permutation_floor(&flows, 60, 120, 0.95, 7);
+        let max_i = FEATURE_NAMES.iter().position(|&n| n == "max_size").unwrap();
+        let mean_i = FEATURE_NAMES
+            .iter()
+            .position(|&n| n == "mean_size")
+            .unwrap();
+        assert!(
+            floors[max_i] > floors[mean_i],
+            "an extreme must earn a HIGHER floor than a mean on heavy-tailed data: \
+             max_size {:.3} vs mean_size {:.3}",
+            floors[max_i],
+            floors[mean_i]
+        );
+
+        // And on a fresh null split, ranking by excess must not crown anything:
+        // every feature should sit at or under its own floor most of the time.
+        let (a, b) = flows.split_at(60);
+        let (feat, acc, ex) = excess_over(a, b, &floors);
+        assert!(
+            ex <= 0.05,
+            "null data must not clear its own permutation floor by much: \
+             {feat} acc {acc:.3} excess {ex:+.3}"
+        );
+    }
+
+    #[test]
+    fn aggregating_flows_amplifies_a_residual_a_single_flow_hides() {
+        // The threat this measures: a per-flow AUC near the floor reads as
+        // "indistinguishable", but an observer watching one host gets HUNDREDS
+        // of flows and can average them. For independent samples the separation
+        // grows as sqrt(N), so a residual that looks like noise per flow can be
+        // decisive per session.
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^ (z >> 31)
+            }
+            /// Sizes with a TINY mean shift between classes - small enough that
+            /// one flow is nearly useless to a classifier.
+            fn size(&mut self, shift: u32) -> u32 {
+                if self.next() % 3 == 0 {
+                    (self.next() % 1400) as u32 + 40 + shift
+                } else {
+                    1448
+                }
+            }
+        }
+
+        let mut rng = Rng(0xA11C_E5EE);
+        let n = 600;
+        let draw = |rng: &mut Rng, shift: u32| -> Vec<FlowTrace> {
+            (0..n)
+                .map(|_| FlowTrace::new((0..40).map(|_| rng.size(shift)).collect()))
+                .collect()
+        };
+        let a = draw(&mut rng, 0);
+        let b = draw(&mut rng, 12);
+
+        let per_flow = measure(&a, &b);
+        eprintln!(
+            "  group=  1  acc={:.3}  floor={:.3}  excess={:+.3}",
+            per_flow.best_accuracy,
+            noise_floor(n),
+            per_flow.best_accuracy - noise_floor(n)
+        );
+
+        // Excess over the floor AT THAT GROUP COUNT is the honest quantity:
+        // grouping shrinks the sample, which raises the floor on its own.
+        let mut best_excess: f64 = per_flow.best_accuracy - noise_floor(n);
+        for g in [5usize, 20, 60] {
+            let agg = measure_aggregated(&a, &b, g).expect("enough groups");
+            eprintln!(
+                "  group={:>3}  acc={:.3}  floor={:.3}  excess={:+.3}  ({} groups)",
+                agg.group_size,
+                agg.best_accuracy,
+                agg.floor,
+                agg.excess(),
+                agg.groups_per_class
+            );
+            best_excess = best_excess.max(agg.excess());
+        }
+
+        let solo_excess = per_flow.best_accuracy - noise_floor(n);
+        assert!(
+            best_excess > solo_excess,
+            "aggregation must expose more of the residual than a single flow does \
+             (solo excess {solo_excess:+.3}, best aggregated {best_excess:+.3})"
+        );
+        // And the strongest aggregation should be decisively separable, not
+        // marginal - that is the whole point of the threat. Assert on EXCESS,
+        // the quantity that survives the floor moving underneath it; the raw
+        // accuracy is quoted alongside only because it is what people read.
+        let deep = measure_aggregated(&a, &b, 60).expect("enough groups");
+        assert!(
+            deep.excess() > 0.15 && deep.best_accuracy >= 0.85,
+            "a residual this size must become decisive once pooled: acc {:.3}, \
+             floor {:.3}, excess {:+.3}",
+            deep.best_accuracy,
+            deep.floor,
+            deep.excess()
+        );
+    }
+
+    #[test]
+    fn aggregation_reports_the_floor_for_its_own_group_count() {
+        // The trap: grouping trades sample size for signal, and `noise_floor`
+        // rises as samples fall. A result read without its own floor credits the
+        // estimator's noise to the shaper's leak.
+        let flat: Vec<FlowTrace> = (0..400)
+            .map(|i| FlowTrace::new(vec![1448, 600 + (i % 7) as u32, 1448, 200]))
+            .collect();
+        let a = &flat[..200];
+        let b = &flat[200..];
+        let one = measure_aggregated(a, b, 1).expect("groups");
+        let many = measure_aggregated(a, b, 50).expect("groups");
+        assert!(
+            many.floor > one.floor,
+            "fewer groups must carry a HIGHER floor: {} groups floor {:.3} vs {} groups floor {:.3}",
+            many.groups_per_class,
+            many.floor,
+            one.groups_per_class,
+            one.floor
+        );
+        // Too few groups to say anything is None, not a confident number.
+        assert!(measure_aggregated(a, b, 150).is_none());
+    }
+
+    #[test]
+    fn the_metric_has_a_floor_above_one_half_when_nothing_separates() {
+        // splitmix64: deterministic, so this test cannot flake.
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^ (z >> 31)
+            }
+            /// A plausible record size: mostly full-MTU, some short.
+            fn size(&mut self) -> u32 {
+                if self.next() % 3 == 0 {
+                    (self.next() % 1400) as u32 + 40
+                } else {
+                    1448
+                }
+            }
+        }
+
+        let mut rng = Rng(0x5EED_C0DE);
+        let reps = 40;
+        let mut results = Vec::new();
+        for &n in &[16usize, 30, 66, 150] {
+            let mut sum = 0.0;
+            let mut worst: f64 = 0.0;
+            for _ in 0..reps {
+                let draw = |rng: &mut Rng| -> Vec<FlowTrace> {
+                    (0..n)
+                        .map(|_| FlowTrace::new((0..40).map(|_| rng.size()).collect()))
+                        .collect()
+                };
+                let a = draw(&mut rng);
+                let b = draw(&mut rng);
+                let d = measure(&a, &b);
+                sum += d.best_accuracy;
+                worst = worst.max(d.best_accuracy);
+            }
+            let mean = sum / f64::from(reps);
+            eprintln!("  flows/class={n:>4}  mean floor={mean:.3}  worst={worst:.3}");
+            results.push((n, mean));
+            assert!(
+                mean > 0.5,
+                "the fold plus max-over-14-features must bias upward at n={n}"
+            );
+            assert!(
+                mean < 0.75,
+                "a floor of {mean:.3} at n={n} would mean the metric is mostly noise"
+            );
+        }
+        // The bias is a small-sample effect: more flows, lower floor.
+        let (_, small) = results[0];
+        let (_, large) = results[results.len() - 1];
+        assert!(
+            small > large,
+            "floor must fall as the sample grows ({small:.3} at 16 flows vs {large:.3} at 150)"
+        );
+    }
+
     use super::*;
 
     /// Tiny deterministic LCG so tests are reproducible without a dep.

@@ -32,6 +32,7 @@ members = [
     "crates/transport-dnstt",
     "crates/transport-pad",
     "crates/transport-mux",
+    "crates/cover",
     "crates/bridge",
     "crates/client",
     "crates/socks5",
@@ -246,6 +247,7 @@ mirage-transport-doh = { path = "crates/transport-doh" }
 mirage-transport-dnstt = { path = "crates/transport-dnstt" }
 mirage-transport-pad = { path = "crates/transport-pad" }
 mirage-transport-mux = { path = "crates/transport-mux" }
+mirage-cover = { path = "crates/cover" }
 mirage-bridge = { path = "crates/bridge" }
 mirage-client = { path = "crates/client" }
 mirage-socks5 = { path = "crates/socks5" }

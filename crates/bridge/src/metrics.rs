@@ -61,8 +61,8 @@ pub const TRANSPORT_RAW: usize = 8;
 /// indices below do not shift). Never emitted.
 #[allow(dead_code)]
 pub const TRANSPORT_HLS: usize = 9;
-/// Only emitted when the bridge is built with the `webrtc` feature.
-#[allow(dead_code)]
+/// WebRTC sessions. Always compiled - WebRTC stopped being a build-time
+/// feature when the workspace's optional compile flags were removed.
 pub const TRANSPORT_WEBRTC: usize = 10;
 
 /// Number of transport buckets in [`Metrics::sessions_by_transport`].

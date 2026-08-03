@@ -1,12 +1,13 @@
-//! Production OS TUN device (Linux / macOS / Windows), behind the `device`
-//! feature.
+//! Production OS TUN device (Linux / macOS / Windows).
 //!
 //! - **Linux/macOS**: opens `/dev/net/tun` (needs `CAP_NET_ADMIN`/root).
 //! - **Windows**: creates a [Wintun](https://www.wintun.net/) adapter (needs
 //!   Administrator, and `wintun.dll` present - see [`OsTun::create`]).
 //!
-//! This is feature-gated and never exercised by the default build or unit tests
-//! (which drive the netstack through [`crate::MemoryTun`]). All `unsafe` - the
+//! Always compiled (TUN is a runtime choice, not a build-time one) and used by
+//! the client's `run_tun` and by `mirage-mobile-ffi`, but not exercised by unit
+//! tests, which drive the netstack through [`crate::MemoryTun`] instead of
+//! demanding elevated privileges from the test runner. All `unsafe` - the
 //! `TUNSETIFF` ioctl on Unix, the `LoadLibrary`/wintun FFI on Windows - lives
 //! inside the `tun` dependency, preserving Mirage's crate-level
 //! `#![forbid(unsafe_code)]`.

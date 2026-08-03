@@ -56,9 +56,27 @@ use thiserror::Error;
 pub const DOC_TYPE_ONION_DESCRIPTOR: u8 = 0x60;
 
 const ONION_DESC_VERSION_V1: u8 = 0x01;
+/// v2 adds the service's X25519 key and a dialable endpoint per introduction
+/// point. Both were REQUIRED for the protocol to be executable at all:
+///
+/// - Without the X25519 key a client cannot seal an INTRODUCE to the service,
+///   and the signed form it replaces could only be produced by the service
+///   itself (see `crate::introduce_sealed`).
+/// - Without an endpoint a client holds a bridge IDENTITY it cannot dial.
+///   Mirage has no global directory on purpose, so identity-only resolution
+///   works solely for bridges the client already knows - which a service's
+///   introduction points generally are not.
+///
+/// The disclosure is bounded: descriptors are sealed to address-holders
+/// (`crate::seal`), so learning these endpoints requires already knowing the
+/// `.mirage` address. That is the same trade Tor makes by listing introduction
+/// points in a descriptor.
+const ONION_DESC_VERSION_V2: u8 = 0x02;
 const MAGIC: [u8; 2] = *b"MI";
 const SIG_LEN: usize = 64;
-const INTRO_POINT_LEN: usize = 32 + 32 + 32; // 96
+/// Fixed part of an introduction point: three keys. The endpoint that follows
+/// is length-prefixed, because a hostname has no fixed size.
+const INTRO_POINT_FIXED_LEN: usize = 32 + 32 + 32; // 96
 /// Hard cap on number of introduction points per descriptor.
 /// Keeps the descriptor compact (under the BEP-44 1000-byte budget)
 /// while permitting redundancy.
@@ -70,17 +88,36 @@ const DESC_INFO_HASH_LABEL: &[u8] = b"mirage-onion-desc-v1";
 /// One introduction-point entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntroPoint {
-    /// Bridge's long-term Ed25519 identity (matches the bridge's
-    /// announcement). Used to verify the introduction-point bridge
-    /// against the discovery layer's bridge directory.
+    /// Bridge's long-term Ed25519 identity, which a client can also cross-check
+    /// against its own pool when it happens to know this bridge.
     pub bridge_ed25519_pk: [u8; 32],
     /// Bridge's static X25519. Used by the client to dial the
     /// bridge for the introduction request.
     pub bridge_x25519_pk: [u8; 32],
-    /// Per-introduction Ed25519 key. The client signs the INTRODUCE
-    /// cell payload with this key; the introduction-point bridge
-    /// verifies before forwarding to the service.
+    /// Per-introduction Ed25519 VERIFYING key, and the name the service is
+    /// reached by at this introduction point: a client puts it at the front of
+    /// its INTRODUCE so the bridge knows which registered circuit to hand the
+    /// rest to.
+    ///
+    /// It used to say "the client signs the INTRODUCE cell payload with this
+    /// key; the introduction-point bridge verifies before forwarding". Neither
+    /// half is true. A client cannot sign with a verifying key, and the bridge
+    /// deliberately does NOT look at the body - an introduction point is not
+    /// entitled to read it, so it forwards everything past this key verbatim.
+    /// What consumes the signature is the SERVICE, in
+    /// [`crate::ServiceState::accept_introduce`]. It is a ROUTING LABEL, not an
+    /// authenticator: the cell itself is sealed to the service (see
+    /// [`crate::introduce_sealed`]), which is what a client can actually
+    /// produce.
     pub intro_auth_key: [u8; 32],
+    /// Where to dial this bridge, e.g. `"198.51.100.7:443"` or `"cdn.example:443"`.
+    ///
+    /// Present because a bare identity is not dialable. Mirage has no global
+    /// directory on purpose, so resolving an identity works only for bridges the
+    /// client already knows - and a service's introduction points generally are
+    /// not among them. The disclosure is bounded by the descriptor's own seal:
+    /// reading this requires already holding the `.mirage` address.
+    pub endpoint: String,
 }
 
 /// A signed onion service descriptor.
@@ -93,6 +130,13 @@ pub struct OnionDescriptor {
     /// Service's long-term Ed25519 identity (the same key encoded
     /// in the `.mirage` address).
     pub service_ed25519_pk: [u8; 32],
+    /// Service's static X25519, which clients seal their INTRODUCE to.
+    ///
+    /// Separate from the Ed25519 identity rather than converted from it: the
+    /// birational map between the two is easy to get subtly wrong, and a
+    /// distinct key lets the service rotate its introduction key without
+    /// changing its address.
+    pub service_x25519_pk: [u8; 32],
     /// Introduction points (1..=[`MAX_INTRO_POINTS`]).
     pub intro_points: Vec<IntroPoint>,
     /// Ed25519 signature by `service_ed25519_pk` over the wire
@@ -131,6 +175,7 @@ impl OnionDescriptor {
         issued_at: u64,
         expires_at: u64,
         service_ed25519_pk: [u8; 32],
+        service_x25519_pk: [u8; 32],
         intro_points: Vec<IntroPoint>,
     ) -> Result<Self, ServiceDescError> {
         if expires_at <= issued_at {
@@ -145,6 +190,7 @@ impl OnionDescriptor {
             issued_at,
             expires_at,
             service_ed25519_pk,
+            service_x25519_pk,
             intro_points,
             signature: [0u8; SIG_LEN],
         })
@@ -193,28 +239,46 @@ impl OnionDescriptor {
     }
 
     fn signed_prefix_len(&self) -> usize {
-        2 + 1 + 1 + 8 + 8 + 32 + 1 + self.intro_points.len() * INTRO_POINT_LEN
+        // magic + doc_type + version + issued + expires + service_ed + service_x
+        // + count, then each intro point: 3 keys + u8 endpoint length + endpoint.
+        2 + 1
+            + 1
+            + 8
+            + 8
+            + 32
+            + 32
+            + 1
+            + self
+                .intro_points
+                .iter()
+                .map(|ip| INTRO_POINT_FIXED_LEN + 1 + ip.endpoint.len())
+                .sum::<usize>()
     }
 
     fn encode_signed_prefix(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&MAGIC);
         out.push(DOC_TYPE_ONION_DESCRIPTOR);
-        out.push(ONION_DESC_VERSION_V1);
+        out.push(ONION_DESC_VERSION_V2);
         out.extend_from_slice(&self.issued_at.to_be_bytes());
         out.extend_from_slice(&self.expires_at.to_be_bytes());
         out.extend_from_slice(&self.service_ed25519_pk);
+        out.extend_from_slice(&self.service_x25519_pk);
         out.push(self.intro_points.len() as u8);
         for ip in &self.intro_points {
             out.extend_from_slice(&ip.bridge_ed25519_pk);
             out.extend_from_slice(&ip.bridge_x25519_pk);
             out.extend_from_slice(&ip.intro_auth_key);
+            out.push(ip.endpoint.len() as u8);
+            out.extend_from_slice(ip.endpoint.as_bytes());
         }
     }
 
     /// Decode from wire bytes. Does NOT verify the signature; call
     /// [`Self::verify`] after if you need authenticity.
     pub fn decode(buf: &[u8]) -> Result<Self, ServiceDescError> {
-        if buf.len() < 2 + 1 + 1 + 8 + 8 + 32 + 1 + INTRO_POINT_LEN + SIG_LEN {
+        // Smallest possible v2: header + one intro point with an empty endpoint.
+        const MIN: usize = 2 + 1 + 1 + 8 + 8 + 32 + 32 + 1 + INTRO_POINT_FIXED_LEN + 1 + SIG_LEN;
+        if buf.len() < MIN {
             return Err(ServiceDescError::Wire("descriptor too short"));
         }
         if buf[0..2] != MAGIC {
@@ -223,7 +287,15 @@ impl OnionDescriptor {
         if buf[2] != DOC_TYPE_ONION_DESCRIPTOR {
             return Err(ServiceDescError::Wire("wrong doc_type"));
         }
-        if buf[3] != ONION_DESC_VERSION_V1 {
+        if buf[3] == ONION_DESC_VERSION_V1 {
+            // v1 had no service X25519 key and no endpoints, so a client reading
+            // one cannot seal an INTRODUCE or dial an introduction point. Refuse
+            // clearly rather than decode something unusable.
+            return Err(ServiceDescError::Wire(
+                "v1 descriptor: no service X25519 key and no endpoints, cannot be used",
+            ));
+        }
+        if buf[3] != ONION_DESC_VERSION_V2 {
             return Err(ServiceDescError::Wire("unsupported version"));
         }
         let issued_at = u64::from_be_bytes(buf[4..12].try_into().unwrap());
@@ -233,37 +305,54 @@ impl OnionDescriptor {
         }
         let mut service_ed25519_pk = [0u8; 32];
         service_ed25519_pk.copy_from_slice(&buf[20..52]);
-        let intro_count = buf[52] as usize;
+        let mut service_x25519_pk = [0u8; 32];
+        service_x25519_pk.copy_from_slice(&buf[52..84]);
+        let intro_count = buf[84] as usize;
         if intro_count == 0 || intro_count > MAX_INTRO_POINTS as usize {
             return Err(ServiceDescError::BadIntroCount { count: intro_count });
         }
-        let intro_block_len = intro_count * INTRO_POINT_LEN;
-        let cursor = 53;
-        if buf.len() != cursor + intro_block_len + SIG_LEN {
-            return Err(ServiceDescError::Wire("length mismatch"));
-        }
+
+        let mut off = 85usize;
         let mut intro_points = Vec::with_capacity(intro_count);
-        for i in 0..intro_count {
-            let off = cursor + i * INTRO_POINT_LEN;
+        for _ in 0..intro_count {
+            // Every read is bounds-checked against the remaining buffer: this
+            // parses a blob fetched from a public discovery channel, so a
+            // truncated or hostile descriptor must error rather than panic.
+            if buf.len() < off + INTRO_POINT_FIXED_LEN + 1 {
+                return Err(ServiceDescError::Wire("truncated intro point"));
+            }
             let mut bridge_ed25519_pk = [0u8; 32];
             bridge_ed25519_pk.copy_from_slice(&buf[off..off + 32]);
             let mut bridge_x25519_pk = [0u8; 32];
             bridge_x25519_pk.copy_from_slice(&buf[off + 32..off + 64]);
             let mut intro_auth_key = [0u8; 32];
             intro_auth_key.copy_from_slice(&buf[off + 64..off + 96]);
+            let ep_len = buf[off + 96] as usize;
+            off += INTRO_POINT_FIXED_LEN + 1;
+            if buf.len() < off + ep_len {
+                return Err(ServiceDescError::Wire("truncated endpoint"));
+            }
+            let endpoint = std::str::from_utf8(&buf[off..off + ep_len])
+                .map_err(|_| ServiceDescError::Wire("endpoint is not utf-8"))?
+                .to_string();
+            off += ep_len;
             intro_points.push(IntroPoint {
                 bridge_ed25519_pk,
                 bridge_x25519_pk,
                 intro_auth_key,
+                endpoint,
             });
         }
-        let sig_off = cursor + intro_block_len;
+        if buf.len() != off + SIG_LEN {
+            return Err(ServiceDescError::Wire("length mismatch"));
+        }
         let mut signature = [0u8; SIG_LEN];
-        signature.copy_from_slice(&buf[sig_off..sig_off + SIG_LEN]);
+        signature.copy_from_slice(&buf[off..off + SIG_LEN]);
         Ok(Self {
             issued_at,
             expires_at,
             service_ed25519_pk,
+            service_x25519_pk,
             intro_points,
             signature,
         })
@@ -304,14 +393,21 @@ mod tests {
             bridge_ed25519_pk: [tag; 32],
             bridge_x25519_pk: [tag.wrapping_add(1); 32],
             intro_auth_key: [tag.wrapping_add(2); 32],
+            endpoint: format!("198.51.100.{tag}:443"),
         }
     }
 
     #[test]
     fn descriptor_sign_verify_roundtrip() {
         let (sk, pk) = keypair();
-        let mut desc =
-            OnionDescriptor::new(1_000_000, 1_003_600, pk, vec![intro(1), intro(2)]).unwrap();
+        let mut desc = OnionDescriptor::new(
+            1_000_000,
+            1_003_600,
+            pk,
+            [0xC5u8; 32],
+            vec![intro(1), intro(2)],
+        )
+        .unwrap();
         desc.sign(&sk).unwrap();
         let bytes = desc.encode().unwrap();
         let back = OnionDescriptor::decode(&bytes).unwrap();
@@ -322,7 +418,8 @@ mod tests {
     #[test]
     fn verify_rejects_tampered_intro() {
         let (sk, pk) = keypair();
-        let mut desc = OnionDescriptor::new(1_000_000, 1_003_600, pk, vec![intro(1)]).unwrap();
+        let mut desc =
+            OnionDescriptor::new(1_000_000, 1_003_600, pk, [0xC5u8; 32], vec![intro(1)]).unwrap();
         desc.sign(&sk).unwrap();
         let mut bytes = desc.encode().unwrap();
         // Flip a byte in the intro-point block.
@@ -334,7 +431,7 @@ mod tests {
     #[test]
     fn descriptor_rejects_zero_intros() {
         let (_, pk) = keypair();
-        let err = OnionDescriptor::new(1, 2, pk, vec![]).unwrap_err();
+        let err = OnionDescriptor::new(1, 2, pk, [0xC5u8; 32], vec![]).unwrap_err();
         assert!(matches!(err, ServiceDescError::BadIntroCount { count: 0 }));
     }
 
@@ -344,14 +441,14 @@ mod tests {
         let many: Vec<_> = (0..MAX_INTRO_POINTS as usize + 1)
             .map(|i| intro(i as u8))
             .collect();
-        let err = OnionDescriptor::new(1, 2, pk, many).unwrap_err();
+        let err = OnionDescriptor::new(1, 2, pk, [0xC5u8; 32], many).unwrap_err();
         assert!(matches!(err, ServiceDescError::BadIntroCount { .. }));
     }
 
     #[test]
     fn descriptor_rejects_bad_expiry() {
         let (_, pk) = keypair();
-        let err = OnionDescriptor::new(2, 1, pk, vec![intro(1)]).unwrap_err();
+        let err = OnionDescriptor::new(2, 1, pk, [0xC5u8; 32], vec![intro(1)]).unwrap_err();
         assert_eq!(err, ServiceDescError::BadExpiry);
     }
 
@@ -359,7 +456,7 @@ mod tests {
     fn sign_rejects_pk_mismatch() {
         let (sk, _pk) = keypair();
         let (_, other_pk) = keypair();
-        let mut desc = OnionDescriptor::new(1, 2, other_pk, vec![intro(1)]).unwrap();
+        let mut desc = OnionDescriptor::new(1, 2, other_pk, [0xC5u8; 32], vec![intro(1)]).unwrap();
         let err = desc.sign(&sk).unwrap_err();
         assert_eq!(err, ServiceDescError::PkMismatch);
     }

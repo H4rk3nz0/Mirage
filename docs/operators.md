@@ -229,24 +229,78 @@ browser and preserved on save - the UI can neither display nor overwrite a secre
 
 You can also enable it from the config file instead of the flag: `"admin_bind": "127.0.0.1:3825"`.
 
-## 9. Paranoid mode + cover sources (optional)
+## 9. Proteus + paranoid mode (optional)
 
-For the strongest posture, set `"paranoid": true` in `bridge.json` (and clients set it too). It forces
-the Reality carrier, strict anti-probe, and **replay pacing**: authenticated sessions wear the packet
-sizes/timing of a real recorded video stream instead of a generated shape.
+**Proteus** makes authenticated sessions wear the packet sizes and timing of a *real recorded flow*
+instead of their own. Turn it on:
 
-Build the trace library the pacer replays with `mirage-cover-record` - a self-contained binary (no
-yt-dlp, ffmpeg, tcpdump, or python; it fetches a real HLS video over its own TLS stack and reads the
-wire envelope off the TLS record framing):
-
-```sh
-mirage-cover-record /opt/mirage/library --mode video  --count 20   # streaming-video envelope
-mirage-cover-record /opt/mirage/library --mode browse --count 20   # web-browsing envelope
-mirage-cover-record /opt/mirage/library --loop 30 --max 40         # self-driving (systemd unit)
+```json
+{ "proteus": true }
 ```
 
-Each class lands in `library/<class>/`. Point `reality_pace_profile` at the class dir that matches
-your Reality pretext (a video/CDN host -> `library/video`; a general site -> `library/browse`) on
-both the bridge and the clients (ship it with the client config). Both ends must run paranoid/replay
-for the shape to match. Per session the pacer chains a random shuffle of several traces, so nothing
-loops. Details: [`tools/cover-sources/README.md`](../tools/cover-sources/README.md).
+on the bridge and on clients. That is the whole procedure. With no library configured the daemon
+records and refreshes its own cover in-process - nothing to install, nothing to ship. The default
+`lean` tier sources a browse class plus a dense upstream class; `balanced` adds video, because a
+video capture is the better downstream disguise while its upstream is too sparse to carry a
+handshake, so Proteus pairs the two. Per session it chains a random shuffle of several traces, so
+nothing loops.
+
+### Budget for it before you enable it
+
+Cover runs for as long as a session is open, busy or idle, and the envelope's rate is therefore also
+a ceiling on every client's throughput. The two are the same quantity, 1:1 - user bytes displace
+padding rather than adding to it, which is precisely what makes an idle tunnel and a busy one look
+alike:
+
+| tier | cover bill per client | sustained throughput |
+|---|---|---|
+| `lean` (default) | 2.5 GB/day | ~0.23 Mbit/s |
+| `balanced` | 6 GB/day | ~0.56 Mbit/s |
+
+Multiply by your client count, and by the fraction of the day a client is actually connected - this
+is a per session-day figure, so a client online two hours a day costs two hours of cover, not
+twenty-four.
+
+Or set `proteus_max_gb_day` to your own number (or `"unlimited"`) and skip the tiers. Since the
+relationship is 1:1, that number IS the throughput you are buying: ~2 GB/hour connected gets a
+client roughly 5 Mbit/s, ~7-11 GB/hour gets 15-25 Mbit/s, because at those budgets the recorder can
+use real video cover rather than page loads.
+
+**The budget also sets worst-case latency, not just throughput.** Cheap cover cannot also be smooth
+- a page load is either fast, which costs, or waiting, which is a gap the tunnel stalls inside - so
+a client complaining that the tunnel is laggy needs a bigger budget, not a shaping knob. There is
+not one; see [Proteus](proteus.md) for why that is a theorem rather than a missing feature.
+
+A budget is a THROUGHPUT and LATENCY choice, not a concealment one - a censor-vantage matrix
+measured the tiers indistinguishable FROM EACH OTHER - so pick the cheapest one your users can
+tolerate rather than the biggest one you can afford. That is a statement about tiers, not a claim
+that the tunnel is undetectable: a replicated measurement still finds a small residual activity
+signal (about AUC 0.57 against a 0.53 control) on every budget tested. See [Proteus](proteus.md). If your deployment needs line rate and will not pay for it, run
+the Reality carrier WITHOUT Proteus and accept that flow shape is then exposed to traffic analysis.
+
+Note also that Proteus does not cover every carrier. Reality, WebSocket, Shadowsocks-2022,
+Hysteria2, h3, meek and DoH wear the envelope; plain TCP, obfs-tcp, dnstt and WebRTC do not, on
+either end, and nothing warns you. `mirage-keygen --proteus` advertises that the BRIDGE paces - it
+does not promise that the carrier a given client picks is one of the seven.
+
+Proteus is a per-connection property: **both ends must have it on**, or one side frames and the other
+does not and the session hangs rather than merely looking different.
+
+For the strongest posture set `"paranoid": true` instead, which turns on Proteus along with the
+Reality carrier and strict anti-probe.
+
+Generate invites with `mirage-keygen --proteus` so they advertise that this bridge requires
+pacing. A client without Proteus then refuses the invite up front with the reason, instead of
+failing inside a handshake and looking like an unreachable bridge - a paced bridge cannot serve an
+unpaced client, so the session fails outright rather than falling back.
+
+Clients pull this bridge's cover library over the tunnel once connected and stop recording their
+own, which also makes replay *joint* (both ends replaying one captured flow rather than two
+unrelated ones).
+
+If you want a *specific* envelope - your own site, a particular stream, an upload endpoint you
+control - record it with `mirage-cover-record` and set `proteus_profile`. Setting that path turns
+auto-sourcing off, so set `proteus_profile_up` to a dense capture as well or downloads inherit a
+20x slowdown. Details, including per-site target-conditioned replay and the bandwidth cost of a
+given profile: [`tools/cover-sources/README.md`](../tools/cover-sources/README.md) and
+[Proteus](proteus.md).

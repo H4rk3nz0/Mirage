@@ -20,6 +20,8 @@ quinn = { workspace = true }
 # real BRUTAL congestion controller (quinn_proto::congestion::Controller). M3.
 quinn-proto = "0.11"
 mirage-quic-obfs = { workspace = true }
+# Source of the replay cover's wire sizes/cadence for datagram-layer shaping.
+mirage-transport-reality = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
 getrandom = "0.3"

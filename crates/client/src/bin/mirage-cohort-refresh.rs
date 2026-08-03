@@ -64,6 +64,18 @@ struct ClientConfig {
     reality_sni: Option<String>,
     #[serde(default)]
     reality_tls_fingerprint: Option<String>,
+    // ---- Proteus pacing ----
+    // Read from the SAME config the client and bridge use. Pacing is a
+    // per-connection property both ends must agree on: the bridge paces every
+    // accept of a paced carrier, so a tool that dials one WITHOUT pacing framing
+    // does not merely look different - it hangs, because one side is framing and
+    // the other is not.
+    #[serde(default)]
+    proteus: Option<mirage_common::proteus_switch::ProteusSwitch>,
+    #[serde(default)]
+    proteus_profile: Option<String>,
+    #[serde(default)]
+    proteus_profile_up: Option<String>,
     // ---- SS-2022 ----
     #[serde(default)]
     ss2022_psk_hex: Option<String>,
@@ -123,6 +135,26 @@ async fn main() {
         .map_err(|e| format!("read: {e}"))
         .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
         .unwrap_or_else(|e| fatal(format!("config: {e}")));
+
+    // Activate pacing from the SAME config the client and bridge read. Without
+    // this the wrapping below is a no-op - `maybe_pace_stream` only paces when the
+    // local process has pacing configured - and the tool would dial a paced bridge
+    // with unpaced framing, which hangs rather than merely looking different.
+    if let Some(mode) = cfg.proteus.as_ref().and_then(|p| p.mode()) {
+        // Short-lived tool: it uses whatever library the client already has, and
+        // does NOT start the auto-sourcer. Recording cover for a process that
+        // exits in seconds would spend real bandwidth on a trace nothing replays.
+        // If the client has not populated a library yet, the fallback below leaves
+        // the profile unset and pacing simply stays off for this run.
+        let profile = cfg.proteus_profile.clone().or_else(|| {
+            Some(
+                mirage_cover::default_library_dir()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        });
+        mirage_transport_reality::set_pace_override(mode, profile, cfg.proteus_profile_up.clone());
+    }
 
     // Derive dialing parameters from the first invite (same logic as mirage-client).
     let (bridge_addr, bridge_x25519_pk, client_sk, token, operator_pk, tls_override_pk, probe_root) =
@@ -211,6 +243,7 @@ async fn main() {
             // Maintenance tool: plain QUIC (no obfs) - operators run it from a
             // trusted network. Add obfs_key here to exercise obfuscated refresh.
             obfs_key: None,
+            quic_wu_evasion: false,
         };
         let hy2_stream = tokio::time::timeout(
             timeout,
@@ -219,6 +252,14 @@ async fn main() {
         .await
         .unwrap_or_else(|_| fatal("hysteria2 timeout"))
         .unwrap_or_else(|e| fatal(format!("hysteria2: {e}")));
+        let hy2_seed = hy2_stream.pace_seed();
+        let hy2_stream = mirage_transport_reality::maybe_pace_stream(
+            hy2_stream,
+            mirage_transport_reality::pacer::Dir::Up,
+            hy2_seed,
+            // QUIC: sizes are shaped below the transport.
+            mirage_transport_reality::Carrier::raw(),
+        );
         let session = tokio::time::timeout(
             timeout,
             connect(hy2_stream, &client_sk, &bridge_x25519_pk, &token),
@@ -310,9 +351,18 @@ async fn wrap_carrier(
         let psk: [u8; 32] = raw
             .try_into()
             .unwrap_or_else(|_| fatal("ss2022_psk_hex: expected 32 bytes"));
-        let c = mirage_transport_shadowsocks::ss2022_client_dial(sock, &psk, timeout)
+        // Maintenance tool from a trusted network: no Wu-2023 preamble.
+        let c = mirage_transport_shadowsocks::ss2022_client_dial(sock, &psk, timeout, false)
             .await
             .unwrap_or_else(|e| fatal(format!("ss2022: {e}")));
+        let seed = c.pace_seed();
+        let c = mirage_transport_reality::maybe_pace_stream(
+            c,
+            mirage_transport_reality::pacer::Dir::Up,
+            seed,
+            // One SS-2022 AEAD chunk per record (34 B, not TLS's 21).
+            mirage_transport_reality::Carrier::ss2022(),
+        );
         return Box::pin(c);
     }
 
@@ -336,6 +386,18 @@ async fn wrap_carrier(
             "application/octet-stream".into(),
         )
         .await;
+        // The bridge paces its meek arm, so this must too. Pacing is a property
+        // both ends agree on - the session handshake runs INSIDE the pacer - so an
+        // unpaced dial here does not degrade, it hangs, exactly as this file's own
+        // header says. The seed comes from the auth nonce the server reads out of
+        // the same first POST, so both halves replay one captured flow.
+        let c = mirage_transport_reality::maybe_pace_stream(
+            c,
+            mirage_transport_reality::pacer::Dir::Up,
+            mirage_transport_meek::meek_pace_seed(&auth_frame),
+            // HTTP-mediated: no fixed per-record cost to size against.
+            mirage_transport_reality::Carrier::raw(),
+        );
         return Box::pin(c);
     }
 
@@ -348,13 +410,22 @@ async fn wrap_carrier(
         )
         .await
         .unwrap_or_else(|e| fatal(format!("doh: {e}")));
+        // Same as meek above: DoH rides meek's server machinery on the bridge,
+        // which paces every session it accepts, so an unpaced dial hangs.
+        let doh_seed = c.pace_seed();
+        let c = mirage_transport_reality::maybe_pace_stream(
+            c,
+            mirage_transport_reality::pacer::Dir::Up,
+            doh_seed,
+            mirage_transport_reality::Carrier::raw(),
+        );
         return Box::pin(c);
     }
 
     if cfg.ws_enabled == Some(true) {
         let path = cfg.ws_path.clone().unwrap_or_else(|| "/".to_owned());
         // Maintenance tool: a neutral cover Host (never "localhost").
-        let c = mirage_transport_ws::ws_client_connect(
+        let (c, ws_seed) = mirage_transport_ws::ws_client_connect(
             sock,
             bridge_x25519_pk,
             // Maintenance tool: no invite obfs secret in scope, so the knock is
@@ -367,6 +438,13 @@ async fn wrap_carrier(
         )
         .await
         .unwrap_or_else(|e| fatal(format!("websocket: {e}")));
+        let c = mirage_transport_reality::maybe_pace_stream(
+            c,
+            mirage_transport_reality::pacer::Dir::Up,
+            ws_seed,
+            // Masked client frames; this tool never uses carrier TLS.
+            mirage_transport_reality::Carrier::websocket_client(),
+        );
         return Box::pin(c);
     }
 

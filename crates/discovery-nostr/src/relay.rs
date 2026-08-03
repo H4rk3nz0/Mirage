@@ -1,8 +1,10 @@
 //! WebSocket-based `DiscoveryChannel` implementation for real Nostr relays.
 //!
-//! Gated behind the `relay` feature. The protocol layer in the sibling
-//! modules (`event`, `signing`, `wrap`) is I/O-free; this module adds
-//! the async WebSocket client that talks to a relay on the other end.
+//! Always compiled - there is no `relay` feature, and no build-time feature
+//! flags at all. The protocol layer in the sibling modules (`event`, `signing`,
+//! `wrap`) stays I/O-free by design; this module adds the async WebSocket client
+//! that talks to a relay on the other end. Whether it is *used* is a runtime
+//! config choice.
 //!
 //! Wire protocol (NIP-01 client-to-relay messages we emit / consume):
 //!
@@ -62,8 +64,9 @@
 //!   published ciphertext into the event ID via SHA-256. A relay cannot
 //!   rewrite `content` without invalidating the signature.
 //! - On `fetch`, we enforce the [`DiscoveryChannel::publish`] 4 KiB cap
-//!   AND the [`crate::wrap::MAX_CONTENT_LEN`] 2 KiB cap on returned
-//!   events, so a relay that streams gigabytes of junk cannot OOM us.
+//!   AND the [`crate::wrap::MAX_CONTENT_LEN`] 8 KiB cap on returned
+//!   events (applied in `unpack_announcement_event`), so a relay that
+//!   streams gigabytes of junk cannot OOM us.
 //! - The WebSocket client is built with rustls + webpki-roots. Operators
 //!   publishing from a hostile network should combine this with DoT/DoH
 //!   or a circumvention transport for the name lookup itself.
@@ -78,13 +81,13 @@ use mirage_discovery::{
 };
 use serde_json::{json, Value};
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::{self, protocol::WebSocketConfig, Message};
+use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
 use tracing::{debug, trace, warn};
 
 use crate::{
     event::NostrEvent,
     signing::NostrSigningKey,
-    wrap::{build_announcement_event, unpack_announcement_event, MAX_CONTENT_LEN, TAG_D},
+    wrap::{build_announcement_event, unpack_announcement_event, TAG_D},
 };
 
 /// Default per-operation deadline. Relays are geographically diverse;
@@ -586,13 +589,6 @@ fn classify_frame(text: &str, our_sub_id: &str, expected_kind: u64) -> RelayFram
         }
         _ => RelayFrame::Unrecognized,
     }
-}
-
-/// Silence unused-import warnings when feature is built headlessly.
-#[allow(dead_code)]
-fn _ensure_used() {
-    let _ = MAX_CONTENT_LEN;
-    let _: tungstenite::Error;
 }
 
 // Tests: in-process mock relay

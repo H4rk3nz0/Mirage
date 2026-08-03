@@ -254,10 +254,13 @@ impl NextHopDialer for SessionNextHopDialer {
             // needed. This obfuscates only; authentication remains the inner Noise
             // session. The peer MUST run the protocol mux (the default) to unwrap it.
             let relay_psk = derive_relay_ss_psk(&next_hop_pk);
+            // No Wu-2023 preamble on the internal relay leg: it is bridge-to-bridge,
+            // not the client-facing edge where entropy DPI runs.
             let ss = mirage_transport_shadowsocks::ss2022_client_dial(
                 tcp,
                 &relay_psk,
                 self.dial_timeout,
+                false,
             )
             .await
             .map_err(|e| format!("relay dial: ss2022 wrap: {e}"))?;
@@ -343,6 +346,7 @@ mod tests {
                 tcp,
                 &relay_psk,
                 Duration::from_secs(5),
+                false,
             )
             .await
             .expect("bridge-1 ss2022 unwrap relay leg");

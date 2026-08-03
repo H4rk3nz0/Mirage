@@ -204,16 +204,58 @@ struct BridgeConfig {
     /// Clients must also run paranoid/replay for the pacing to match.
     #[serde(default)]
     paranoid: bool,
-    /// Envelope pacing mode for authenticated Reality sessions: `video`/`browse` or
-    /// `replay` (wear a real captured trace - recommended). Config equivalent of
-    /// `MIRAGE_REALITY_PACE`. Paranoid mode sets this to `replay`.
+    /// **Proteus**: wear a real recorded traffic envelope on authenticated
+    /// sessions, so the tunnel's wire shape is a real flow's rather than its own.
+    ///
+    /// `proteus = true` is the whole setup. The bridge sources and refreshes its
+    /// own cover library in-process - no recorder to run, no timer to install, no
+    /// traces to ship. Config equivalent of `MIRAGE_PROTEUS`; paranoid mode turns
+    /// it on. Accepts `"replay"` (what `true` means) or the weaker generative
+    /// classes `"video"`/`"browse"` for an operator who has read the docs.
     #[serde(default)]
-    reality_pace: Option<String>,
-    /// For `reality_pace = "replay"`: a trace file, or a directory library of real
-    /// traces (one is chosen per session; keep it fresh with tools/cover-sources).
-    /// Config equivalent of `MIRAGE_REALITY_PACE_PROFILE`.
+    proteus: Option<mirage_common::proteus_switch::ProteusSwitch>,
+    /// Point Proteus at a trace file, or a directory library of real traces you
+    /// recorded yourself with `mirage-cover-record`. Leave unset and the bridge
+    /// records its own. Config equivalent of `MIRAGE_PROTEUS_PROFILE`.
     #[serde(default)]
-    reality_pace_profile: Option<String>,
+    proteus_profile: Option<String>,
+    /// Optional SEPARATE replay library for the UPSTREAM direction. The best
+    /// downstream cover is often the worst upstream one - a video capture is a
+    /// client that says almost nothing, and a tunnel's own handshake starves on
+    /// it. Set this to a browse-class library to keep the video's downstream
+    /// shape while borrowing upload capacity from a capture that has some. The
+    /// upstream trace is tiled to cover the downstream span. MUST match on both
+    /// endpoints, like `proteus_profile`.
+    #[serde(default)]
+    proteus_profile_up: Option<String>,
+    /// Where the bridge records its own cover FROM: `global` (default), a region
+    /// (`cn`, `ir`, `ru`, `tr`), or a comma-separated list of your own URLs.
+    ///
+    /// A bridge is usually well-connected and uncensored, so the global default
+    /// is usually right for it. Set a region when the bridge sits inside the
+    /// censored network it serves, or a custom list to record cover shaped like
+    /// the site your Reality cover host actually is.
+    #[serde(default)]
+    proteus_sources: Option<String>,
+    /// Daily cover budget: a number of GB/day, or the word "unlimited".
+    ///
+    /// Cover is paid for around the clock whether or not anyone uses the tunnel,
+    /// so this ceiling is ALSO the ceiling on throughput - the two are one dial,
+    /// not two. 2.5 GB/day is about 0.23 Mbit/s sustained; 6 is about 0.56.
+    ///
+    /// It is NOT a concealment setting. A censor-vantage matrix measured every
+    /// budget equally undetectable, so spending more buys speed and costs
+    /// bandwidth while buying no extra hiding. Absent, the tier's own ceiling
+    /// applies.
+    #[serde(default)]
+    proteus_max_gb_day: Option<mirage_cover::CoverBudget>,
+    /// Act as an introduction / rendezvous point for Mirage hidden services.
+    ///
+    /// Off by default: it makes this bridge carry traffic for services it
+    /// cannot see the destination of, which is the point, but it is an
+    /// operator's call to make rather than a default to inherit.
+    #[serde(default)]
+    onion_rendezvous_enabled: bool,
     /// `host:port` of the cover destination for unauthenticated
     /// peers. Required if `reality_enabled = true` AND
     /// [`Self::reality_cover_addrs`] is empty. Operators typically
@@ -743,6 +785,16 @@ struct BridgeConfig {
     /// (Salamander), so existing deployments are unchanged.
     #[serde(default)]
     quic_obfs_disable: bool,
+    /// Add the Wu-2023 evasion preamble to the high-entropy carriers -
+    /// obfuscated QUIC (hysteria2) datagrams AND the Shadowsocks-2022 stream.
+    /// Both are uniform-random from byte 0, which the GFW's deployed
+    /// fully-encrypted classifier flags (red-team #9); this prepends a printable
+    /// run that clears its exemptions while keeping the payload hidden. A
+    /// per-network posture (a printable prefix is a mild anomaly to DPI that
+    /// fully parses the carrier), so default `false`. MUST match the client's
+    /// `wu_evasion`.
+    #[serde(default)]
+    wu_evasion: bool,
 
     // ---- dnstt (DNS tunnel) carrier ----
     /// Enable the full DNS-tunnel handler. The bridge is the authoritative name
@@ -1147,6 +1199,11 @@ fn default_pad_cbr_interval_ms() -> u64 {
 /// hold a session slot indefinitely (RT-rl-2).
 const MAGIC_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Lower bound on any budget that has to wait for bytes crossing a PACED
+/// channel. Those bytes leave only on a schedule token, so a stock timeout
+/// measures the cover envelope rather than the peer.
+const PACED_HANDSHAKE_FLOOR: Duration = Duration::from_secs(60);
+
 /// Reports bridge load as 0-255 based on how full the session
 /// semaphore is. Used by [`CohortDistressMonitor`] to decide
 /// when to publish `EntryDistressed` gossip events to peers.
@@ -1330,35 +1387,119 @@ async fn bridge_doctor_probes(config: &BridgeConfig) {
 }
 
 /// Apply PARANOID mode + config-driven pacing on the bridge before startup. Paranoid
-/// forces Reality on, strict anti-probe, and replay pacing; the `reality_pace*` fields
+/// forces Reality on, strict anti-probe, and Proteus; the `proteus*` fields
 /// are honored whether or not paranoid is set.
-fn apply_paranoid_bridge(config: &mut BridgeConfig) {
+///
+/// `start_sourcing` is false for `--check-config` / `--doctor`: validating a
+/// config must not begin fetching real traffic from the internet as a side
+/// effect. The profile path is still resolved so the summary can report it.
+fn apply_paranoid_bridge(config: &mut BridgeConfig, start_sourcing: bool) {
     if config.paranoid {
         config.reality_enabled = true;
         config.reality_probe_accept_legacy = false; // strict: reject pubkey-only probes
-        if config.reality_pace.is_none() {
-            config.reality_pace = Some("replay".to_string());
+        if config.proteus.is_none() {
+            config.proteus = Some(mirage_common::proteus_switch::ProteusSwitch::On(true));
         }
         tracing::warn!(
             reality = true,
             strict_probe = true,
-            pace = ?config.reality_pace,
-            "PARANOID MODE: Reality carrier + strict anti-probe + replay pacing (sessions \
-             wear a real recorded cover shape). Clients must also run paranoid/replay."
+            proteus = ?config.proteus,
+            "PARANOID MODE: Reality carrier + strict anti-probe + Proteus (sessions wear a \
+             real recorded cover shape). Clients must also run paranoid/Proteus."
         );
     }
-    if let Some(mode) = config.reality_pace.clone() {
-        mirage_transport_reality::set_pace_override(
-            mode.clone(),
-            config.reality_pace_profile.clone(),
-        );
-        if mode == "replay" && config.reality_pace_profile.is_none() {
-            tracing::warn!(
-                "reality_pace=replay but reality_pace_profile is unset; pacing stays inactive \
-                 until a trace library is configured (see tools/cover-sources/README.md)"
-            );
+    let Some(mode) = config
+        .proteus
+        .as_ref()
+        .and_then(|p| p.mode())
+        .map(str::to_owned)
+    else {
+        return;
+    };
+
+    // Proteus is a switch: if nobody pointed it at a library, it sources its own
+    // rather than logging a warning and doing nothing. The old behaviour - stay
+    // inactive until an operator records traces, installs a timer unit and ships
+    // the CSVs to every client - meant the feature was only on for people who
+    // read the docs all the way through, which is the wrong set of people.
+    let (profile, profile_up) = match config.proteus_profile.clone() {
+        Some(p) => (p, config.proteus_profile_up.clone()),
+        None => {
+            let dir = mirage_cover::default_library_dir();
+            // `tokio::spawn` panics without a reactor, and a config-normalisation
+            // step must not be able to abort the process. Every caller today is
+            // inside the runtime; degrade rather than rely on that staying true.
+            if start_sourcing && tokio::runtime::Handle::try_current().is_ok() {
+                let tier = config
+                    .proteus
+                    .as_ref()
+                    .and_then(|p| p.tier_name())
+                    .and_then(|t| mirage_cover::Tier::parse(&t))
+                    .unwrap_or_default();
+                let pack = config
+                    .proteus_sources
+                    .as_deref()
+                    .and_then(mirage_cover::packs::SourcePack::parse)
+                    .unwrap_or_default();
+                // An explicit budget overrides the tier's ceiling; "unlimited"
+                // resolves to no cap at all. The tier then only decides which
+                // classes to record.
+                let ceiling = config
+                    .proteus_max_gb_day
+                    .as_ref()
+                    .map_or_else(|| tier.max_gb_day(), |b| b.gb_per_day(tier.max_gb_day()));
+                tracing::info!(
+                    library = %dir.display(),
+                    ?tier,
+                    ceiling_gb_day = ?ceiling,
+                    sources = pack.name(),
+                    "proteus: no profile configured, sourcing cover automatically"
+                );
+                // Pass the RESOLVED ceiling, not the tier's. Computing it for
+                // the log and then handing the recorder the tier default made
+                // "unlimited" a no-op that reported itself as applied.
+                tokio::spawn(mirage_cover::keep_fresh_tier_budget(
+                    dir.clone(),
+                    tier,
+                    pack,
+                    ceiling,
+                ));
+            }
+            (
+                dir.to_string_lossy().into_owned(),
+                config
+                    .proteus_profile_up
+                    .clone()
+                    .or_else(|| Some(mirage_cover::upstream_class_dir(&dir))),
+            )
         }
+    };
+    // Offer whatever library this bridge paces from to its clients, so they do
+    // not have to record their own. A client recording cover makes real,
+    // un-tunnelled HTTPS requests from its real address to sources that are
+    // frequently blocked exactly where this tool is needed - and sharing one
+    // library is also what makes replay JOINT rather than two unrelated flows
+    // glued together.
+    set_cover_library(Some(std::path::PathBuf::from(&profile)));
+    // The bridge side of the same trap, from the other direction. Once this
+    // bridge has traces it paces every accept, and any client WITHOUT a
+    // matching library then fails with zero bytes rather than connecting
+    // unpaced - the pacer wraps the carrier and the session handshake runs
+    // inside it, so an unframed handshake is read as a frame header with a
+    // nonsense length. Operators need to know that turning Proteus on here puts
+    // a hard requirement on their clients, not a soft one.
+    if start_sourcing {
+        let have = mirage_cover::count_traces(std::path::Path::new(&profile));
+        tracing::info!(
+            library = %profile,
+            traces = have,
+            "proteus: clients MUST also run Proteus with a library, or their sessions will \
+             fail outright rather than fall back to unpaced. Clients can pull this bridge's \
+             library over the tunnel once connected; the first one still needs a library \
+             shipped with its config."
+        );
     }
+    mirage_transport_reality::set_pace_override(mode, Some(profile), profile_up);
 }
 
 #[tokio::main]
@@ -1457,7 +1598,14 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    apply_paranoid_bridge(&mut config);
+    // Hidden-service rendezvous routing, if the operator turned it on. Set
+    // BEFORE any session spawns, because a session that started without it
+    // would silently not offer the service for its whole lifetime.
+    let _ = RENDEZVOUS.set(config.onion_rendezvous_enabled.then(|| {
+        info!("onion: acting as an introduction / rendezvous point for hidden services");
+        std::sync::Arc::new(mirage_bridge::rendezvous_router::RendezvousRouter::new())
+    }));
+    apply_paranoid_bridge(&mut config, !check_only);
 
     // Active-probe shadow config sanity (mimicry footguns). `http_shadow_target`
     // MUST speak PLAINTEXT HTTP - the bridge replays a plaintext HTTP request to
@@ -1588,8 +1736,8 @@ async fn main() {
         if let Some(ref m) = config.metrics_bind {
             println!("  metrics:        http://{m}/metrics");
         }
-        // These two toggles MUST match the client's settings (symmetric
-        // protocols); surface them so a mismatched pair is easy to spot.
+        // These toggles MUST match the client's settings (symmetric protocols);
+        // surface them so a mismatched pair is easy to spot.
         println!(
             "  padding:        {} (client must match)",
             if config.pad_enabled { "on" } else { "off" }
@@ -1602,6 +1750,34 @@ async fn main() {
                 "off"
             }
         );
+        // Proteus belongs in this group above all: a mismatch does not merely
+        // look different, it HANGS the session, because one end frames and the
+        // other does not. Report where the cover comes from too - "on" with an
+        // empty library paces nothing, and that is worth being able to see.
+        match config.proteus.as_ref().and_then(|p| p.mode()) {
+            Some(mode) => {
+                let (source, count) = match config.proteus_profile.as_deref() {
+                    Some(p) => (
+                        p.to_string(),
+                        mirage_cover::count_traces(std::path::Path::new(p)),
+                    ),
+                    None => {
+                        let d = mirage_cover::default_library_dir();
+                        let n = mirage_cover::count_traces(&d);
+                        (format!("{} (self-sourced)", d.display()), n)
+                    }
+                };
+                println!("  proteus:        {mode} (client must match)");
+                println!("  proteus cover:  {count} traces in {source}");
+                if count == 0 {
+                    println!(
+                        "                  none yet - sessions run UNPACED until the first \
+                         trace lands"
+                    );
+                }
+            }
+            None => println!("  proteus:        off (client must match)"),
+        }
         // Is the primary bind address actually bindable right now?
         match tokio::net::TcpListener::bind(&config.bind).await {
             Ok(l) => {
@@ -1690,7 +1866,30 @@ async fn main() {
         );
         Arc::new(SyncReplaySet::new(config.replay_capacity))
     };
-    let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
+    // Envelope pacing changes what a handshake COSTS on BOTH ends. The bridge has
+    // to allow for it too: a paced client's handshake bytes leave only on a
+    // schedule token, so the bridge sitting on a 10s budget simply closes the
+    // connection mid-handshake and the client sees `io: early eof`. Raising this
+    // on the client alone is not enough - the shorter of the two budgets wins.
+    let mut handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
+    if mirage_transport_reality::pacing_active() {
+        // Derived from the envelope, exactly as on the client - and it MUST be,
+        // because the shorter of the two budgets wins. A bridge holding a fixed
+        // 60s floor while its cover has 12s gaps closes the connection
+        // mid-handshake no matter how patient the client is.
+        let floor = mirage_transport_reality::paced_handshake_budget()
+            .unwrap_or(PACED_HANDSHAKE_FLOOR)
+            .max(PACED_HANDSHAKE_FLOOR);
+        if handshake_timeout < floor {
+            warn!(
+                configured_secs = config.handshake_timeout_secs,
+                raised_to_secs = floor.as_secs(),
+                "envelope pacing is on: raising the handshake budget to what THIS cover \
+                 envelope can actually deliver"
+            );
+            handshake_timeout = floor;
+        }
+    }
     let socks5_timeout = Duration::from_secs(config.socks5_connect_timeout_secs);
     let session_semaphore = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_sessions));
     let policy = Arc::new(policy_from(&config));
@@ -2505,6 +2704,7 @@ async fn main() {
                 .as_ref()
                 .map(std::path::PathBuf::from),
             brutal_cc: config.hysteria2_brutal,
+            quic_wu_evasion: config.wu_evasion,
         };
         // M4: bind the primary UDP port PLUS the current+next epoch derived UDP
         // ports (the SAME epoch derivation as the TCP port-hop listeners), so a
@@ -2562,6 +2762,19 @@ async fn main() {
                             // exhaustion of the global session semaphore + probe
                             // detector poisoned with 0.0.0.0).
                             let peer: std::net::SocketAddr = stream.remote_addr();
+                            // Proteus above quinn on the downstream half; see the
+                            // client side for why the datagram shaper alone is not
+                            // enough (it shapes size, not volume). The seed came
+                            // from the client with the knock, so both halves replay
+                            // one captured flow.
+                            let hy2_seed = stream.pace_seed();
+                            let stream = mirage_transport_reality::maybe_pace_stream(
+                                stream,
+                                mirage_transport_reality::pacer::Dir::Down,
+                                hy2_seed,
+                                // QUIC: sizes are shaped below the transport, so the pump frame is handed down whole.
+                                mirage_transport_reality::Carrier::raw(),
+                            );
                             let peer_guard = match peer_limiter_h2.try_acquire(peer.ip()) {
                                 Some(g) => g,
                                 None => {
@@ -2741,7 +2954,11 @@ async fn main() {
                                 Err(_) => return,
                             };
                             let h3_stream =
-                                match mirage_transport_masque::h3::h3_server_accept_conn(conn).await
+                                match mirage_transport_masque::h3::h3_server_accept_conn(
+                                    conn,
+                                    handshake_timeout,
+                                )
+                                .await
                                 {
                                     Ok(s) => s,
                                     Err(e) => {
@@ -2749,6 +2966,17 @@ async fn main() {
                                         return;
                                     }
                                 };
+                            // Proteus above quinn on the downstream half. The seed
+                            // came from the client in the first DATA frame, so both
+                            // halves replay one captured flow.
+                            let (h3_stream, h3_seed) = h3_stream;
+                            let h3_stream = mirage_transport_reality::maybe_pace_stream(
+                                h3_stream,
+                                mirage_transport_reality::pacer::Dir::Down,
+                                h3_seed,
+                                // QUIC: sizes are shaped below the transport, so the pump frame is handed down whole.
+                                mirage_transport_reality::Carrier::raw(),
+                            );
                             metrics_t.session_accepted();
                             let res = run_authenticated_session(
                                 into_session_stream(h3_stream, pad_cfg_t.as_ref()),
@@ -3197,7 +3425,21 @@ async fn main() {
                             )
                             .await
                             {
-                                Ok(ws_stream) => {
+                                Ok((ws_stream, ws_seed)) => {
+                                    // Proteus on the WebSocket carrier's DOWNSTREAM
+                                    // half. Both directions must be paced or the
+                                    // shaped one is simply the odd flow out; the
+                                    // seed comes from the handshake nonce, which
+                                    // the client derives identically, so the two
+                                    // halves replay one captured flow rather than
+                                    // two unrelated ones.
+                                    let ws_stream = mirage_transport_reality::maybe_pace_stream(
+                                        ws_stream,
+                                        mirage_transport_reality::pacer::Dir::Down,
+                                        ws_seed,
+                                        // One unmasked RFC 6455 binary frame per record.
+                                        mirage_transport_reality::Carrier::websocket_server(),
+                                    );
                                     let res = run_authenticated_session(
                                         into_session_stream(ws_stream, pad_cfg.as_ref()),
                                         peer,
@@ -3273,6 +3515,17 @@ async fn main() {
                                 )) => {
                                     metrics_clone
                                         .session_by_transport(crate::metrics::TRANSPORT_MEEK);
+                                    // Proteus on the downstream half. The seed came
+                                    // from the auth nonce in the client's first
+                                    // POST, so both halves replay one flow.
+                                    let seed = doh_stream.pace_seed();
+                                    let doh_stream = mirage_transport_reality::maybe_pace_stream(
+                                        doh_stream,
+                                        mirage_transport_reality::pacer::Dir::Down,
+                                        seed,
+                                        // HTTP-mediated: no fixed per-record cost to size against.
+                                        mirage_transport_reality::Carrier::raw(),
+                                    );
                                     let res = run_authenticated_session(
                                         into_session_stream(doh_stream, pad_cfg.as_ref()),
                                         peer,
@@ -3343,6 +3596,16 @@ async fn main() {
                                 Ok(mirage_transport_meek::MeekServeOutcome::NewSession(
                                     meek_stream,
                                 )) => {
+                                    // Proteus on the downstream half; seed from the
+                                    // auth nonce in the client's first POST.
+                                    let seed = meek_stream.pace_seed();
+                                    let meek_stream = mirage_transport_reality::maybe_pace_stream(
+                                        meek_stream,
+                                        mirage_transport_reality::pacer::Dir::Down,
+                                        seed,
+                                        // HTTP-mediated: no fixed per-record cost to size against.
+                                        mirage_transport_reality::Carrier::raw(),
+                                    );
                                     let res = run_authenticated_session(
                                         into_session_stream(meek_stream, pad_cfg.as_ref()),
                                         peer,
@@ -3437,6 +3700,8 @@ async fn main() {
                             stream,
                             mirage_transport_reality::pacer::Dir::Down,
                             seed,
+                            // One SS-2022 AEAD chunk per record (34 B, not TLS's 21).
+                            mirage_transport_reality::Carrier::ss2022(),
                         );
                         let res = run_authenticated_session(
                             into_session_stream(stream, pad_cfg.as_ref()),
@@ -4219,7 +4484,8 @@ async fn handle_session_reality(
             // through the TLS records. MUST match the client, which gates padding
             // off for Reality in `pad_stream_if_enabled`.
             //
-            // Shaper-v2: opt-in envelope pacing (MIRAGE_REALITY_PACE), off by
+            // Proteus: envelope pacing (`proteus` in the config, or MIRAGE_PROTEUS
+            // in the environment), off by
             // default. The bridge writes downstream, so it paces `Down`. Both ends
             // must set the same class; the schedule seed is derived from the shared
             // keys, so no extra negotiation is needed.
@@ -4570,9 +4836,13 @@ async fn run_authenticated_session(
                 "circuit-relay session; SessionTask (extend-capable{})",
                 if inbound_is_relay { " + relay-leg" } else { "" }
             );
-            let t = SessionTask::new(session, Arc::new(executor), SessionTaskConfig::default())
+            let mut t = SessionTask::new(session, Arc::new(executor), SessionTaskConfig::default())
                 .with_exit_events(exit_events_rx)
                 .with_next_hop_events(next_hop_rx);
+            if let Some(r) = rendezvous_router() {
+                t = t.with_rendezvous(r);
+            }
+            let t = t;
             if inbound_is_relay {
                 t.with_relay_mode()
             } else {
@@ -4588,8 +4858,12 @@ async fn run_authenticated_session(
                 "circuit-relay session; SessionTask ({})",
                 if inbound_is_relay { "exit hop (relay leg)" } else { "exit-only" }
             );
-            let t = SessionTask::new(session, Arc::new(executor), SessionTaskConfig::default())
+            let mut t = SessionTask::new(session, Arc::new(executor), SessionTaskConfig::default())
                 .with_exit_events(exit_events_rx);
+            if let Some(r) = rendezvous_router() {
+                t = t.with_rendezvous(r);
+            }
+            let t = t;
             if inbound_is_relay {
                 t.with_relay_mode()
             } else {
@@ -4611,7 +4885,27 @@ async fn run_authenticated_session(
     // token-authenticated Mirage handshake, so this is same-trust as SOCKS5.
     let mut session = session;
     let mut first = [0u8; 1];
-    match tokio::time::timeout(socks5_timeout, session.read_exact(&mut first)).await {
+    // This byte arrives on the PACED channel, so it is not governed by how fast
+    // the client is - it is governed by when the cover envelope next has a
+    // token. `socks5_connect_timeout_secs` defaults to 10s, which is a
+    // sane budget for an upstream TCP connect and a badly wrong one here: a
+    // realistic browse envelope has reading gaps of 12s, so the bridge was
+    // killing perfectly healthy mux carriers before the client's first byte
+    // could legally leave.
+    //
+    // That is what made paced WebSocket look broken. It failed 5 of 6 runs
+    // against a bursty cover library and passed 4 of 4 against a dense one, with
+    // no error on either side beyond "mux carrier closed mid-open" - because the
+    // handshake had already SUCCEEDED and the carrier died afterwards, waiting
+    // to be allowed to speak.
+    let first_byte_timeout = if mirage_transport_reality::pacing_active() {
+        socks5_timeout.max(
+            mirage_transport_reality::paced_handshake_budget().unwrap_or(PACED_HANDSHAKE_FLOOR),
+        )
+    } else {
+        socks5_timeout
+    };
+    match tokio::time::timeout(first_byte_timeout, session.read_exact(&mut first)).await {
         Ok(Ok(_)) => {}
         _ => {
             metrics.socks5_failed();
@@ -4660,6 +4954,10 @@ async fn run_authenticated_session(
     if is_cohort_target(&req.target) {
         info!(client = %plog(&peer), "cohort request received");
         return handle_cohort_request(session, peer, token_id, token_kind, cohort, metrics).await;
+    }
+    if is_cover_target(&req.target) {
+        info!(client = %plog(&peer), "cover-library request received");
+        return handle_cover_request(session, peer, cover_library()).await;
     }
     if is_refresh_target(&req.target) {
         info!(client = %plog(&peer), "refresh request received");
@@ -5031,6 +5329,168 @@ where
         Ok(_) => Ok(()),
         Err(e) => Err(format!("http connect copy: {e}")),
     }
+}
+
+/// The Proteus cover library this bridge serves to its clients.
+///
+/// A process-wide cell rather than a parameter: it is decided once at startup
+/// from config and never changes, and `run_authenticated_session` already has
+/// fifteen arguments across a dozen call sites. This mirrors how the pacing
+/// override itself is published (`set_pace_override`).
+static COVER_LIBRARY: std::sync::RwLock<Option<std::path::PathBuf>> = std::sync::RwLock::new(None);
+
+/// Hidden-service rendezvous routing, when the operator enabled it.
+///
+/// Process-wide because it MUST span sessions: a service registers its
+/// introduction point on its own session and a client introduces on another, so
+/// a per-session value could never complete the exchange.
+static RENDEZVOUS: std::sync::OnceLock<
+    Option<mirage_bridge::rendezvous_router::SharedRendezvousRouter>,
+> = std::sync::OnceLock::new();
+
+fn rendezvous_router() -> Option<mirage_bridge::rendezvous_router::SharedRendezvousRouter> {
+    RENDEZVOUS.get().and_then(Clone::clone)
+}
+
+/// Publish the library path clients may fetch, or `None` to serve nothing.
+fn set_cover_library(path: Option<std::path::PathBuf>) {
+    if let Ok(mut w) = COVER_LIBRARY.write() {
+        *w = path;
+    }
+}
+
+fn cover_library() -> Option<std::path::PathBuf> {
+    COVER_LIBRARY.read().ok().and_then(|g| g.clone())
+}
+
+/// Is this the cover-library magic host?
+fn is_cover_target(t: &ConnectTarget) -> bool {
+    // Case-insensitive for the same reason as the cohort host: a client sending
+    // mixed case would otherwise miss the dispatch and leak the magic hostname
+    // to whatever upstream DNS the bridge resolves through.
+    matches!(
+        t,
+        ConnectTarget::Domain(name, mirage_discovery::cover_sync::COVER_MAGIC_PORT)
+            if name.eq_ignore_ascii_case(mirage_discovery::cover_sync::COVER_MAGIC_HOSTNAME)
+    )
+}
+
+/// Serve the bridge's own Proteus cover library to an authenticated client.
+///
+/// The client would otherwise have to record its own, which means making real
+/// HTTPS requests un-tunnelled from its real address, to sources that are
+/// frequently blocked exactly where this tool is needed. The bridge already has
+/// a library for its own downstream pacing and is by assumption well-connected,
+/// so it sends that one - which also restores joint replay, since the up and
+/// down schedules are only two halves of one flow if both ends hold the same
+/// traces.
+async fn handle_cover_request<S>(
+    mut session: S,
+    peer: std::net::SocketAddr,
+    library: Option<std::path::PathBuf>,
+) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    use mirage_discovery::cover_sync as cs;
+
+    send_success_reply_for_internal(&mut session)
+        .await
+        .map_err(|e| format!("cover reply: {e}"))?;
+
+    let mut buf = [0u8; cs::COVER_REQUEST_LEN];
+    tokio::time::timeout(MAGIC_HOST_REQUEST_TIMEOUT, session.read_exact(&mut buf))
+        .await
+        .map_err(|_| "cover read: timeout".to_string())?
+        .map_err(|e| format!("cover read: {e}"))?;
+
+    let reply = |r: cs::CoverResponse| r.encode();
+    let req = match cs::CoverRequest::decode(&buf) {
+        Ok(r) => r,
+        Err(_) => {
+            let out = reply(cs::CoverResponse::status_only(
+                cs::COVER_STATUS_BAD_REQUEST,
+                0,
+            ));
+            let _ = session.write_all(&out).await;
+            let _ = session.flush().await;
+            return Ok(());
+        }
+    };
+
+    // A bridge with no library of its own has nothing to share. Say EMPTY
+    // rather than stalling, so the client can fall back to its own sourcing
+    // (or to running unpaced) instead of waiting on a transfer that will never
+    // come.
+    let class_dir = match &library {
+        Some(root) => root.join(match req.class {
+            cs::COVER_CLASS_VIDEO => "video",
+            cs::COVER_CLASS_UPSTREAM => mirage_cover::UPSTREAM_CLASS,
+            _ => "browse",
+        }),
+        None => {
+            let out = reply(cs::CoverResponse::status_only(cs::COVER_STATUS_EMPTY, 0));
+            let _ = session.write_all(&out).await;
+            let _ = session.flush().await;
+            let _ = session.shutdown().await;
+            return Ok(());
+        }
+    };
+
+    let mut traces: Vec<Vec<u8>> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&class_dir) {
+        let mut paths: Vec<std::path::PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "csv"))
+            .collect();
+        // Deterministic order so the digest is stable across calls.
+        paths.sort();
+        for p in paths.into_iter().take(req.max_traces as usize) {
+            match std::fs::read(&p) {
+                Ok(b) if b.len() <= cs::COVER_MAX_TRACE_BYTES => traces.push(b),
+                // Skip anything oversized rather than refusing the whole
+                // response: one bad file should not deny every client cover.
+                _ => continue,
+            }
+        }
+    }
+
+    let digest = cs::library_digest(&traces);
+    let resp = if traces.is_empty() {
+        cs::CoverResponse::status_only(cs::COVER_STATUS_EMPTY, 0)
+    } else if digest == req.have_digest {
+        // The client already holds exactly this library. One round trip beats
+        // re-sending a megabyte of traces it would write over the top of itself.
+        cs::CoverResponse::status_only(cs::COVER_STATUS_UNCHANGED, digest)
+    } else {
+        cs::CoverResponse {
+            status: cs::COVER_STATUS_OK,
+            digest,
+            traces,
+        }
+    };
+    let resp_status = resp.status;
+    let resp_traces = resp.traces.len();
+    let out = reply(resp);
+    session
+        .write_all(&out)
+        .await
+        .map_err(|e| format!("cover write: {e}"))?;
+    session
+        .flush()
+        .await
+        .map_err(|e| format!("cover flush: {e}"))?;
+    // SHUT DOWN, do not just return. On a PACED session `flush` does not put
+    // bytes on the wire - they leave on the next schedule token - so dropping
+    // the stream here discards a response that was already written. That is
+    // exactly what happened: the bridge logged "cover library served" while the
+    // client got `early eof`, because the 11-byte reply never left the pacer's
+    // queue. Shutdown is what drains it (see PacedChannel's residual flush), and
+    // it is why every other magic-host handler ends this way.
+    let _ = session.shutdown().await;
+    info!(client = %plog(&peer), bytes = out.len(), status = resp_status, traces = resp_traces, "cover library served");
+    Ok(())
 }
 
 fn is_cohort_target(t: &ConnectTarget) -> bool {

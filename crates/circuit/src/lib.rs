@@ -86,6 +86,7 @@ pub mod circuit;
 pub mod extend;
 pub mod keys;
 pub mod onion;
+pub mod rendezvous;
 pub mod split_exit;
 /// Wire codec for relay sub-cell stream bodies (BEGIN / DATA / END).
 pub mod stream;
@@ -102,6 +103,10 @@ pub use cell::{
     CMD_HANDOFF, CMD_HANDOFF_RESULT, CMD_RESOLVE,
 };
 pub use cell::{CMD_DATA, CMD_DESTROY, CMD_END, CMD_EXTEND, CMD_EXTENDED, CMD_PADDING, CMD_RELAY};
+pub use cell::{
+    CMD_ESTABLISH_INTRO, CMD_ESTABLISH_INTRO_OK, CMD_ESTABLISH_RENDEZVOUS, CMD_INTRODUCE,
+    CMD_RENDEZVOUS, CMD_RENDEZVOUS_OK,
+};
 pub use circuit::{
     Circuit, CircuitError, MAX_CIRCUIT_HOPS, MAX_REVERSE_RELAY_DATA_BYTES, MIN_CIRCUIT_HOPS,
 };
@@ -115,6 +120,10 @@ pub use keys::{
     SESSION_DIRECTION_LABEL_R2I,
 };
 pub use onion::{onion_open, onion_seal, OnionError, OnionLayer};
+pub use rendezvous::{
+    EstablishIntroBody, RendezvousAction, RendezvousBody, RendezvousError, RendezvousState,
+    COOKIE_LEN, INTRO_REGISTRATION_TTL, RENDEZVOUS_COOKIE_TTL,
+};
 pub use split_exit::{
     ForwarderPolicy, ForwarderState, ForwarderStreamState, HandoffBody, HandoffResultBody,
     HandoffStatus, ResolveBody, ResolveTarget, ResolverDecision, ResolverPolicy, ResolverState,

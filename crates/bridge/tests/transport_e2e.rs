@@ -188,6 +188,7 @@ async fn ss2022_round_trip() {
                         sock,
                         &psk,
                         Duration::from_secs(5),
+                        false,
                     )
                     .await
                     {
@@ -218,10 +219,14 @@ async fn ss2022_round_trip() {
         let sock = TcpStream::connect(bridge_addr).await.unwrap();
         sock.set_nodelay(true).ok();
 
-        let ss_stream =
-            mirage_transport_shadowsocks::ss2022_client_dial(sock, &psk, Duration::from_secs(5))
-                .await
-                .expect("ss2022 client dial");
+        let ss_stream = mirage_transport_shadowsocks::ss2022_client_dial(
+            sock,
+            &psk,
+            Duration::from_secs(5),
+            false,
+        )
+        .await
+        .expect("ss2022 client dial");
 
         let mut session = connect(ss_stream, &k.client_x_sk, &k.bridge_x_pk, &token)
             .await
@@ -322,7 +327,7 @@ async fn ws_client_connect(
     )
     .await;
 
-    Ok(mirage_transport_ws::WsStream::new(ws))
+    Ok(mirage_transport_ws::WsStream::new_with_seed(ws, 0))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -352,7 +357,7 @@ async fn ws_round_trip() {
                 tokio::spawn(async move {
                     // Step 1: HTTP/WS upgrade + Mirage auth frame.
                     let seen = mirage_transport::SeenNonceSet::new(Duration::from_secs(60));
-                    let ws_stream = match mirage_transport_ws::ws_server_auth(
+                    let (ws_stream, _ws_seed) = match mirage_transport_ws::ws_server_auth(
                         sock,
                         &k.bridge_x_pk,
                         None,

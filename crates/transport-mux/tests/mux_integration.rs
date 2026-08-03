@@ -172,10 +172,14 @@ async fn relay_ss2022_wrap_authenticates_via_mux() {
         let c = TcpStream::connect(addr).await.unwrap();
         // Dial SS-2022 (writes salt + encrypted request header, 0-RTT deferred
         // response). Hold the stream open so the mux can complete server auth.
-        let _ss =
-            mirage_transport_shadowsocks::ss2022_client_dial(c, &relay_psk, Duration::from_secs(3))
-                .await
-                .expect("relay ss2022 client dial");
+        let _ss = mirage_transport_shadowsocks::ss2022_client_dial(
+            c,
+            &relay_psk,
+            Duration::from_secs(3),
+            false,
+        )
+        .await
+        .expect("relay ss2022 client dial");
         tokio::time::sleep(Duration::from_millis(300)).await;
     });
     let (server, _) = listener.accept().await.unwrap();
@@ -198,6 +202,126 @@ async fn relay_ss2022_wrap_authenticates_via_mux() {
         matches!(res, MuxResult::AuthenticatedShadowsocks(_, _)),
         "relay leg wrapped in SS-2022 under relay_ss_psk must be accepted, got {res:?}"
     );
+    client_task.await.unwrap();
+}
+
+/// Regression: the Wu-2023 preamble and the SS-2022 request header arrive in
+/// SEPARATE TCP segments on any real network (the client sets TCP_NODELAY on the
+/// carrier socket, and the two are distinct writes). The mux must wait for
+/// enough bytes rather than giving up on the short first segment and
+/// cover-forwarding a legitimate client. Reproduces the split by writing the
+/// preamble by hand, letting the bridge peek, and only then handshaking.
+#[tokio::test]
+async fn wu_ss2022_authenticates_when_the_first_segment_is_split() {
+    use tokio::io::AsyncWriteExt;
+
+    let psk = [0x77u8; 32];
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client_task = tokio::spawn(async move {
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.set_nodelay(true).ok();
+        // Segment 1: the preamble alone.
+        let pre = mirage_common::wu_preamble::make_preamble();
+        c.write_all(&pre).await.expect("write preamble");
+        c.flush().await.expect("flush preamble");
+        // Give the bridge time to peek and (wrongly) decide on the short read.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        // Segment 2: the SS-2022 request header (0-RTT, does not read a reply).
+        let _ss = mirage_transport_shadowsocks::perform_client_handshake(c, psk)
+            .await
+            .expect("ss2022 client handshake");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+    let (server, _) = listener.accept().await.unwrap();
+
+    let mux = ProtocolMux::new(MuxConfig {
+        bridge_static_pk: [0u8; 32],
+        obfs_secret: None,
+        bridge_static_sk: [0u8; 32],
+        relay_ss_psk: None,
+        ss_psk: Some(psk),
+        obfs_enabled: false,
+        vless_uuid: None,
+    });
+    let seen = mirage_transport::SeenNonceSet::new(Duration::from_secs(300));
+    let res = mux
+        .accept(server, Duration::from_secs(3), &seen)
+        .await
+        .unwrap();
+    assert!(
+        matches!(res, MuxResult::AuthenticatedShadowsocks(_, _)),
+        "a wu-wrapped SS client whose preamble lands in its own segment must \
+         still authenticate, got {res:?}"
+    );
+    client_task.await.unwrap();
+}
+
+/// Wu-2023 evasion: an SS-2022 client that wears the printable preamble
+/// (`ss2022_client_dial(wu=true)`) must still be auto-detected and authenticated
+/// by the mux, which strips the preamble via `detect_wu_preamble` + the wu-aware
+/// server auth - and the bidirectional carrier must carry data end to end.
+#[tokio::test]
+async fn wu_wrapped_ss2022_auto_detects_and_roundtrips_via_mux() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let psk = [0x24u8; 32];
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client_task = tokio::spawn(async move {
+        let c = TcpStream::connect(addr).await.unwrap();
+        let mut ss = mirage_transport_shadowsocks::ss2022_client_dial(
+            c,
+            &psk,
+            Duration::from_secs(3),
+            true, // wear the Wu-2023 preamble
+        )
+        .await
+        .expect("wu ss2022 client dial");
+        // 0-RTT: send a request, then read the echo the bridge sends back.
+        ss.write_all(b"wu carrier payload")
+            .await
+            .expect("client write");
+        ss.flush().await.expect("client flush");
+        let mut got = vec![0u8; 5];
+        ss.read_exact(&mut got).await.expect("client read echo");
+        assert_eq!(&got, b"pong!", "downstream survived the wu carrier");
+    });
+    let (server, _) = listener.accept().await.unwrap();
+
+    let mux = ProtocolMux::new(MuxConfig {
+        bridge_static_pk: [0u8; 32],
+        obfs_secret: None,
+        bridge_static_sk: [0u8; 32],
+        relay_ss_psk: None,
+        ss_psk: Some(psk),
+        obfs_enabled: false,
+        vless_uuid: None,
+    });
+    let seen = mirage_transport::SeenNonceSet::new(Duration::from_secs(300));
+    let res = mux
+        .accept(server, Duration::from_secs(3), &seen)
+        .await
+        .unwrap();
+    let mut carrier = match res {
+        MuxResult::AuthenticatedShadowsocks(s, _seed) => s,
+        other => panic!("wu-wrapped SS must auto-detect as SS-2022, got {other:?}"),
+    };
+    // Read the client's request, reply with the preamble-wrapped downstream.
+    let mut req = vec![0u8; b"wu carrier payload".len()];
+    carrier
+        .read_exact(&mut req)
+        .await
+        .expect("bridge read request");
+    assert_eq!(
+        &req, b"wu carrier payload",
+        "upstream survived the wu carrier"
+    );
+    carrier
+        .write_all(b"pong!")
+        .await
+        .expect("bridge write echo");
+    carrier.flush().await.expect("bridge flush");
     client_task.await.unwrap();
 }
 

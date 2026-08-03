@@ -20,6 +20,12 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Test-only: the envelope pacer lives in transport-reality, and pacing a carrier
+# is a property both ends must agree on - one side framing and the other not
+# HANGS rather than merely looking different. The podman harness cannot run meek
+# (it needs CDN fronting), so a paced client-server pair here is the only place
+# that property can actually be verified. No cycle: reality does not depend on meek.
+mirage-transport-reality = { workspace = true }
 
 [lints]
 workspace = true

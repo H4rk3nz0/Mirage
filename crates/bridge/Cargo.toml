@@ -38,6 +38,7 @@ path = "src/bin/mirage-setup.rs"
 async-trait = { workspace = true }
 mirage-circuit = { workspace = true }
 mirage-common = { workspace = true }
+mirage-cover = { workspace = true }
 mirage-crypto = { workspace = true }
 # ECDSA P-256 for the Reality TLS-signing identity (keygen generates it, the
 # daemon loads it) - the browser-realistic CertVerify scheme (0x0403).
@@ -79,11 +80,6 @@ rustls-pki-types = { workspace = true }
 # mirage-cover-record: HLS URL resolution + real cert roots for the recorder.
 url = { workspace = true }
 webpki-roots = "0.26"
-
-
-[[bin]]
-name = "mirage-cover-record"
-path = "src/bin/mirage-cover-record.rs"
 
 [dev-dependencies]
 tempfile = "3"

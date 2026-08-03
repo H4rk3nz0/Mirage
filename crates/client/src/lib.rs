@@ -177,16 +177,57 @@ struct ClientConfig {
     /// The bridge must also run paranoid/reality+replay for the pacing to match.
     #[serde(default)]
     paranoid: bool,
-    /// Envelope pacing mode: `video`/`browse` (generative) or `replay` (wear a real
-    /// captured trace - recommended; see `tools/cover-sources`). Config equivalent of
-    /// `MIRAGE_REALITY_PACE`. Paranoid mode sets this to `replay`.
+    /// **Proteus**: wear a real recorded traffic envelope, so the tunnel's wire
+    /// shape is a real flow's rather than its own.
+    ///
+    /// `proteus = true` is the whole setup. The client sources and refreshes its
+    /// own cover library in-process - nothing to record, install or copy. Config
+    /// equivalent of `MIRAGE_PROTEUS`; paranoid mode turns it on. Accepts
+    /// `"replay"` (what `true` means) or the weaker generative classes
+    /// `"video"`/`"browse"`.
     #[serde(default)]
-    reality_pace: Option<String>,
-    /// For `reality_pace = "replay"`: the trace file, or a directory library of real
-    /// traces (one is chosen per session). Config equivalent of
-    /// `MIRAGE_REALITY_PACE_PROFILE`.
+    proteus: Option<mirage_common::proteus_switch::ProteusSwitch>,
+    /// Point Proteus at a trace file, or a directory library of real traces you
+    /// recorded yourself with `mirage-cover-record`. Leave unset and the client
+    /// records its own. Config equivalent of `MIRAGE_PROTEUS_PROFILE`.
     #[serde(default)]
-    reality_pace_profile: Option<String>,
+    proteus_profile: Option<String>,
+    /// Optional SEPARATE replay library for the UPSTREAM direction. The best
+    /// downstream cover is often the worst upstream one - a video capture is a
+    /// client that says almost nothing, and a tunnel's own handshake starves on
+    /// it. Set this to a browse-class library to keep the video's downstream
+    /// shape while borrowing upload capacity from a capture that has some. The
+    /// upstream trace is tiled to cover the downstream span. MUST match on both
+    /// endpoints, like `proteus_profile`.
+    #[serde(default)]
+    proteus_profile_up: Option<String>,
+    /// Where the client records its own cover FROM, when it is self-sourcing:
+    /// `global` (default), a region (`cn`, `ir`, `ru`, `tr`), or a
+    /// comma-separated list of your own URLs.
+    ///
+    /// **This matters more on a client than anywhere else.** Recording cover
+    /// means making real HTTPS requests, un-tunnelled, from this machine's real
+    /// address, before any tunnel exists. The default sources are Wikipedia and
+    /// a set of PeerTube instances - blocked or conspicuous in several of the
+    /// places Mirage is for. On such a network the fetches fail, the library
+    /// never fills, and Proteus runs unpaced.
+    ///
+    /// Prefer not to self-source at all: a library shipped with the config, or
+    /// pointed at by `proteus_profile`, costs the client no requests.
+    #[serde(default)]
+    proteus_sources: Option<String>,
+    /// Daily cover budget: a number of GB/day, or the word "unlimited".
+    ///
+    /// Cover is paid for around the clock whether or not anyone uses the tunnel,
+    /// so this ceiling is ALSO the ceiling on throughput - the two are one dial,
+    /// not two. 2.5 GB/day is about 0.23 Mbit/s sustained; 6 is about 0.56.
+    ///
+    /// It is NOT a concealment setting. A censor-vantage matrix measured every
+    /// budget equally undetectable, so spending more buys speed and costs
+    /// bandwidth while buying no extra hiding. Absent, the tier's own ceiling
+    /// applies.
+    #[serde(default)]
+    proteus_max_gb_day: Option<mirage_cover::CoverBudget>,
     /// Explicit opt-in to the unobfuscated raw-TCP carrier. When NO obfuscated
     /// transport is configured, the client would otherwise silently fall back to
     /// raw Noise-over-TCP, whose `MI` magic + message-type bytes are a cleartext
@@ -287,6 +328,18 @@ struct ClientConfig {
     /// mismatch garbles the QUIC Initial. Default `false` (Salamander).
     #[serde(default)]
     quic_obfs_disable: bool,
+    /// Enable the Wu-2023 evasion preamble on the high-entropy carriers -
+    /// obfuscated QUIC (hysteria2) datagrams AND the Shadowsocks-2022 stream.
+    /// Both are uniform-random from byte 0, which the GFW's deployed
+    /// fully-encrypted-traffic classifier flags; this prepends a printable run
+    /// that clears its exemptions. One "my network runs entropy DPI" switch. A
+    /// per-network posture (a printable prefix is itself a mild anomaly to DPI
+    /// that fully parses the carrier), so default `false`. MUST match the
+    /// bridge's `wu_evasion`. For QUIC it is ignored when obfs is disabled; for
+    /// Shadowsocks it also lets SS be used as a sole outer carrier under entropy
+    /// DPI (see `allow_ss2022_outer`).
+    #[serde(default)]
+    wu_evasion: bool,
 
     // ---- dnstt (DNS tunnel) transport ----
     /// Enable the full DNS-tunnel carrier. Requires `dnstt_domain` +
@@ -742,6 +795,10 @@ struct BridgeEntry {
     /// Salamander-obfuscated QUIC (red-team #9). Stamped from the client config;
     /// must match the bridge's `quic_obfs_disable`.
     quic_obfs_disable: bool,
+    /// When true, the hysteria2 AND Shadowsocks-2022 dials wear the Wu-2023
+    /// evasion preamble (printable run on an otherwise uniform-random wire).
+    /// Stamped from the client config; must match the bridge's `wu_evasion`.
+    wu_evasion: bool,
     /// When true, the meek/DoH/WS dial wraps the carrier TCP in real TLS to a
     /// terminating front before the HTTP (red-team #4). Stamped from config.
     carrier_tls: bool,
@@ -884,6 +941,23 @@ impl BridgeEntry {
         ann.verify(&invite.operator_ed25519_pk)
             .map_err(|e| format!("invite: announcement signature: {e}"))?;
 
+        // A bridge that REQUIRES Proteus cannot be reached without a cover
+        // library: pacing adds framing and the session handshake runs inside it,
+        // so a client that cannot pace gets zero bytes rather than an unpaced
+        // tunnel. Say that here, where the reason is still known, instead of
+        // letting the user watch an "unreachable bridge" that is nothing of the
+        // sort.
+        if ann.transport_caps & mirage_discovery::wire::transport_caps::PROTEUS_REQUIRED != 0
+            && !mirage_transport_reality::pacing_active()
+        {
+            return Err(
+                "this bridge requires Proteus, and it is not enabled here. A paced bridge \
+                 cannot serve an unpaced client - the session fails outright rather than \
+                 falling back. Set \"proteus\": true in your client config."
+                    .to_string(),
+            );
+        }
+
         let bridge_addr = endpoint_to_dial_str(&ann.endpoint)?;
         let tokens = invite.bootstrap_tokens.clone();
         let fs_tokens = invite.fs_bootstrap_tokens.clone();
@@ -945,6 +1019,7 @@ impl BridgeEntry {
             vless_uuid: None,          // set by build_pool() after construction
             pad_enabled: false,        // set by build_pool()
             quic_obfs_disable: false,  // set by build_pool()
+            wu_evasion: false,         // set by build_pool()
             carrier_tls: false,        // set by build_pool()
             carrier_tls_sni: None,     // set by build_pool()
             ech_config_list,           // from the invite; config may override in build_pool
@@ -1009,6 +1084,36 @@ impl BridgeEntry {
                 client_x25519_sk,
                 token,
             } => (*client_x25519_sk, PresentedToken::Legacy(token.clone())),
+        }
+    }
+
+    /// Does this carrier actually wear the Proteus envelope?
+    ///
+    /// Turning Proteus on does not pace everything a bridge can accept, and the
+    /// uncovered carriers are unpaced on BOTH ends - so they connect fine and
+    /// the operator has no way to tell the difference from the outside. The
+    /// `PROTEUS_REQUIRED` capability says the BRIDGE paces; it does not say the
+    /// carrier this client happened to pick is one of the paced ones.
+    ///
+    /// Kept next to [`Self::describe_mode`] deliberately: a new transport arm
+    /// added there without a decision here is the bug this exists to catch, and
+    /// the match is exhaustive so the compiler forces the decision.
+    fn wears_proteus(&self) -> bool {
+        match &self.transport {
+            TransportMode::Reality { .. }
+            | TransportMode::WebSocket { .. }
+            | TransportMode::Ss2022 { .. }
+            | TransportMode::Hysteria2 { .. }
+            | TransportMode::H3 { .. }
+            | TransportMode::Meek { .. }
+            | TransportMode::Doh { .. } => true,
+            // A DNS tunnel and a WebRTC data channel have their own strong
+            // shapes; replaying a captured TLS envelope over either would look
+            // like neither the cover nor the carrier. Plain TCP could be paced
+            // with `Carrier::raw()` and simply is not wired.
+            TransportMode::Dnstt { .. } | TransportMode::WebRtc { .. } | TransportMode::Raw => {
+                false
+            }
         }
     }
 
@@ -1146,6 +1251,11 @@ const KNOWN_TRANSPORTS: &[&str] = &[
     "explicit-hex",
 ];
 
+/// Minimum seconds between operator-triggered re-discover walks (rate-limits
+/// `POST /api/rediscover`). Comfortably below any human's click cadence, so the
+/// GUI button is never blocked, while a scripted local flood is bounded.
+const MANUAL_REDISCOVER_MIN_SECS: u64 = 5;
+
 struct EntryPool {
     entries: Vec<BridgeEntry>,
     health: Mutex<Vec<EntryHealth>>,
@@ -1164,6 +1274,10 @@ struct EntryPool {
     /// `true` while a discovery pass is in flight, so the GUI can show a live
     /// "walking rendezvous" indicator that reflects reality rather than a timer.
     discovery_active: Arc<AtomicBool>,
+    /// Unix time of the last operator-triggered re-discover, to rate-limit
+    /// `POST /api/rediscover`: a local caller (bypassing the GUI's own debounce)
+    /// must not be able to spin the discovery loop into a rendezvous query flood.
+    last_manual_rediscover: AtomicU64,
     /// Per-(network, transport) success-rate map. Every dial outcome is
     /// recorded here (success in `record_latency`, failure in `mark_failure`),
     /// persisted across restarts, and surfaced in the management API. This is
@@ -1266,6 +1380,33 @@ fn random_egress_witness() -> Vec<u8> {
 /// This is a transport-CHARACTER model (a predictive per-transport prior the real
 /// Wu classifier evaluates), not a live per-flow socket tap (which would require a
 /// tap inside every transport). See [`mirage_transport::self_adversary`].
+/// Transports already warned about, so the message appears once per carrier for
+/// the life of the process rather than on every dial.
+static UNCOVERED_WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+/// Say once that Proteus is on and this carrier is not wearing it.
+///
+/// At `warn`, not `debug`: the user turned a protection on and is not getting it
+/// on this path. Silence here is the failure mode - the tunnel works, so nothing
+/// else will ever tell them.
+fn warn_uncovered_carrier_once(name: &str) {
+    let seen =
+        UNCOVERED_WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let Ok(mut g) = seen.lock() else {
+        return;
+    };
+    if !g.insert(name.to_string()) {
+        return;
+    }
+    warn!(
+        transport = name,
+        "Proteus is enabled but the {name} carrier does not wear the cover envelope, so \
+         traffic over it is NOT shaped. It still connects because this carrier is unpaced \
+         on both ends. See docs/proteus.md for which carriers are covered."
+    );
+}
+
 fn transport_egress_witness(name: &str) -> Vec<u8> {
     match name {
         // TLS-shaped first packet (ClientHello + SNI): exempt.
@@ -1363,6 +1504,7 @@ impl EntryPool {
             }),
             egress_verified: AtomicBool::new(false),
             egress_since_unix: AtomicU64::new(0),
+            last_manual_rediscover: AtomicU64::new(0),
         }
     }
 
@@ -1378,6 +1520,11 @@ impl EntryPool {
             self.egress_since_unix.store(now, Ordering::Relaxed);
             info!("egress verified-connected: authenticated Mirage tunnel established");
         }
+    }
+
+    /// Is a verified tunnel currently up?
+    fn egress_is_verified(&self) -> bool {
+        self.egress_verified.load(Ordering::Acquire)
     }
 
     /// Mark egress down: every bridge entry is simultaneously exhausted, so no
@@ -1398,10 +1545,23 @@ impl EntryPool {
     }
 
     /// Kick an immediate discovery walk (the operator's "re-discover now").
-    /// Wakes the background task via the same channel the mass-failure path
-    /// uses; a no-op if no discovery channels are configured (nothing listens).
-    pub fn trigger_rediscovery(&self) {
+    /// Wakes the background task via the same channel the mass-failure path uses.
+    /// Rate-limited to one manual walk per `MANUAL_REDISCOVER_MIN_SECS` so a local
+    /// caller can't spin the discovery loop into a rendezvous query flood; returns
+    /// `true` if it fired, `false` if it was throttled. A no-op (still `true`) when
+    /// no discovery channels are configured (nothing is listening on the channel).
+    pub fn trigger_rediscovery(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = self.last_manual_rediscover.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < MANUAL_REDISCOVER_MIN_SECS {
+            return false;
+        }
+        self.last_manual_rediscover.store(now, Ordering::Relaxed);
         self.discovery_trigger.notify_one();
+        true
     }
 
     /// The rendezvous channels this client walks, for the management API.
@@ -1595,6 +1755,14 @@ impl EntryPool {
         // a block) + lift this bearer class's posture score.
         if let Some(e) = self.entries.get(idx) {
             let name = e.describe_mode();
+            // Proteus is on, but this carrier is not one it paces. The session
+            // works - the uncovered carriers are unpaced on BOTH ends, so there
+            // is no mismatch - and that is exactly the problem: nothing about a
+            // working tunnel tells the user their traffic is not wearing the
+            // envelope they switched on. Once per transport, not per dial.
+            if mirage_transport_reality::pacing_active() && !e.wears_proteus() {
+                warn_uncovered_carrier_once(name);
+            }
             self.success_map.record(&self.network, name, true);
             let base = outcome_reward(true, Some(Duration::from_millis(latency_ms)));
             let mut g = self.routing.lock().expect("routing lock poisoned");
@@ -1956,8 +2124,16 @@ async fn run_nostr_discovery(
         "dynamic discovery: background task started"
     );
 
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The walk period is JITTERED around the configured interval rather than run
+    // on a fixed tick. Discovery is the most externally visible thing the client
+    // does: it reaches Nostr relays, DNS resolvers and DHT nodes directly, from
+    // the user's real IP, before any tunnel exists to hide it. A fixed cadence
+    // turns that into "this host queries these relays every N seconds" - a stable
+    // behavioural signature that survives every transport change underneath it,
+    // and one an observer can lock onto without decrypting anything. Same
+    // reasoning that jittered the probe and token-refresh loops.
+    let jitter_lo = interval.mul_f64(0.75);
+    let jitter_hi = interval.mul_f64(1.25);
     loop {
         // Idle while waiting; the GUI reads this as "not currently walking".
         active.store(false, Ordering::Relaxed);
@@ -1965,7 +2141,7 @@ async fn run_nostr_discovery(
         // notification from the dial path (all entries failed simultaneously),
         // or an operator-requested re-discover from the management API.
         tokio::select! {
-            _ = ticker.tick() => {},
+            () = tokio::time::sleep(jitter_duration(jitter_lo, jitter_hi)) => {},
             _ = trigger.notified() => {
                 debug!("nostr discovery: immediate re-fetch (mass-failure or operator request)");
             }
@@ -2201,17 +2377,22 @@ fn collect_transports(config: &ClientConfig) -> Result<Vec<TransportMode>, Strin
     // byte 0). ss2022's entropy is inherent and it can't be nested inside a
     // mimicry transport here, so as a sole outer carrier it is trivially
     // entropy-classified (red-team #3). Same discipline as the raw-TCP guard.
+    // `wu_evasion` lifts this: the Wu-2023 preamble gives the SS wire a printable
+    // run that clears the classifier's exemptions, so SS alone is no longer a
+    // free entropy tell (see `wu_evasion` + the SS `wu_stream` wrapper).
     if !out.is_empty()
         && out
             .iter()
             .all(|m| matches!(m, TransportMode::Ss2022 { .. }))
         && !config.allow_ss2022_outer
+        && !config.wu_evasion
     {
         return Err(
             "the only configured transport is Shadowsocks-2022, whose wire is uniform \
                     random from byte 0 - the exact Wu-2023 fully-encrypted-traffic signature a \
                     GFW-class entropy classifier flags (this is the class that got obfs4 dropped). \
-                    Configure a mimicry transport (reality/meek/ws/...) alongside it, or set \
+                    Configure a mimicry transport (reality/meek/ws/...) alongside it, set \
+                    wu_evasion=true to wear the Wu-2023 printable preamble, or set \
                     allow_ss2022_outer=true if Shadowsocks is permitted and no entropy DPI runs \
                     on your network."
                 .to_string(),
@@ -2220,16 +2401,47 @@ fn collect_transports(config: &ClientConfig) -> Result<Vec<TransportMode>, Strin
     Ok(out)
 }
 
-/// Apply PARANOID mode + config-driven pacing before the pool is built. Paranoid is
+/// Start the background cover-sourcing task, if there is a runtime to start it on.
+///
+/// [`apply_paranoid`] is a synchronous config-normalisation step, and every
+/// production caller happens to run inside the Tokio runtime - but "happens to"
+/// is not a contract, and `tokio::spawn` PANICS without a reactor. A config
+/// normaliser must not be able to abort the process, so the absence of a runtime
+/// degrades to pacing from whatever library already exists rather than crashing.
+fn spawn_cover_sourcing(
+    dir: std::path::PathBuf,
+    tier: mirage_cover::Tier,
+    pack: mirage_cover::packs::SourcePack,
+    max_gb_day: Option<f64>,
+) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        COVER_SOURCING.store(true, std::sync::atomic::Ordering::Relaxed);
+        tokio::spawn(mirage_cover::keep_fresh_budget(
+            dir,
+            tier,
+            pack,
+            max_gb_day,
+            cover_stop_flag(),
+        ));
+    } else {
+        tracing::debug!(
+            "proteus: no async runtime here, skipping automatic cover sourcing (an \
+             already-populated library still replays normally)"
+        );
+    }
+}
+
+/// Apply PARANOID mode + config-driven Proteus before the pool is built. Paranoid is
 /// one switch for the strongest posture (it overrides the individual toggles); the
-/// `reality_pace*` fields are honored whether or not paranoid is set.
-fn apply_paranoid(config: &mut ClientConfig) {
+/// `proteus*` fields are honored whether or not paranoid is set.
+fn apply_paranoid(config: &mut ClientConfig, start_sourcing: bool) {
     if config.paranoid {
         config.reality_enabled = true; // hide as real TLS to a real cover host
         config.pad_enabled = true; // pad the Noise handshake
         config.allow_insecure_raw = false; // fail closed - never fall back to raw
-        if config.reality_pace.is_none() {
-            config.reality_pace = Some("replay".to_string()); // wear a real recorded shape
+        if config.proteus.is_none() {
+            // wear a real recorded shape
+            config.proteus = Some(mirage_common::proteus_switch::ProteusSwitch::On(true));
         }
         // Multi-hop (`circuit_relay`) is complementary but needs several bridges + relay
         // support, so it is left as a separate opt-in rather than forced here (forcing it
@@ -2237,31 +2449,145 @@ fn apply_paranoid(config: &mut ClientConfig) {
         tracing::warn!(
             reality = true,
             padding = true,
-            pace = ?config.reality_pace,
+            proteus = ?config.proteus,
             multihop = config.circuit_relay,
-            "PARANOID MODE: Reality carrier + handshake padding + fail-closed + replay \
-             pacing (wears a real recorded cover shape). The bridge must also enable \
-             reality + replay for the shape to match. Enable circuit_relay for multi-hop."
+            "PARANOID MODE: Reality carrier + handshake padding + fail-closed + Proteus \
+             (wears a real recorded cover shape). The bridge must also enable reality + \
+             Proteus for the shape to match. Enable circuit_relay for multi-hop."
         );
     }
-    // Config-driven pacing (takes precedence over the env vars), paranoid or not.
-    if let Some(mode) = config.reality_pace.clone() {
-        mirage_transport_reality::set_pace_override(
-            mode.clone(),
-            config.reality_pace_profile.clone(),
-        );
-        if mode == "replay" && config.reality_pace_profile.is_none() {
-            tracing::warn!(
-                "reality_pace=replay but reality_pace_profile is unset; pacing stays inactive \
-                 until a trace library is configured (see tools/cover-sources/README.md)"
-            );
+    // Config-driven Proteus (takes precedence over the env vars), paranoid or not.
+    let Some(mode) = config
+        .proteus
+        .as_ref()
+        .and_then(|p| p.mode())
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    // Proteus is a switch: with no library configured the client sources its own
+    // rather than staying silently inactive. See the bridge's counterpart for why
+    // "warn and do nothing" was the wrong default.
+    let (profile, profile_up) = match config.proteus_profile.clone() {
+        Some(p) => (p, config.proteus_profile_up.clone()),
+        None => {
+            let dir = mirage_cover::default_library_dir();
+            if start_sourcing {
+                let tier = config
+                    .proteus
+                    .as_ref()
+                    .and_then(|p| p.tier_name())
+                    .and_then(|t| mirage_cover::Tier::parse(&t))
+                    .unwrap_or_default();
+                let pack = config
+                    .proteus_sources
+                    .as_deref()
+                    .and_then(mirage_cover::packs::SourcePack::parse)
+                    .unwrap_or_default();
+                tracing::info!(
+                    library = %dir.display(),
+                    ?tier,
+                    ceiling_gb_day = ?tier.max_gb_day(),
+                    sources = pack.name(),
+                    "proteus: no profile configured, sourcing cover automatically"
+                );
+                // Shaping the flow does nothing about the cover host announced in
+                // the CLEAR, in the TLS SNI. A client on a network where the
+                // chosen SNI is blocked has already said the interesting part
+                // before a single record is paced, and no amount of replay
+                // fidelity walks that back. Only a regional pack can judge this,
+                // because only it carries a claim about what is blocked where.
+                if let Some(sni) = config.reality_sni.as_deref() {
+                    if !pack.sni_is_plausible(sni) {
+                        tracing::warn!(
+                            sni,
+                            sources = pack.name(),
+                            "proteus: reality_sni names a host that looks out of place on this \
+                             region's network - the SNI is sent in cleartext, so claiming to be \
+                             a site nobody local can reach is conspicuous no matter how good the \
+                             traffic shape is. Prefer a cover host that is ordinary here."
+                        );
+                    }
+                }
+                // Explicit budget wins over the tier's ceiling; "unlimited"
+                // resolves to no cap. The tier then only picks the classes.
+                let ceiling = config
+                    .proteus_max_gb_day
+                    .as_ref()
+                    .map_or_else(|| tier.max_gb_day(), |b| b.gb_per_day(tier.max_gb_day()));
+                spawn_cover_sourcing(dir.clone(), tier, pack, ceiling);
+            }
+            (
+                dir.to_string_lossy().into_owned(),
+                config
+                    .proteus_profile_up
+                    .clone()
+                    .or_else(|| Some(mirage_cover::upstream_class_dir(&dir))),
+            )
         }
+    };
+    // A pacing MISMATCH does not degrade, it hangs. The pacer wraps the carrier
+    // and the session handshake runs inside it, so a client with no traces
+    // sends a raw handshake into a bridge that is expecting frames: the bridge
+    // reads it as a frame header, gets a nonsense length, and the session dies
+    // with zero bytes through. Observed exactly that way.
+    //
+    // So an empty library is not "Proteus is off for now" - against a paced
+    // bridge it is "no tunnel at all", and the user sees an unreachable bridge
+    // with nothing pointing at the real cause. Say it plainly, here, once.
+    if mirage_cover::count_traces(std::path::Path::new(&profile)) == 0 {
+        tracing::warn!(
+            library = %profile,
+            "proteus: enabled but this library has NO traces yet. Pacing is a property both \
+             ends must agree on - if the bridge is paced and this client is not, the session \
+             does not run unpaced, it FAILS with zero bytes. If cover sourcing cannot reach \
+             its sites from this network (the default sources are blocked in several places \
+             this tool is for), set proteus_sources to a reachable region or list, or point \
+             proteus_profile at a library shipped with your config."
+        );
     }
+    mirage_transport_reality::set_pace_override(mode, Some(profile), profile_up);
 }
 
-fn build_pool(mut config: ClientConfig) -> Result<EntryPool, String> {
-    apply_paranoid(&mut config);
-    let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
+/// Build the entry pool from a config.
+///
+/// `start_sourcing` is false for `--check-config` / `--doctor`: validating a
+/// config must not begin fetching real traffic from the internet as a side
+/// effect of being asked whether the file parses.
+fn build_pool(mut config: ClientConfig, start_sourcing: bool) -> Result<EntryPool, String> {
+    apply_paranoid(&mut config, start_sourcing);
+    // Envelope pacing changes what a handshake COSTS, so it has to change the
+    // budget too. Handshake bytes leave only on a schedule token, and a
+    // low-bitrate cover trace has multi-second idle gaps and a very sparse
+    // upstream side, so a multi-round-trip Noise handshake simply cannot finish
+    // inside the 10s default - it is not a slow network, it is arithmetically
+    // unreachable. Turning on pacing with stock timeouts would otherwise brick
+    // every carrier, which is a terrible property for the strongest posture: the
+    // user opts into more safety and gets no tunnel. Raise the floor here, once,
+    // rather than expecting every operator to know this.
+    let mut handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
+    if mirage_transport_reality::pacing_active() {
+        // Derive the floor from the ENVELOPE, not from a constant. Handshake
+        // bytes leave only on a schedule token, so the cover's worst gap is the
+        // worst per-message latency - and a realistic browse capture with
+        // reading gaps has a 12s one, which a fixed 60s floor cannot absorb
+        // across a multi-message exchange. That showed up as flakiness rather
+        // than failure: the same configuration connected or did not depending on
+        // where in the schedule the handshake landed.
+        let floor = mirage_transport_reality::paced_handshake_budget()
+            .unwrap_or(PACED_HANDSHAKE_FLOOR)
+            .max(PACED_HANDSHAKE_FLOOR);
+        if handshake_timeout < floor {
+            tracing::warn!(
+                configured_secs = config.handshake_timeout_secs,
+                raised_to_secs = floor.as_secs(),
+                "envelope pacing is on: raising the handshake budget to what THIS cover \
+                 envelope can actually deliver. Sparse cover means a slow connect - that is \
+                 the envelope being a budget, not a fault"
+            );
+            handshake_timeout = floor;
+        }
+    }
     let failure_backoff = Duration::from_secs(config.entry_failure_backoff_secs);
 
     // Collect EVERY configured carrier transport as a candidate (priority
@@ -2349,6 +2675,7 @@ fn build_pool(mut config: ClientConfig) -> Result<EntryPool, String> {
                 vless_uuid: None,                              // stamped below
                 pad_enabled: false,                            // stamped below
                 quic_obfs_disable: false,                      // stamped below
+                wu_evasion: false,                             // stamped below
                 carrier_tls: false,                            // stamped below
                 carrier_tls_sni: None,                         // stamped below
                 ech_config_list: base.ech_config_list.clone(), // inherit from the base entry
@@ -2414,6 +2741,7 @@ fn build_pool(mut config: ClientConfig) -> Result<EntryPool, String> {
             vless_uuid: None,          // set below if vless_uuid_hex is configured
             pad_enabled: false,        // set by build_pool()
             quic_obfs_disable: false,  // set by build_pool()
+            wu_evasion: false,         // set by build_pool()
             carrier_tls: false,        // set by build_pool()
             carrier_tls_sni: None,     // set by build_pool()
             ech_config_list: None,     // set by build_pool()
@@ -2492,6 +2820,15 @@ fn build_pool(mut config: ClientConfig) -> Result<EntryPool, String> {
     if config.quic_obfs_disable {
         for entry in &mut entries {
             entry.quic_obfs_disable = true;
+        }
+    }
+
+    // Stamp the Wu-2023 evasion preamble flag (printable prefix on the
+    // high-entropy carriers - obfuscated QUIC and Shadowsocks-2022 - so the flow
+    // clears the GFW's fully-encrypted-traffic classifier).
+    if config.wu_evasion {
+        for entry in &mut entries {
+            entry.wu_evasion = true;
         }
     }
 
@@ -2772,7 +3109,9 @@ impl Client {
     /// pool (credentials, transports, discovery) but does not dial anything yet.
     pub fn new(config: Config) -> Result<Self, String> {
         Ok(Self {
-            pool: Arc::new(build_pool(config.0)?),
+            // A library caller building a Client intends to connect, so Proteus
+            // sources its cover the same way the daemon's would.
+            pool: Arc::new(build_pool(config.0, true)?),
         })
     }
 
@@ -3021,7 +3360,27 @@ pub async fn cli_main() {
 
     if check_only {
         let local_bind_chk = config.local_bind.clone();
-        let pool = match build_pool(config) {
+        // Capture before `config` moves into the builder. Reported because a
+        // Proteus mismatch does not merely look different, it HANGS the session:
+        // one end frames and the other does not.
+        let proteus_chk = {
+            // `apply_paranoid` has not run yet, so paranoid implies Proteus here
+            // exactly as it will there.
+            let sw = config.proteus.clone().or_else(|| {
+                config
+                    .paranoid
+                    .then_some(mirage_common::proteus_switch::ProteusSwitch::On(true))
+            });
+            let mode = sw.as_ref().and_then(|p| p.mode()).map(str::to_owned);
+            let profile = config
+                .proteus_profile
+                .clone()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(mirage_cover::default_library_dir);
+            (mode, profile, config.proteus_profile.is_some())
+        };
+        // Validating a config must not start fetching real traffic.
+        let pool = match build_pool(config, false) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("mirage-client config ERROR: {e}");
@@ -3055,6 +3414,19 @@ pub async fn cli_main() {
                 vl,
                 pk
             );
+        }
+        let (mode, profile, pinned) = proteus_chk;
+        match mode {
+            Some(m) => {
+                let n = mirage_cover::count_traces(&profile);
+                let how = if pinned { "pinned" } else { "self-sourced" };
+                println!("  proteus:     {m} (bridge must match)");
+                println!("  cover:       {n} traces in {} ({how})", profile.display());
+                if n == 0 {
+                    println!("               none yet - sessions run UNPACED until one lands");
+                }
+            }
+            None => println!("  proteus:     off (bridge must match)"),
         }
         std::process::exit(0);
     }
@@ -3305,6 +3677,205 @@ async fn pin_clock_offset(config: &ClientConfig) {
     }
 }
 
+/// How long to wait for a self-sourced cover library before dialling anyway.
+///
+/// A browse capture is a real multi-page session with real reading gaps, so it
+/// takes tens of seconds; this covers one capture plus a retry. Long enough that
+/// an ordinary cold start just works, short enough that a client on a network
+/// where the sources are blocked finds out promptly rather than appearing hung.
+const COVER_WAIT_BUDGET: Duration = Duration::from_secs(90);
+
+/// Whether this process started the background cover recorder.
+///
+/// [`wait_for_cover`] must not wait on a directory nobody is filling: with
+/// `proteus_profile` pinned, self-sourcing is off by design, so an empty
+/// library there is a provisioning mistake to report rather than a race to
+/// wait out.
+static COVER_SOURCING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set to stop the background recorder. Shared with `mirage_cover::keep_fresh_until`,
+/// which checks it between captures so a stop never truncates a trace on disk.
+static COVER_STOP: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
+
+fn cover_stop_flag() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    std::sync::Arc::clone(
+        COVER_STOP.get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))),
+    )
+}
+
+/// Block until the configured Proteus library holds a trace, or the budget runs out.
+///
+/// This closes a startup race that is much sharper than it looks. Pacing is a
+/// property BOTH ends must agree on, and the session handshake runs inside the
+/// paced channel - so a client that dials before its first trace lands sends an
+/// unframed handshake to a bridge reading frame headers, which reads a nonsense
+/// length and drops the session. The user sees an unreachable bridge, with
+/// nothing anywhere pointing at "your cover library was empty for the first
+/// twenty seconds".
+///
+/// On a network where the cover sources are blocked the wait cannot succeed, so
+/// it is bounded and says exactly what to do. Dialling anyway is deliberate: it
+/// is the caller's tunnel, and a clear failure at the handshake beats refusing
+/// to start.
+/// Pull the bridge's cover library and write it into the local one.
+///
+/// This is what stops a client recording its own cover forever. Recording means
+/// making real HTTPS requests, un-tunnelled, from the user's own address, to
+/// sources that are frequently blocked exactly where this tool is needed. The
+/// bridge is well-connected and outside that network by assumption, it already
+/// keeps a library for its own downstream pacing, and we are already talking to
+/// it over an authenticated session - so it should be the one doing the
+/// fetching.
+///
+/// It also repairs joint replay. The up and down schedules are two halves of one
+/// captured flow, so they only stay coupled when both ends hold the same traces;
+/// two independently-recorded libraries give a pair a relationship no real flow
+/// has.
+///
+/// Deliberately NOT a bootstrap path: this needs a working tunnel, and a paced
+/// tunnel needs a library, so the first connection still comes from whatever the
+/// client already has. What it removes is every recording after that.
+async fn sync_cover_from_bridge(pool: &EntryPool) -> bool {
+    use mirage_discovery::cover_sync as cs;
+
+    let Some(profile) = mirage_transport_reality::pace_profile() else {
+        return false;
+    };
+    let root = std::path::PathBuf::from(&profile);
+    let Some(idx) = pool.pick_entry().await else {
+        return false;
+    };
+    let (timeout, bridge) = {
+        let e = &pool.entries[idx];
+        (e.handshake_timeout, e.bridge_addr.clone())
+    };
+
+    let mut any = false;
+    // The upstream class matters as much as the other two: replay is joint only
+    // when BOTH directions come from the same captured flow, so taking the
+    // bridge's downstream while keeping our own upstream would leave the pair
+    // with an up/down relationship no real flow has.
+    for (class, dir_name) in [
+        (cs::COVER_CLASS_BROWSE, "browse"),
+        (cs::COVER_CLASS_UPSTREAM, mirage_cover::UPSTREAM_CLASS),
+        (cs::COVER_CLASS_VIDEO, "video"),
+    ] {
+        let dir = root.join(dir_name);
+        // Send the digest of what we already hold so an unchanged library costs
+        // one round trip instead of re-sending a megabyte over a paced tunnel.
+        let have: Vec<Vec<u8>> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "csv"))
+            .filter_map(|p| std::fs::read(&p).ok())
+            .collect();
+        let digest = cs::library_digest(&have);
+
+        let session = match establish_session(&pool.entries[idx], timeout).await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!(bridge = %bridge, error = %e, "proteus: cover sync could not open a session");
+                return any;
+            }
+        };
+        match cs::fetch_cover_library(session, class, cs::COVER_MAX_TRACES, digest).await {
+            Ok(resp) if resp.status == cs::COVER_STATUS_OK && !resp.traces.is_empty() => {
+                if std::fs::create_dir_all(&dir).is_err() {
+                    continue;
+                }
+                // Write to a fresh index range rather than over the existing
+                // files: a half-written library is worse than a stale one, and
+                // the pacer may be reading these right now.
+                let mut written = 0usize;
+                for (i, t) in resp.traces.iter().enumerate() {
+                    let p = dir.join(format!("bridge{i}.csv"));
+                    if std::fs::write(&p, t).is_ok() {
+                        written += 1;
+                    }
+                }
+                info!(
+                    bridge = %bridge,
+                    class = dir_name,
+                    traces = written,
+                    "proteus: cover library synced from the bridge (replay is now joint, and \
+                     this client no longer needs to record its own)"
+                );
+                any = any || written > 0;
+            }
+            Ok(resp) if resp.status == cs::COVER_STATUS_UNCHANGED => {
+                debug!(class = dir_name, "proteus: bridge library unchanged");
+                any = true;
+            }
+            Ok(_) => debug!(
+                class = dir_name,
+                "proteus: bridge has no library for this class"
+            ),
+            Err(e) => {
+                debug!(bridge = %bridge, class = dir_name, error = %e, "proteus: cover sync failed")
+            }
+        }
+    }
+    any
+}
+
+async fn wait_for_cover() {
+    if !mirage_transport_reality::pacing_active() {
+        return;
+    }
+    let Some(profile) = mirage_transport_reality::pace_profile() else {
+        return;
+    };
+    let path = std::path::PathBuf::from(&profile);
+    if mirage_cover::count_traces(&path) > 0 {
+        return;
+    }
+    // Only wait if something is actually recording. With `proteus_profile`
+    // pinned, auto-sourcing is off by design - nothing will ever appear in that
+    // directory, so waiting would just be 90 seconds of delay before the same
+    // failure. The operator pointed us at a library; if it is empty that is a
+    // provisioning mistake to report, not a race to wait out.
+    if !COVER_SOURCING.load(std::sync::atomic::Ordering::Relaxed) {
+        warn!(
+            library = %profile,
+            "proteus: the configured library is empty and nothing is recording into it \
+             (proteus_profile is pinned, which turns self-sourcing off). Ship a library to \
+             that path, or unset proteus_profile to let this client record its own."
+        );
+        return;
+    }
+
+    info!(
+        library = %profile,
+        budget_secs = COVER_WAIT_BUDGET.as_secs(),
+        "proteus: waiting for the first cover trace before dialling (a paced bridge will \
+         refuse an unpaced client outright, so connecting now would fail with no tunnel)"
+    );
+    let started = std::time::Instant::now();
+    while started.elapsed() < COVER_WAIT_BUDGET {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let n = mirage_cover::count_traces(&path);
+        if n > 0 {
+            info!(
+                traces = n,
+                waited_secs = started.elapsed().as_secs(),
+                "proteus: cover ready, dialling"
+            );
+            return;
+        }
+    }
+    warn!(
+        library = %profile,
+        waited_secs = COVER_WAIT_BUDGET.as_secs(),
+        "proteus: no cover recorded within the budget, dialling ANYWAY - if the bridge is \
+         paced this will fail with zero bytes rather than connect unpaced. The usual cause is \
+         that the cover sources are unreachable from this network: set proteus_sources to \
+         your region or your own site list, or ship a library and point proteus_profile at it."
+    );
+}
+
 async fn run_daemon(config: ClientConfig, management_bind: Option<String>) {
     mirage_common::init_tracing();
     // One-shot clock-skew pin BEFORE any epoch-derived discovery, so a poisoned
@@ -3332,7 +3903,12 @@ async fn run_daemon(config: ClientConfig, management_bind: Option<String>) {
             destinations: config.cover_destinations.clone(),
         })
     };
-    let pool = Arc::new(build_pool(config).unwrap_or_else(|e| fatal(e)));
+    let pool = Arc::new(build_pool(config, true).unwrap_or_else(|e| fatal(e)));
+
+    // Do not dial until Proteus has something to wear. See `wait_for_cover`:
+    // an empty library against a paced bridge is not a weaker disguise, it is
+    // zero bytes and no tunnel.
+    wait_for_cover().await;
 
     info!(
         local_bind = %local_bind,
@@ -3392,7 +3968,7 @@ async fn run_daemon(config: ClientConfig, management_bind: Option<String>) {
                 "claiming fresh tokens for {claim_count} bridge entr{}...",
                 if claim_count == 1 { "y" } else { "ies" }
             );
-            claim_all_entries(&pool, Duration::from_secs(10)).await;
+            claim_all_entries(&pool, maintenance_handshake_timeout(&pool)).await;
         }
     }
 
@@ -3415,15 +3991,47 @@ async fn run_daemon(config: ClientConfig, management_bind: Option<String>) {
         });
     }
 
-    // Background token refresh loop: every 2 minutes, check each entry's
-    // fresh_tokens deque and request more from the bridge when below the
-    // low watermark.  Net cost: 1 token consumed per refresh, 8 returned.
+    // Background token refresh loop: check each entry's fresh_tokens deque and
+    // request more from the bridge when below the low watermark. Net cost: 1
+    // token consumed per refresh, 8 returned.
+    //
+    // The period is JITTERED (90-180 s) for the same reason the probe loop above
+    // is: a fixed 120 s cadence is a constant-period behavioural fingerprint. It
+    // matters more than it looks. On a paced carrier the envelope is only a few
+    // hundred kbit/s, so a refresh is no longer a rounding error on the wire - it
+    // is a visible periodic burst, and a metronome is exactly what a traffic
+    // analyst hopes to find.
     {
         let bg_pool = Arc::clone(&pool);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(120)).await;
-                refresh_low_entries(&bg_pool, Duration::from_secs(10)).await;
+                tokio::time::sleep(jitter_duration(
+                    Duration::from_secs(90),
+                    Duration::from_secs(180),
+                ))
+                .await;
+                refresh_low_entries(&bg_pool, maintenance_handshake_timeout(&bg_pool)).await;
+                // Pull the bridge's cover library once a tunnel works, so this
+                // client stops making its own un-tunnelled requests to sites
+                // that may be blocked where it runs - and so both ends replay
+                // the SAME captured flow, which is what makes replay joint.
+                //
+                // Here rather than in the startup preflight: that fires once and
+                // gives up. Measured, it ran before the bridge was listening,
+                // logged "no bridge reachable yet", and never retried, so the
+                // sync never happened on a run whose tunnel came up fine
+                // moments later.
+                if COVER_SOURCING.load(std::sync::atomic::Ordering::Relaxed)
+                    && bg_pool.egress_is_verified()
+                    && sync_cover_from_bridge(&bg_pool).await
+                {
+                    COVER_SOURCING.store(false, std::sync::atomic::Ordering::Relaxed);
+                    cover_stop_flag().store(true, std::sync::atomic::Ordering::Relaxed);
+                    info!(
+                        "proteus: using the bridge's cover library; this client will stop \
+                         recording its own"
+                    );
+                }
             }
         });
     }
@@ -3592,15 +4200,39 @@ fn destination_to_muxtarget(dest: &local_socks::Destination) -> Result<MuxTarget
                 }
             }
         }
-        local_socks::Destination::Domain(d, port) => MuxTarget::Domain {
-            domain: d.clone(),
-            port: *port,
-        },
+        local_socks::Destination::Domain(d, port) => {
+            // A `.mirage` address must NEVER leave as an ordinary domain. It is
+            // a hidden service's identity key, and handing it to the bridge as
+            // a hostname means it gets resolved - putting the address into a
+            // DNS query, in front of a resolver, for a destination whose whole
+            // purpose is to be unlocatable. Refuse until the rendezvous drivers
+            // exist to reach it properly.
+            if is_onion_address(d) {
+                return Err(format!(
+                    "{d} is a Mirage hidden-service address and cannot be reached yet - the                      rendezvous client is not built. Refusing rather than resolving it as a                      hostname, which would leak the address to a DNS resolver."
+                ));
+            }
+            MuxTarget::Domain {
+                domain: d.clone(),
+                port: *port,
+            }
+        }
     };
     // Fail fast on an unrepresentable target (non-LDH host, port 0) rather than
     // discovering it deep in open_local after burning a carrier.
     target.encode().map_err(|e| format!("target: {e}"))?;
     Ok(target)
+}
+
+/// Is this a Mirage hidden-service address?
+///
+/// Checked at every point a destination could leave this process, because the
+/// address IS the service's identity key: resolving it as a hostname puts it in
+/// a DNS query in front of a resolver, which defeats the entire point of a
+/// destination that is supposed to be unlocatable.
+fn is_onion_address(host: &str) -> bool {
+    host.to_ascii_lowercase()
+        .ends_with(mirage_onion::ONION_ADDRESS_SUFFIX)
 }
 
 /// Reuse a live carrier to `entry` with stream capacity, if one exists. Takes
@@ -3611,9 +4243,13 @@ fn destination_to_muxtarget(dest: &local_socks::Destination) -> Result<MuxTarget
 async fn reuse_carrier(entry: &BridgeEntry) -> Option<MuxConnection> {
     let mut carriers = entry.mux_carriers.lock().await;
     carriers.retain(|c| !c.is_closed());
+    // Reaping an idle carrier and re-dialing later is two more wire events. That
+    // is a fair trade normally (it frees a bridge session and a per-IP slot), but
+    // under pacing the carrier IS the cover: it must stay up and unchanging.
+    let paced = mirage_transport_reality::pacing_active();
     let mut idle_spare_kept = false;
     carriers.retain(|c| {
-        if c.open_stream_count() == 0 {
+        if !paced && c.open_stream_count() == 0 {
             if idle_spare_kept {
                 c.close();
                 return false;
@@ -3622,6 +4258,17 @@ async fn reuse_carrier(entry: &BridgeEntry) -> Option<MuxConnection> {
         }
         true
     });
+    // With envelope pacing on, a carrier is not just a pipe - it emits the cover
+    // envelope for its entire life. A SECOND carrier therefore doubles the cover
+    // on the wire, and every dial adds a distinct short-lived flow. Measured on a
+    // paced cluster, an idle client showed one busy secondary connection and a
+    // busy client showed two (10.0s each, carrying 2 paced records) - so dial
+    // churn tracks user activity and leaks exactly what the envelope exists to
+    // hide. Under pacing, reuse the live carrier regardless of stream count:
+    // one connection, one envelope, whatever the app is doing.
+    if mirage_transport_reality::pacing_active() {
+        return carriers.first().cloned();
+    }
     carriers
         .iter()
         .find(|c| c.open_stream_count() < MAX_STREAMS_PER_CARRIER)
@@ -3925,9 +4572,7 @@ async fn tunnel_flow(pool: Arc<EntryPool>, flow: mirage_tun::TcpFlow) -> Result<
                 // netstack flow slot + the bridge's upstream socket) instead of
                 // pinning it forever - mirrors the SOCKS mux path.
                 let started = Instant::now();
-                let res =
-                    mirage_socks5::copy_bidirectional_idle(flow, stream, MUX_STREAM_IDLE_TIMEOUT)
-                        .await;
+                let res = counted_copy_idle(flow, stream, MUX_STREAM_IDLE_TIMEOUT).await;
                 if let Ok((up, down)) = &res {
                     // H3: feed session goodput to the throttle detector.
                     pool.record_session_goodput(idx, up + down, started.elapsed())
@@ -4088,9 +4733,7 @@ async fn tunnel_one_mux(
                 // stream + the bridge's upstream socket) instead of pinning it
                 // forever; half-closes on EOF. Takes ownership of both streams.
                 let started = Instant::now();
-                let res =
-                    mirage_socks5::copy_bidirectional_idle(local, stream, MUX_STREAM_IDLE_TIMEOUT)
-                        .await;
+                let res = counted_copy_idle(local, stream, MUX_STREAM_IDLE_TIMEOUT).await;
                 if let Ok((up, down)) = &res {
                     // H3: feed session goodput to the throttle detector.
                     pool.record_session_goodput(idx, up + down, started.elapsed())
@@ -4618,6 +5261,14 @@ async fn carrier_tls_wrap(
     let builder = ClientConfig::builder_with_provider(provider);
     // ECH: when the invite delivered a CDN ECHConfigList, encrypt the real inner SNI
     // (RFC 9180 HPKE, hand-rolled in `crate::ech`). Else the standard TLS path.
+    //
+    // CAVEAT (JA3 conformance): this is rustls's default ClientHello, whose
+    // fingerprint is NOT a browser's (unlike the Reality carrier, which hand-builds
+    // a Chrome ClientHello in `tls_client_hello_gen`). ECH in the wild is sent almost
+    // only by browsers, so ECH advertised on a rustls JA3 is anomalous and can be a
+    // distinguisher. ECH still hides the inner SNI, but its blending value here is
+    // limited until this path emits a browser ClientHello (a full uTLS-equivalent
+    // session, which Rust lacks). Prefer ECH where the carrier already blends.
     let cfg = match ech_config_list {
         Some(list) => builder
             .with_ech(crate::ech::ech_mode(list).map_err(|e| format!("carrier tls ech: {e}"))?)
@@ -4643,6 +5294,22 @@ async fn carrier_tls_wrap(
 /// Wrap `tcp` for a meek/DoH/WS arm: real TLS when the entry has `carrier_tls`
 /// set, else a plain passthrough. `default_sni` is the front/cover host used
 /// when the client didn't configure an explicit `carrier_tls_sni`.
+/// The framing the WebSocket carrier adds per paced record, for `entry`.
+///
+/// Client -> server frames are masked (4 bytes the server direction does not
+/// pay), and when the carrier rides a client-originated TLS session to a
+/// terminating front ([`carrier_maybe_tls`]) each frame is additionally sealed
+/// in a TLS record. Both costs have to be in the pacer's size budget or every
+/// record lands off the captured envelope by the difference.
+fn ws_carrier(entry: &BridgeEntry) -> mirage_transport_reality::Carrier {
+    let c = mirage_transport_reality::Carrier::websocket_client();
+    if entry.carrier_tls {
+        c.over_tls()
+    } else {
+        c
+    }
+}
+
 async fn carrier_maybe_tls(
     tcp: TcpStream,
     entry: &BridgeEntry,
@@ -4700,6 +5367,7 @@ async fn establish_session(
                         } else {
                             Some(resolve_obfs_key(*obfs_key, entry))
                         },
+                        quic_wu_evasion: entry.wu_evasion,
                     },
                     bridge_sa,
                     timeout,
@@ -4708,6 +5376,20 @@ async fn establish_session(
             .await
             .map_err(|_| format!("hysteria2: timed out after {timeout:?}"))?
             .map_err(|e| format!("hysteria2: {e}"))?;
+            // Proteus ABOVE quinn. The datagram shaper beneath it fixes sizes and
+            // fills idle gaps but never delays a real datagram, so it does nothing
+            // about VOLUME - measured at 76x between an idle and a busy tunnel,
+            // separable on total bytes alone. Holding the PAYLOAD to the cover's
+            // envelope has to happen here, where backpressure reaches the
+            // application instead of confusing quinn's congestion controller.
+            let hy2_seed = stream.pace_seed();
+            let stream = mirage_transport_reality::maybe_pace_stream(
+                stream,
+                mirage_transport_reality::pacer::Dir::Up,
+                hy2_seed,
+                // QUIC: sizes are shaped below the transport, so the pump frame is handed down whole.
+                mirage_transport_reality::Carrier::raw(),
+            );
             return finish_carrier(stream, entry, client_sk, token, timeout).await;
         }
         TransportMode::H3 { hostname, obfs_key } => {
@@ -4733,11 +5415,21 @@ async fn establish_session(
             } else {
                 Some(resolve_obfs_key(*obfs_key, entry))
             };
-            let stream = mirage_transport_masque::h3::h3_client_connect(
+            let (stream, h3_seed) = mirage_transport_masque::h3::h3_client_connect(
                 bridge_sa, &hostname, &hostname, &path, timeout, h3_obfs,
             )
             .await
             .map_err(|e| format!("h3: {e}"))?;
+            // Proteus ABOVE quinn, same as hysteria2: the datagram shaper beneath
+            // fixes sizes and idle gaps but never delays a real datagram, so it
+            // cannot hold VOLUME to the envelope. Rate has to be enforced here.
+            let stream = mirage_transport_reality::maybe_pace_stream(
+                stream,
+                mirage_transport_reality::pacer::Dir::Up,
+                h3_seed,
+                // QUIC: sizes are shaped below the transport, so the pump frame is handed down whole.
+                mirage_transport_reality::Carrier::raw(),
+            );
             return finish_carrier(stream, entry, client_sk, token, timeout).await;
         }
         TransportMode::Dnstt { domain, resolver } => {
@@ -4755,22 +5447,29 @@ async fn establish_session(
     match &entry.transport {
         TransportMode::Raw => finish_carrier(bridge_sock, entry, client_sk, token, timeout).await,
         TransportMode::Ss2022 { psk } => {
-            let c = mirage_transport_shadowsocks::ss2022_client_dial(bridge_sock, psk, timeout)
-                .await
-                .map_err(|e| format!("ss2022: {e}"))?;
+            let c = mirage_transport_shadowsocks::ss2022_client_dial(
+                bridge_sock,
+                psk,
+                timeout,
+                entry.wu_evasion,
+            )
+            .await
+            .map_err(|e| format!("ss2022: {e}"))?;
             // Proteus: pace the SS carrier to the shared envelope (matched to the bridge).
             let seed = c.pace_seed();
             let c = mirage_transport_reality::maybe_pace_stream(
                 c,
                 mirage_transport_reality::pacer::Dir::Up,
                 seed,
+                // One SS-2022 AEAD chunk per record (34 B, not TLS's 21).
+                mirage_transport_reality::Carrier::ss2022(),
             );
             finish_carrier(c, entry, client_sk, token, timeout).await
         }
         TransportMode::WebSocket { path } => {
             let cover = ws_cover_host(&entry.bridge_addr);
             let stream = carrier_maybe_tls(bridge_sock, entry, cover, timeout).await?;
-            let c = mirage_transport_ws::ws_client_connect(
+            let (c, ws_seed) = mirage_transport_ws::ws_client_connect(
                 stream,
                 &entry.bridge_x25519_pk,
                 entry.obfs_secret.as_ref(),
@@ -4780,6 +5479,15 @@ async fn establish_session(
             )
             .await
             .map_err(|e| format!("websocket: {e}"))?;
+            // Proteus on the mux carrier's WebSocket. This is the long-lived
+            // connection every browser request rides, so it is the one whose
+            // envelope a censor gets the most samples of.
+            let c = mirage_transport_reality::maybe_pace_stream(
+                c,
+                mirage_transport_reality::pacer::Dir::Up,
+                ws_seed,
+                ws_carrier(entry),
+            );
             finish_carrier(c, entry, client_sk, token, timeout).await
         }
         TransportMode::Reality {
@@ -5157,6 +5865,7 @@ async fn dial_hysteria2(
         } else {
             Some(resolve_obfs_key(obfs_key, entry))
         },
+        quic_wu_evasion: entry.wu_evasion,
     };
 
     let hy2_stream = tokio::time::timeout(
@@ -5167,6 +5876,20 @@ async fn dial_hysteria2(
     .map_err(|_| format!("hysteria2: timed out after {timeout:?}"))?
     .map_err(|e| format!("hysteria2: {e}"))?;
 
+    // Proteus above quinn, exactly as the mux dial path does. This is NOT
+    // optional: the bridge paces EVERY hysteria2 accept, and the pacer adds
+    // framing, so an unpaced client here is a protocol mismatch that hangs the
+    // connection - not a weaker disguise. Pacing is a per-connection property
+    // both ends must agree on, so every dial path for a paced carrier has to
+    // pace, not just the common one.
+    let hy2_seed = hy2_stream.pace_seed();
+    let hy2_stream = mirage_transport_reality::maybe_pace_stream(
+        hy2_stream,
+        mirage_transport_reality::pacer::Dir::Up,
+        hy2_seed,
+        // QUIC: sizes are shaped below the transport, so the pump frame is handed down whole.
+        mirage_transport_reality::Carrier::raw(),
+    );
     let hy2_stream = pad_stream_if_enabled(hy2_stream, entry);
     let mut session = tokio::time::timeout(
         timeout,
@@ -5186,7 +5909,7 @@ async fn dial_hysteria2(
     if entry.circuit_relay {
         run_circuit_relay(local, peer, session, entry, extra_hops).await
     } else {
-        let res = copy_bidirectional(&mut local, &mut session).await;
+        let res = counted_copy(&mut local, &mut session).await;
         let _ = session.shutdown().await;
         let _ = local.shutdown().await;
         log_copy_result(peer, &entry.bridge_addr, res)
@@ -5233,7 +5956,7 @@ async fn dial_h3(
 
     // Obfs ON by default (config password -> invite secret -> pubkey default),
     // matching the always-obfuscating bridge.
-    let h3_stream = mirage_transport_masque::h3::h3_client_connect(
+    let (h3_stream, h3_seed) = mirage_transport_masque::h3::h3_client_connect(
         bridge_sa,
         &hostname,
         &hostname,
@@ -5248,6 +5971,13 @@ async fn dial_h3(
     .await
     .map_err(|e| format!("h3: {e}"))?;
 
+    let h3_stream = mirage_transport_reality::maybe_pace_stream(
+        h3_stream,
+        mirage_transport_reality::pacer::Dir::Up,
+        h3_seed,
+        // QUIC: sizes are shaped below the transport, so the pump frame is handed down whole.
+        mirage_transport_reality::Carrier::raw(),
+    );
     let h3_stream = pad_stream_if_enabled(h3_stream, entry);
     let mut session = tokio::time::timeout(
         timeout,
@@ -5267,7 +5997,7 @@ async fn dial_h3(
     if entry.circuit_relay {
         run_circuit_relay(local, peer, session, entry, extra_hops).await
     } else {
-        let res = copy_bidirectional(&mut local, &mut session).await;
+        let res = counted_copy(&mut local, &mut session).await;
         let _ = session.shutdown().await;
         let _ = local.shutdown().await;
         log_copy_result(peer, &entry.bridge_addr, res)
@@ -5307,7 +6037,7 @@ async fn dial_dnstt(
     if entry.circuit_relay {
         run_circuit_relay(local, peer, session, entry, extra_hops).await
     } else {
-        let res = copy_bidirectional(&mut local, &mut session).await;
+        let res = counted_copy(&mut local, &mut session).await;
         let _ = session.shutdown().await;
         let _ = local.shutdown().await;
         log_copy_result(peer, &entry.bridge_addr, res)
@@ -5357,6 +6087,18 @@ async fn dial_meek(
     .await;
 
     apply_vless_if_needed(&mut c, entry.vless_uuid, timeout).await?;
+    // Proteus on the meek carrier. One paced token becomes exactly one HTTP POST:
+    // meek's driver fires a POST per flush and the pump flushes after every frame,
+    // so the observable unit and the schedule token line up. The seed comes from
+    // the auth nonce the server reads out of that same first POST, so both halves
+    // replay one captured flow with no extra exchange.
+    let c = mirage_transport_reality::maybe_pace_stream(
+        c,
+        mirage_transport_reality::pacer::Dir::Up,
+        mirage_transport_meek::meek_pace_seed(&auth_frame),
+        // HTTP-mediated: no fixed per-record cost to size against.
+        mirage_transport_reality::Carrier::raw(),
+    );
     let c = pad_stream_if_enabled(c, entry);
     let mut session = tokio::time::timeout(
         timeout,
@@ -5376,7 +6118,7 @@ async fn dial_meek(
     if entry.circuit_relay {
         run_circuit_relay(local, peer, session, entry, extra_hops).await
     } else {
-        let res = copy_bidirectional(&mut local, &mut session).await;
+        let res = counted_copy(&mut local, &mut session).await;
         let _ = session.shutdown().await;
         let _ = local.shutdown().await;
         log_copy_result(peer, &entry.bridge_addr, res)
@@ -5444,7 +6186,7 @@ async fn dial_webrtc(
         if entry.circuit_relay {
             run_circuit_relay(local, peer, session, entry, extra_hops).await
         } else {
-            let res = copy_bidirectional(&mut local, &mut session).await;
+            let res = counted_copy(&mut local, &mut session).await;
             let _ = session.shutdown().await;
             let _ = local.shutdown().await;
             log_copy_result(peer, &entry.bridge_addr, res)
@@ -5484,6 +6226,19 @@ async fn dial_doh(
     .map_err(|e| format!("doh: {e}"))?;
 
     apply_vless_if_needed(&mut c, entry.vless_uuid, timeout).await?;
+    // Proteus on the DoH carrier. DoH rides meek's server machinery on the bridge,
+    // which paces every session it accepts - so an unpaced dial here is a framing
+    // mismatch that hangs, not a weaker disguise. The seed comes from the auth
+    // nonce meek put in the first POST, which the server reads from that same
+    // frame.
+    let doh_seed = c.pace_seed();
+    let c = mirage_transport_reality::maybe_pace_stream(
+        c,
+        mirage_transport_reality::pacer::Dir::Up,
+        doh_seed,
+        // HTTP-mediated: no fixed per-record cost to size against.
+        mirage_transport_reality::Carrier::raw(),
+    );
     let c = pad_stream_if_enabled(c, entry);
     let mut session = tokio::time::timeout(
         timeout,
@@ -5503,7 +6258,7 @@ async fn dial_doh(
     if entry.circuit_relay {
         run_circuit_relay(local, peer, session, entry, extra_hops).await
     } else {
-        let res = copy_bidirectional(&mut local, &mut session).await;
+        let res = counted_copy(&mut local, &mut session).await;
         let _ = session.shutdown().await;
         let _ = local.shutdown().await;
         log_copy_result(peer, &entry.bridge_addr, res)
@@ -5576,23 +6331,30 @@ async fn dial_with_sock(
 
     match &entry.transport {
         TransportMode::Ss2022 { psk } => {
-            let c = mirage_transport_shadowsocks::ss2022_client_dial(bridge_sock, psk, timeout)
-                .await
-                .map_err(|e| {
-                    warn!(
-                        peer = %peer,
-                        bridge = %entry.bridge_addr,
-                        error = %e,
-                        "ss2022 carrier handshake failed"
-                    );
-                    format!("ss2022: {e}")
-                })?;
+            let c = mirage_transport_shadowsocks::ss2022_client_dial(
+                bridge_sock,
+                psk,
+                timeout,
+                entry.wu_evasion,
+            )
+            .await
+            .map_err(|e| {
+                warn!(
+                    peer = %peer,
+                    bridge = %entry.bridge_addr,
+                    error = %e,
+                    "ss2022 carrier handshake failed"
+                );
+                format!("ss2022: {e}")
+            })?;
             // Proteus: pace the SS carrier to the shared envelope (matched to the bridge).
             let seed = c.pace_seed();
             let mut c = mirage_transport_reality::maybe_pace_stream(
                 c,
                 mirage_transport_reality::pacer::Dir::Up,
                 seed,
+                // One SS-2022 AEAD chunk per record (34 B, not TLS's 21).
+                mirage_transport_reality::Carrier::ss2022(),
             );
             apply_vless_if_needed(&mut c, entry.vless_uuid, timeout).await?;
             let c = pad_stream_if_enabled(c, entry);
@@ -5612,7 +6374,7 @@ async fn dial_with_sock(
             if entry.circuit_relay {
                 run_circuit_relay(local, peer, session, entry, extra_hops).await
             } else {
-                let res = copy_bidirectional(&mut local, &mut session).await;
+                let res = counted_copy(&mut local, &mut session).await;
                 let _ = session.shutdown().await;
                 let _ = local.shutdown().await;
                 log_copy_result(peer, &entry.bridge_addr, res)
@@ -5624,7 +6386,7 @@ async fn dial_with_sock(
             let stream = carrier_maybe_tls(bridge_sock, entry, cover, timeout)
                 .await
                 .map_err(|e| format!("websocket: {e}"))?;
-            let mut c = mirage_transport_ws::ws_client_connect(
+            let (mut c, ws_seed) = mirage_transport_ws::ws_client_connect(
                 stream,
                 &entry.bridge_x25519_pk,
                 entry.obfs_secret.as_ref(),
@@ -5643,6 +6405,17 @@ async fn dial_with_sock(
                 format!("websocket: {e}")
             })?;
             apply_vless_if_needed(&mut c, entry.vless_uuid, timeout).await?;
+            // Proteus on the WebSocket carrier (this also covers VLESS, which
+            // rides it). One paced token becomes exactly one WebSocket Binary
+            // frame, because the pump flushes after every frame and the ws
+            // carrier frames on flush - so the envelope a censor sees is the
+            // replayed one, not whatever the app happened to write.
+            let c = mirage_transport_reality::maybe_pace_stream(
+                c,
+                mirage_transport_reality::pacer::Dir::Up,
+                ws_seed,
+                ws_carrier(entry),
+            );
             let c = pad_stream_if_enabled(c, entry);
             let mut session = tokio::time::timeout(
                 timeout,
@@ -5660,7 +6433,7 @@ async fn dial_with_sock(
             if entry.circuit_relay {
                 run_circuit_relay(local, peer, session, entry, extra_hops).await
             } else {
-                let res = copy_bidirectional(&mut local, &mut session).await;
+                let res = counted_copy(&mut local, &mut session).await;
                 let _ = session.shutdown().await;
                 let _ = local.shutdown().await;
                 log_copy_result(peer, &entry.bridge_addr, res)
@@ -5696,7 +6469,8 @@ async fn dial_with_sock(
             .await
             .map_err(|_| format!("reality handshake timed out after {timeout:?}"))?
             .map_err(|e| format!("reality: {e}"))?;
-            // Shaper-v2: opt-in envelope pacing (MIRAGE_REALITY_PACE), matched to
+            // Proteus: envelope pacing (`proteus` in the config, or MIRAGE_PROTEUS
+            // in the environment), matched to
             // the bridge which paces every authenticated session. Off by default
             // (returns the carrier unchanged). Client writes upstream -> `Up`.
             let mut reality = mirage_transport_reality::maybe_pace(
@@ -5721,7 +6495,7 @@ async fn dial_with_sock(
             if entry.circuit_relay {
                 run_circuit_relay(local, peer, session, entry, extra_hops).await
             } else {
-                let res = copy_bidirectional(&mut local, &mut session).await;
+                let res = counted_copy(&mut local, &mut session).await;
                 let _ = session.shutdown().await;
                 let _ = local.shutdown().await;
                 log_copy_result(peer, &entry.bridge_addr, res)
@@ -5747,7 +6521,7 @@ async fn dial_with_sock(
             if entry.circuit_relay {
                 run_circuit_relay(local, peer, session, entry, extra_hops).await
             } else {
-                let res = copy_bidirectional(&mut local, &mut session).await;
+                let res = counted_copy(&mut local, &mut session).await;
                 let _ = session.shutdown().await;
                 let _ = local.shutdown().await;
                 log_copy_result(peer, &entry.bridge_addr, res)
@@ -5886,10 +6660,29 @@ fn select_circuit_extra_hops(pool: &EntryPool, entry_idx: usize) -> Vec<CircuitH
 
     // Pass 1 enforces subnet anti-affinity so a single operator (or a /24 an
     // adversary controls) cannot occupy two circuit positions and correlate
-    // entry+exit. Pass 2 relaxes it only if the pool is too small/homogeneous to
-    // fill the circuit otherwise - a working shorter circuit beats no circuit.
+    // entry+exit.
+    //
+    // Pass 2 relaxes that, and it must be a LAST RESORT rather than a way to pad
+    // a circuit to full length. Length and diversity are not interchangeable: the
+    // threat multi-hop exists to answer is one party seeing both who you are and
+    // where you are going, and a 3-hop circuit whose entry and exit share a /24
+    // hands exactly that to whoever owns the /24 - while a 2-hop circuit with
+    // distinct operators does not. Padding to full length with a colliding hop
+    // therefore buys a longer circuit that is WEAKER against the attack that
+    // matters, and it used to happen silently, so the user saw "3 hops" and
+    // believed they were covered.
+    //
+    // So: take every diverse hop available; only if that leaves NO circuit at all
+    // do we relax, because then the alternative really is no multi-hop. Either way
+    // a short or non-diverse outcome is reported rather than passed off as full
+    // protection.
     let mut hops: Vec<CircuitHop> = Vec::with_capacity(max_extra);
     for enforce_affinity in [true, false] {
+        // Only fall through to the relaxed pass when strict selection produced
+        // nothing; a partially-filled diverse circuit is kept as-is.
+        if !enforce_affinity && !hops.is_empty() {
+            break;
+        }
         for &i in &candidates {
             if hops.len() >= max_extra {
                 break;
@@ -5925,7 +6718,39 @@ fn select_circuit_extra_hops(pool: &EntryPool, entry_idx: usize) -> Vec<CircuitH
             break;
         }
     }
+    // Say plainly what the pool could actually provide. A circuit that is shorter
+    // than asked for, or that had to seat two hops in one subnet, is a materially
+    // weaker guarantee and the operator should know which one they got.
+    if hops.len() < max_extra {
+        warn!(
+            requested = max_extra,
+            built = hops.len(),
+            pool = pool.entries.len(),
+            "circuit: fewer hops than requested - the pool lacks bridges in \
+             distinct subnets. The circuit is short but every hop is on a \
+             separate network; add bridges from other operators to lengthen it."
+        );
+    }
+    if !subnets_all_distinct(&used_subnets) {
+        warn!(
+            hops = hops.len(),
+            "circuit: two hops share a subnet - a single operator on that network \
+             can see both ends of this circuit, which is the correlation multi-hop \
+             exists to prevent. Add bridges from other operators."
+        );
+    }
     hops
+}
+
+/// Are all recorded hop subnets distinct? (Hops with no derivable subnet - e.g. a
+/// hostname endpoint - cannot collide by this test and are simply not recorded.)
+fn subnets_all_distinct(used: &[Vec<u8>]) -> bool {
+    for (i, a) in used.iter().enumerate() {
+        if used[i + 1..].contains(a) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Extend an established circuit by one hop over the existing hop-0 session
@@ -6191,6 +7016,16 @@ where
         ConnectTarget::Ipv4(addr, port) => (addr.to_string(), *port),
         ConnectTarget::Ipv6(addr, port) => (addr.to_string(), *port),
     };
+    // Same refusal as the mux path: a `.mirage` address is a hidden service's
+    // identity key, and letting it travel as an ordinary hostname means an exit
+    // resolves it - putting the address in a DNS query for a destination whose
+    // entire purpose is to be unlocatable.
+    if is_onion_address(&host) {
+        return Err(format!(
+            "{host} is a Mirage hidden-service address and cannot be reached yet - the \
+             rendezvous client is not built. Refusing rather than resolving it as a hostname."
+        ));
+    }
     // Send SOCKS5 success reply - the circuit takes the role of the upstream.
     send_success_reply_for_internal(&mut local)
         .await
@@ -6477,6 +7312,99 @@ where
 static TOTAL_BYTES_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TOTAL_BYTES_DOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Wraps the APP-SIDE stream of a tunnel copy (the SOCKS client or the TUN flow)
+/// and tallies bytes into the process-wide counters AS THEY FLOW, not at close.
+/// The app side is copied both ways, so reading from it is upload (app->bridge)
+/// and writing to it is download (bridge->app). This makes the live throughput
+/// readout (management API + GUI) reflect an in-progress transfer instead of
+/// only jumping when the connection ends. Covers every carrier + TUN uniformly.
+struct CountingStream<S> {
+    inner: S,
+}
+
+impl<S> CountingStream<S> {
+    fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let r = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &r {
+            let n = buf.filled().len() - before;
+            if n > 0 {
+                TOTAL_BYTES_UP.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
+        r
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &r {
+            TOTAL_BYTES_DOWN.fetch_add(*n as u64, Ordering::Relaxed);
+        }
+        r
+    }
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if let std::task::Poll::Ready(Ok(n)) = &r {
+            TOTAL_BYTES_DOWN.fetch_add(*n as u64, Ordering::Relaxed);
+        }
+        r
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// `copy_bidirectional` with live byte accounting on the app side.
+async fn counted_copy<A, B>(a: &mut A, b: &mut B) -> std::io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut counted = CountingStream::new(a);
+    copy_bidirectional(&mut counted, b).await
+}
+
+/// Idle-aware bidirectional copy (SOCKS mux + TUN) with live app-side accounting.
+async fn counted_copy_idle<A, B>(a: A, b: B, idle: Duration) -> std::io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    mirage_socks5::copy_bidirectional_idle(CountingStream::new(a), b, idle).await
+}
+
 fn log_copy_result(
     peer: std::net::SocketAddr,
     bridge: &str,
@@ -6484,8 +7412,7 @@ fn log_copy_result(
 ) -> Result<(), String> {
     match res {
         Ok((l2s, s2l)) => {
-            TOTAL_BYTES_UP.fetch_add(l2s, Ordering::Relaxed);
-            TOTAL_BYTES_DOWN.fetch_add(s2l, Ordering::Relaxed);
+            // Bytes were already tallied live by CountingStream; here we only log.
             info!(
                 peer = %peer,
                 bridge = %bridge,
@@ -6817,6 +7744,45 @@ async fn probe_all_entries(pool: &EntryPool, probe_timeout: Duration, stagger_ma
 /// Token deque length below which the background loop triggers a refresh.
 const FRESH_TOKEN_LOW_WATERMARK: usize = 3;
 
+/// Handshake budget for the BACKGROUND maintenance dials (token claim/refresh).
+///
+/// These used a hardcoded 10s, which silently breaks the strongest posture: under
+/// envelope pacing a handshake byte can only leave on a schedule token, and a
+/// low-bitrate cover trace has multi-second idle gaps, so the Noise handshake
+/// routinely needs longer than 10s. Measured on a paced cluster, EVERY refresh
+/// failed with "handshake timed out after 10s" and the client fell back to the
+/// finite bootstrap pool - i.e. paranoid mode quietly stopped renewing
+/// credentials and would eventually lose access to the bridge. Each dead attempt
+/// also left a distinctive ~10s, 2-record connection on the wire.
+///
+/// So take the configured per-entry handshake budget (which an operator running a
+/// paced carrier must already have raised for the data path to work at all) and
+/// never go below the old default, so an unpaced deployment is unchanged.
+/// Smallest handshake budget that a PACED carrier can realistically meet. A paced
+/// handshake advances only when the schedule fires, so this is set by the cover
+/// trace's gaps rather than by the network.
+const PACED_HANDSHAKE_FLOOR: Duration = Duration::from_secs(60);
+
+fn maintenance_handshake_timeout(pool: &EntryPool) -> Duration {
+    const FLOOR: Duration = Duration::from_secs(10);
+    // Under pacing the floor has to be higher. Handshake bytes leave only on a
+    // schedule token and a low-bitrate cover trace has multi-second idle gaps, so
+    // 10s is not a slow network - it is arithmetically unreachable. An operator
+    // who turns on pacing without also raising `handshake_timeout_secs` would
+    // otherwise get the credential-starvation failure back by default.
+    let floor = if mirage_transport_reality::pacing_active() {
+        PACED_HANDSHAKE_FLOOR
+    } else {
+        FLOOR
+    };
+    pool.entries
+        .iter()
+        .map(|e| e.handshake_timeout)
+        .max()
+        .unwrap_or(floor)
+        .max(floor)
+}
+
 /// Enable TCP keepalive on a bridge carrier socket. Now that a mux carrier is
 /// LONG-LIVED (one session serving many streams), an idle carrier can be
 /// silently killed by an on-path NAT / stateful-firewall idle timeout;
@@ -6965,15 +7931,22 @@ async fn try_claim_entry(
         }
 
         TransportMode::Ss2022 { psk } => {
-            let c = mirage_transport_shadowsocks::ss2022_client_dial(bridge_sock, psk, timeout)
-                .await
-                .map_err(|e| format!("ss2022: {e}"))?;
+            let c = mirage_transport_shadowsocks::ss2022_client_dial(
+                bridge_sock,
+                psk,
+                timeout,
+                entry.wu_evasion,
+            )
+            .await
+            .map_err(|e| format!("ss2022: {e}"))?;
             // Proteus: pace the SS carrier to the shared envelope (matched to the bridge).
             let seed = c.pace_seed();
             let mut c = mirage_transport_reality::maybe_pace_stream(
                 c,
                 mirage_transport_reality::pacer::Dir::Up,
                 seed,
+                // One SS-2022 AEAD chunk per record (34 B, not TLS's 21).
+                mirage_transport_reality::Carrier::ss2022(),
             );
             apply_vless_if_needed(&mut c, entry.vless_uuid, timeout).await?;
             let c = pad_stream_if_enabled(c, entry);
@@ -6992,7 +7965,12 @@ async fn try_claim_entry(
             // red-team #4: wrap the carrier TCP in client-originated TLS when the
             // entry opts in, so the claim's HTTP rides encrypted to a TLS front.
             let stream = carrier_maybe_tls(bridge_sock, entry, cover, timeout).await?;
-            let mut c = mirage_transport_ws::ws_client_connect(
+            // Paced like every other WS connection. This is NOT optional: the
+            // bridge paces every WS accept it takes, and the pacer adds framing,
+            // so pacing one side only is a protocol MISMATCH that hangs the
+            // connection outright - not merely a weaker disguise. Pacing is a
+            // per-connection property both ends must agree on.
+            let (mut c, ws_seed) = mirage_transport_ws::ws_client_connect(
                 stream,
                 &entry.bridge_x25519_pk,
                 entry.obfs_secret.as_ref(),
@@ -7003,6 +7981,12 @@ async fn try_claim_entry(
             .await
             .map_err(|e| format!("websocket: {e}"))?;
             apply_vless_if_needed(&mut c, entry.vless_uuid, timeout).await?;
+            let c = mirage_transport_reality::maybe_pace_stream(
+                c,
+                mirage_transport_reality::pacer::Dir::Up,
+                ws_seed,
+                ws_carrier(entry),
+            );
             let c = pad_stream_if_enabled(c, entry);
             let mut s = tokio::time::timeout(
                 timeout,
@@ -7226,15 +8210,22 @@ async fn try_refresh_entry(
         }
 
         TransportMode::Ss2022 { psk } => {
-            let c = mirage_transport_shadowsocks::ss2022_client_dial(bridge_sock, psk, timeout)
-                .await
-                .map_err(|e| format!("ss2022: {e}"))?;
+            let c = mirage_transport_shadowsocks::ss2022_client_dial(
+                bridge_sock,
+                psk,
+                timeout,
+                entry.wu_evasion,
+            )
+            .await
+            .map_err(|e| format!("ss2022: {e}"))?;
             // Proteus: pace the SS carrier to the shared envelope (matched to the bridge).
             let seed = c.pace_seed();
             let mut c = mirage_transport_reality::maybe_pace_stream(
                 c,
                 mirage_transport_reality::pacer::Dir::Up,
                 seed,
+                // One SS-2022 AEAD chunk per record (34 B, not TLS's 21).
+                mirage_transport_reality::Carrier::ss2022(),
             );
             apply_vless_if_needed(&mut c, entry.vless_uuid, timeout).await?;
             let c = pad_stream_if_enabled(c, entry);
@@ -7253,7 +8244,12 @@ async fn try_refresh_entry(
             // red-team #4: wrap the carrier TCP in client-originated TLS when the
             // entry opts in, so the refresh's HTTP rides encrypted to a TLS front.
             let stream = carrier_maybe_tls(bridge_sock, entry, cover, timeout).await?;
-            let mut c = mirage_transport_ws::ws_client_connect(
+            // Paced like every other WS connection. This is NOT optional: the
+            // bridge paces every WS accept it takes, and the pacer adds framing,
+            // so pacing one side only is a protocol MISMATCH that hangs the
+            // connection outright - not merely a weaker disguise. Pacing is a
+            // per-connection property both ends must agree on.
+            let (mut c, ws_seed) = mirage_transport_ws::ws_client_connect(
                 stream,
                 &entry.bridge_x25519_pk,
                 entry.obfs_secret.as_ref(),
@@ -7264,6 +8260,12 @@ async fn try_refresh_entry(
             .await
             .map_err(|e| format!("websocket: {e}"))?;
             apply_vless_if_needed(&mut c, entry.vless_uuid, timeout).await?;
+            let c = mirage_transport_reality::maybe_pace_stream(
+                c,
+                mirage_transport_reality::pacer::Dir::Up,
+                ws_seed,
+                ws_carrier(entry),
+            );
             let c = pad_stream_if_enabled(c, entry);
             let mut s = tokio::time::timeout(
                 timeout,
@@ -7504,10 +8506,15 @@ async fn serve_management(
                     let _ = sock.write_all(resp.as_bytes()).await;
                     return;
                 }
-                pool.trigger_rediscovery();
-                let body = "{\"ok\":true}";
+                // Rate-limited server-side so a scripted local caller can't turn
+                // this into a rendezvous query flood (429 when throttled).
+                let (status_line, body) = if pool.trigger_rediscovery() {
+                    ("200 OK", "{\"ok\":true}")
+                } else {
+                    ("429 Too Many Requests", "{\"ok\":false,\"throttled\":true}")
+                };
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                     body.len(),
                     body
                 );
@@ -7748,7 +8755,8 @@ async fn run_doctor(argv: &[String]) {
     };
 
     let local_bind = config.local_bind.clone();
-    let pool = match build_pool(config) {
+    // Doctor diagnoses, it does not start background work.
+    let pool = match build_pool(config, false) {
         Ok(p) => p,
         Err(e) => {
             println!("[FAIL] config invalid: {e}");
@@ -7924,6 +8932,32 @@ fn format_status(status: &serde_json::Value, bridges: &serde_json::Value) -> Str
         if mc == 1 { "" } else { "s" },
         if ms == 1 { "" } else { "s" }
     );
+    // Posture + discovery (parity with the GUI's status view).
+    let paranoid = status["paranoid"].as_bool().unwrap_or(false);
+    let egress = status["egress_verified"].as_bool().unwrap_or(false);
+    let _ = writeln!(
+        out,
+        "  posture  {}  |  egress {}",
+        if paranoid { "paranoid" } else { "standard" },
+        if egress { "verified" } else { "unverified" }
+    );
+    if let Some(chans) = status["discovery_channels"].as_array() {
+        let names: Vec<&str> = chans.iter().filter_map(|c| c.as_str()).collect();
+        if !names.is_empty() {
+            let dcount = status["discovered_count"].as_u64().unwrap_or(0);
+            let walking = if status["discovery_active"].as_bool().unwrap_or(false) {
+                "  |  walking now"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                out,
+                "  discovery {}  |  {dcount} bridge{} found{walking}",
+                names.join("+"),
+                if dcount == 1 { "" } else { "s" }
+            );
+        }
+    }
     match bridges.as_array() {
         Some(arr) if !arr.is_empty() => {
             let _ = writeln!(out, "  bridges (per-network transport health, learned):");
@@ -8104,6 +9138,58 @@ mod self_adversary_witness_tests {
 mod success_recording_tests {
     use super::*;
 
+    #[test]
+    fn proteus_coverage_matches_the_carriers_that_actually_pace() {
+        // The dial paths that call `maybe_pace`/`maybe_pace_stream` are the
+        // ground truth; `wears_proteus` is a claim ABOUT them, and a claim that
+        // drifts is worse than none - it would silence the warning for a carrier
+        // that stopped being paced. Pinned here so the two move together.
+        let covered = || {
+            vec![
+                TransportMode::Reality {
+                    sni: "example.com".into(),
+                    tls_cert_verify_pk: None,
+                    tls_fingerprint: None,
+                },
+                TransportMode::WebSocket { path: "/".into() },
+                TransportMode::Ss2022 { psk: [0u8; 32] },
+                TransportMode::Meek {
+                    front_domain: "cdn.example.com".into(),
+                    path: "/".into(),
+                },
+                TransportMode::Doh {
+                    front_domain: "dns.example.com".into(),
+                },
+            ]
+        };
+        for t in covered() {
+            let e = test_entry(t);
+            assert!(
+                e.wears_proteus(),
+                "{} is paced on both ends, so it must not be reported uncovered",
+                e.describe_mode()
+            );
+        }
+
+        let uncovered = || {
+            vec![
+                TransportMode::Raw,
+                TransportMode::Dnstt {
+                    domain: "t.example.com".into(),
+                    resolver: "1.1.1.1:53".parse().unwrap(),
+                },
+            ]
+        };
+        for t in uncovered() {
+            let e = test_entry(t);
+            assert!(
+                !e.wears_proteus(),
+                "{} has no pacing on either end, so claiming coverage would be a lie",
+                e.describe_mode()
+            );
+        }
+    }
+
     fn test_entry(transport: TransportMode) -> BridgeEntry {
         BridgeEntry {
             bridge_addr: "127.0.0.1:443".to_string(),
@@ -8127,6 +9213,7 @@ mod success_recording_tests {
             fs_unsupported_until: Arc::new(AtomicU64::new(0)),
             vless_uuid: None,
             pad_enabled: false,
+            wu_evasion: false,
             quic_obfs_disable: false,
             carrier_tls: false,
             carrier_tls_sni: None,
@@ -8322,6 +9409,165 @@ mod success_recording_tests {
         assert!(matches!(entry.next_credentials().1, PresentedToken::Fs(_)));
     }
 
+    /// Regression: background token claim/refresh used a hardcoded 10s handshake
+    /// budget, which is shorter than a PACED handshake can possibly complete in
+    /// (a low-bitrate cover trace has multi-second idle gaps and handshake bytes
+    /// only leave on a schedule token). Measured on a paced cluster, every
+    /// refresh failed and the client silently fell back to the finite bootstrap
+    /// token pool - paranoid mode stopped renewing credentials and would
+    /// eventually lose the bridge. The budget must follow the configured
+    /// per-entry handshake timeout, while never dropping below the old default
+    /// so unpaced deployments are unchanged.
+    #[test]
+    fn maintenance_dials_inherit_the_configured_handshake_budget() {
+        let mk = |secs: u64| {
+            let mut e = test_entry(reality());
+            e.handshake_timeout = Duration::from_secs(secs);
+            e
+        };
+        let pool_of = |entries: Vec<BridgeEntry>| {
+            EntryPool::new(
+                entries,
+                Duration::from_secs(0),
+                Arc::new(tokio::sync::Notify::new()),
+                Vec::new(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(SuccessRateMap::new()),
+                NetworkFingerprint::unknown(),
+            )
+        };
+        // A paced deployment raises the handshake budget; maintenance must use it,
+        // not the old hardcoded 10s that made refresh fail every time.
+        assert_eq!(
+            maintenance_handshake_timeout(&pool_of(vec![mk(120)])),
+            Duration::from_secs(120)
+        );
+        // Mixed pool: the most patient entry sets the budget, so one fast entry
+        // cannot starve a paced one.
+        assert_eq!(
+            maintenance_handshake_timeout(&pool_of(vec![mk(5), mk(90), mk(30)])),
+            Duration::from_secs(90)
+        );
+        // Floor (unpaced): a short configured budget never lowers maintenance
+        // below the historical 10s default. Under pacing the floor is higher -
+        // see PACED_FLOOR - because a paced handshake cannot finish in 10s.
+        assert_eq!(
+            maintenance_handshake_timeout(&pool_of(vec![mk(2)])),
+            Duration::from_secs(10)
+        );
+    }
+
+    /// Length and diversity are not interchangeable. A 3-hop circuit whose entry
+    /// and exit sit in one /24 hands both ends to whoever owns that /24 - the
+    /// exact correlation multi-hop exists to prevent - while a 2-hop circuit
+    /// across distinct operators does not. Padding to full length with a
+    /// colliding hop must therefore NOT happen while a diverse (shorter) circuit
+    /// is available; relaxing is only justified when the alternative is no
+    /// circuit at all.
+    #[test]
+    fn circuit_prefers_a_short_diverse_path_over_a_long_colliding_one() {
+        // A token is needed only because hop selection spends one per hop; its
+        // contents are irrelevant to subnet selection.
+        let dummy_token = mirage_discovery::token::CapabilityToken {
+            token_id: [0u8; 32],
+            bridge_ed25519_pk: [0u8; 32],
+            expires_at: u64::MAX,
+            signature: [0u8; 64],
+        };
+        let entry_at = |addr: &str, pk: u8| {
+            let mut e = test_entry(reality());
+            e.bridge_addr = addr.to_string();
+            e.bridge_x25519_pk = [pk; 32];
+            e.credentials = Credentials::Invite {
+                tokens: Arc::new(vec![dummy_token.clone()]),
+                cursor: Arc::new(AtomicUsize::new(0)),
+                fs_tokens: Arc::new(Vec::new()),
+                fs_cursor: Arc::new(AtomicUsize::new(0)),
+            };
+            e
+        };
+        let pool_of = |entries: Vec<BridgeEntry>| {
+            EntryPool::new(
+                entries,
+                Duration::from_secs(0),
+                Arc::new(tokio::sync::Notify::new()),
+                Vec::new(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(SuccessRateMap::new()),
+                NetworkFingerprint::unknown(),
+            )
+        };
+
+        // Entry in 10.0.0/24; one candidate in a DIFFERENT /24 and one that would
+        // collide with the entry. The colliding one must not be seated just to
+        // reach full length.
+        let pool = pool_of(vec![
+            entry_at("10.0.0.1:443", 1),
+            entry_at("10.9.9.2:443", 2),
+            entry_at("10.0.0.3:443", 3),
+        ]);
+        let hops = select_circuit_extra_hops(&pool, 0);
+        // Map the selected hops back to their pool entries to read their addrs.
+        let mut flat: Vec<Vec<u8>> = vec![hop_affinity_subnet("10.0.0.1:443").unwrap()];
+        for h in &hops {
+            let e = pool
+                .entries
+                .iter()
+                .find(|e| e.bridge_x25519_pk == h.bridge_x25519_pk)
+                .expect("hop came from the pool");
+            flat.extend(hop_affinity_subnet(&e.bridge_addr));
+        }
+        assert!(
+            subnets_all_distinct(&flat),
+            "no two circuit positions may share a subnet while a diverse path exists"
+        );
+
+        // Degenerate pool - every candidate collides with the entry. Here relaxing
+        // is the only way to get any multi-hop at all, so a circuit must still be
+        // built (and the code warns about it).
+        let pool2 = pool_of(vec![
+            entry_at("10.0.0.1:443", 1),
+            entry_at("10.0.0.2:443", 2),
+        ]);
+        assert!(
+            !select_circuit_extra_hops(&pool2, 0).is_empty(),
+            "a homogeneous pool must still yield a circuit rather than none"
+        );
+    }
+
+    /// Every recurring background network activity must be jittered, not ticked.
+    /// Discovery is the most exposed of them - it reaches third-party relays,
+    /// resolvers and DHT nodes from the user's real IP before any tunnel exists -
+    /// so a fixed period is a stable behavioural signature that survives any
+    /// change of transport underneath it. This pins the jitter window actually
+    /// used for the walk, and that it stays centred on the operator's configured
+    /// interval rather than quietly drifting the rate.
+    #[test]
+    fn recurring_background_activity_is_jittered_not_metronomic() {
+        for secs in [60u64, 300, 900] {
+            let interval = Duration::from_secs(secs);
+            let (lo, hi) = (interval.mul_f64(0.75), interval.mul_f64(1.25));
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..200 {
+                let d = jitter_duration(lo, hi);
+                assert!(d >= lo && d <= hi, "{d:?} outside [{lo:?}, {hi:?}]");
+                seen.insert(d.as_millis());
+            }
+            assert!(
+                seen.len() > 50,
+                "a jittered period must actually vary, got {} distinct values",
+                seen.len()
+            );
+            // Centred on the configured interval: the operator asked for this
+            // rate and jitter must not silently halve or double it.
+            let mid = (lo + hi) / 2;
+            assert_eq!(
+                mid, interval,
+                "jitter window must straddle the configured interval"
+            );
+        }
+    }
+
     #[test]
     fn egress_gate_transitions() {
         let pool = EntryPool::new(
@@ -8378,12 +9624,54 @@ mod success_recording_tests {
         // task selects on - this is what `POST /api/rediscover` drives.
         let waiter = tokio::spawn(async move { trigger.notified().await });
         tokio::task::yield_now().await;
-        pool.trigger_rediscovery();
+        assert!(pool.trigger_rediscovery(), "first manual walk fires");
         // The notified future resolves promptly once triggered.
         tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
             .expect("rediscover trigger must wake the discovery waiter")
             .expect("waiter task joins");
+
+        // An immediate second trigger is rate-limited (a scripted local flood
+        // can't spin the discovery loop): the same-second call is throttled.
+        assert!(
+            !pool.trigger_rediscovery(),
+            "a second manual walk within the min interval must be throttled"
+        );
+    }
+
+    #[tokio::test]
+    async fn counting_stream_tallies_live_and_by_direction() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // CountingStream wraps the APP side of a tunnel copy. In a real copy the
+        // engine READS from the app (upload) and WRITES to the app (download), so:
+        // reads -> UP, writes -> DOWN, counted as the bytes move (not at close).
+        let up0 = TOTAL_BYTES_UP.load(Ordering::Relaxed);
+        let down0 = TOTAL_BYTES_DOWN.load(Ordering::Relaxed);
+
+        let (app, mut peer) = tokio::io::duplex(4096);
+        let mut counted = CountingStream::new(app);
+
+        // Download: 250 bytes written toward the app -> DOWN += 250.
+        counted.write_all(&[7u8; 250]).await.unwrap();
+        counted.flush().await.unwrap();
+        let mut d = vec![0u8; 250];
+        peer.read_exact(&mut d).await.unwrap();
+
+        // Upload: 100 bytes the app produces, read out by the copy -> UP += 100.
+        peer.write_all(&[9u8; 100]).await.unwrap();
+        let mut u = vec![0u8; 100];
+        counted.read_exact(&mut u).await.unwrap();
+
+        assert_eq!(
+            TOTAL_BYTES_UP.load(Ordering::Relaxed) - up0,
+            100,
+            "reads from the app side count as upload"
+        );
+        assert_eq!(
+            TOTAL_BYTES_DOWN.load(Ordering::Relaxed) - down0,
+            250,
+            "writes to the app side count as download"
+        );
     }
 
     #[test]
@@ -8615,12 +9903,13 @@ mod success_recording_tests {
         }))
         .expect("paranoid config deserializes");
         assert!(!cfg.reality_enabled, "off before normalization");
-        apply_paranoid(&mut cfg);
+        // No sourcing: this asserts config normalisation, not network behaviour.
+        apply_paranoid(&mut cfg, false);
         assert!(cfg.reality_enabled, "reality forced on");
         assert!(cfg.pad_enabled, "handshake padding forced on");
         assert!(!cfg.allow_insecure_raw, "fail closed - no raw fallback");
         assert_eq!(
-            cfg.reality_pace.as_deref(),
+            cfg.proteus.as_ref().and_then(|p| p.mode()),
             Some("replay"),
             "wears a real recorded cover shape"
         );
@@ -8629,8 +9918,8 @@ mod success_recording_tests {
             "invite": "mirage://x", "local_bind": "127.0.0.1:1080"
         }))
         .unwrap();
-        apply_paranoid(&mut plain);
-        assert!(!plain.reality_enabled && plain.reality_pace.is_none());
+        apply_paranoid(&mut plain, false);
+        assert!(!plain.reality_enabled && plain.proteus.is_none());
     }
 
     #[test]
@@ -8817,7 +10106,10 @@ mod embeddable_api_tests {
 
 #[cfg(test)]
 mod h3_throttle_tests {
-    use super::{is_throttled, GOODPUT_MIN_BYTES, GOODPUT_MIN_SECS, GOODPUT_THROTTLE_FRACTION};
+    use super::{
+        is_onion_address, is_throttled, GOODPUT_MIN_BYTES, GOODPUT_MIN_SECS,
+        GOODPUT_THROTTLE_FRACTION,
+    };
 
     #[test]
     fn no_baseline_is_never_throttled() {
@@ -8865,4 +10157,23 @@ mod h3_throttle_tests {
     const _: () = assert!(GOODPUT_MIN_BYTES >= 64 * 1024);
     const _: () = assert!(GOODPUT_MIN_SECS >= 1.0);
     const _: () = assert!(GOODPUT_THROTTLE_FRACTION > 0.1 && GOODPUT_THROTTLE_FRACTION < 0.8);
+
+    #[test]
+    fn onion_addresses_are_recognised_before_they_can_leak() {
+        // A .mirage address IS the service's identity key. Treating it as an
+        // ordinary hostname puts it in a DNS query in front of a resolver, for
+        // a destination whose entire purpose is to be unlocatable - so the
+        // detection has to be exact and case-insensitive.
+        assert!(is_onion_address("abcd.mirage"));
+        assert!(
+            is_onion_address("ABCD.MIRAGE"),
+            "SOCKS hosts are not normalised"
+        );
+        assert!(is_onion_address("sub.example.mirage"));
+        // And must not swallow ordinary traffic.
+        assert!(!is_onion_address("example.com"));
+        assert!(!is_onion_address("mirage.example.com"));
+        assert!(!is_onion_address("notmirage"));
+        assert!(!is_onion_address(""));
+    }
 }

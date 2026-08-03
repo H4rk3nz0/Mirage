@@ -47,6 +47,16 @@ const MAX_DATA_FRAME: usize = 16 * 1024;
 /// with a plausible 404 (F11-M - a real origin never stays silent).
 const CONNECT_UDP_MARKER: &[u8] = b"connect-udp";
 
+/// Per-session pace seed, carried as the first DATA frame payload.
+///
+/// Envelope pacing needs both ends replaying the same trace from the same offset,
+/// and deriving that from a per-bridge key would give every session the identical
+/// envelope - a fixed shape repeated across sessions is its own fingerprint. It
+/// rides INSIDE the normal DATA framing rather than as raw bytes on the stream, so
+/// the exchange stays well-formed h3 to anything parsing it. Not a secret, and it
+/// authenticates nothing: the inner Noise handshake does that.
+const PACE_SEED_LEN: usize = 8;
+
 /// The nginx default 404 body, byte-for-byte, so a probe that reads it sees a
 /// stock origin rather than anything Mirage-shaped.
 const BENIGN_404_BODY: &str = "<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n<center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
@@ -738,14 +748,21 @@ pub async fn h3_client_connect(
     path: &str,
     deadline: Duration,
     obfs_key: Option<[u8; 32]>,
-) -> Result<H3Stream, TransportError> {
+) -> Result<(H3Stream, u64), TransportError> {
     tokio::time::timeout(deadline, async move {
         let bind: SocketAddr = "0.0.0.0:0".parse().expect("valid bind");
         let mut endpoint = match obfs_key {
             // Gecko/Salamander QUIC obfuscation: the UDP socket scrambles every
             // datagram so the wire shows no QUIC fingerprint.
-            Some(key) => mirage_quic_obfs::client_endpoint(bind, key)
-                .map_err(|e| TransportError::Other(format!("h3: obfs client endpoint: {e}")))?,
+            // No Wu-2023 preamble here: MASQUE mimics real h3 to a CDN, so a
+            // printable prefix would break that pretext rather than help.
+            Some(key) => mirage_quic_obfs::client_endpoint_shaped(
+                bind,
+                key,
+                false,
+                h3_quic_shape(false, &key),
+            )
+            .map_err(|e| TransportError::Other(format!("h3: obfs client endpoint: {e}")))?,
             None => quinn::Endpoint::client(bind)
                 .map_err(|e| TransportError::Other(format!("h3: client endpoint: {e}")))?,
         };
@@ -777,7 +794,22 @@ pub async fn h3_client_connect(
         // live for the connection's lifetime and drop with it - no leak. quinn
         // keeps the connection alive while the Endpoint handle (and the request
         // streams) are held.
-        Ok(H3Stream::new_client(send, recv, endpoint, control))
+        let mut stream = H3Stream::new_client(send, recv, endpoint, control);
+        let mut seed_bytes = [0u8; PACE_SEED_LEN];
+        getrandom::fill(&mut seed_bytes)
+            .map_err(|e| TransportError::Other(format!("h3: pace seed: {e}")))?;
+        {
+            use tokio::io::AsyncWriteExt as _;
+            stream
+                .write_all(&seed_bytes)
+                .await
+                .map_err(|e| TransportError::Other(format!("h3: pace seed write: {e}")))?;
+            stream
+                .flush()
+                .await
+                .map_err(|e| TransportError::Other(format!("h3: pace seed flush: {e}")))?;
+        }
+        Ok((stream, u64::from_le_bytes(seed_bytes)))
     })
     .await
     .map_err(|_| TransportError::Timeout(deadline))?
@@ -786,7 +818,26 @@ pub async fn h3_client_connect(
 /// Accept one H3 request on `conn`: drain the peer control stream + SETTINGS,
 /// accept the bidi request stream, read past its HEADERS frame, and return the
 /// stream as a byte pipe ready to carry the Mirage session.
-pub async fn h3_server_accept_conn(conn: quinn::Connection) -> Result<H3Stream, TransportError> {
+/// Accept an h3 CONNECT and return the byte stream plus the client's pace seed.
+///
+/// `deadline` bounds the WHOLE exchange. Every read here happens before any
+/// authentication, on a connection that has already taken a session permit, so an
+/// unbounded one lets anyone who can complete a QUIC handshake pin a permit
+/// indefinitely by opening a stream and then simply not writing - repeated until
+/// the bridge's session limit is exhausted. Nothing further along can rescue it:
+/// the caller's own handshake timeout only starts once this returns.
+pub async fn h3_server_accept_conn(
+    conn: quinn::Connection,
+    deadline: Duration,
+) -> Result<(H3Stream, u64), TransportError> {
+    tokio::time::timeout(deadline, h3_server_accept_conn_inner(conn))
+        .await
+        .map_err(|_| TransportError::Timeout(deadline))?
+}
+
+async fn h3_server_accept_conn_inner(
+    conn: quinn::Connection,
+) -> Result<(H3Stream, u64), TransportError> {
     recv_control_settings(&conn).await?;
     let (mut send, mut recv) = conn
         .accept_bi()
@@ -827,7 +878,63 @@ pub async fn h3_server_accept_conn(conn: quinn::Connection) -> Result<H3Stream, 
         return Err(TransportError::Auth("h3: benign probe answered with 404"));
     }
 
-    Ok(H3Stream::new(send, recv))
+    let mut stream = H3Stream::new(send, recv);
+    let mut seed_bytes = [0u8; PACE_SEED_LEN];
+    {
+        use tokio::io::AsyncReadExt as _;
+        stream
+            .read_exact(&mut seed_bytes)
+            .await
+            .map_err(|e| TransportError::Other(format!("h3: pace seed read: {e}")))?;
+    }
+    Ok((stream, u64::from_le_bytes(seed_bytes)))
+}
+
+/// Datagram-layer shaping for the h3 carrier, from the replay cover.
+///
+/// Same construction as the hysteria2 carrier: each endpoint shapes the direction
+/// it SENDS and sizes are clamped to what the path can carry. Every record is
+/// kept - QUIC's 1200-byte floor binds only datagrams carrying an Initial, so
+/// small records still shape the small datagrams that dominate a client's
+/// upstream - and a cover with nothing large enough for a full-size datagram
+/// warns rather than refusing, since the small ones are still worth shaping.
+fn h3_quic_shape(want_down: bool, key: &[u8; 32]) -> Option<mirage_quic_obfs::QuicShape> {
+    let seed = u64::from_le_bytes(key[..8].try_into().expect("key is 32 bytes"));
+    let tokens = mirage_transport_reality::pace_wire_sizes(want_down, seed)?;
+    let ceiling = mirage_quic_obfs::mtu_upper_bound_with_overhead();
+    // Split oversize records into the back-to-back MTU packets the wire would
+    // have made of them, rather than clamping each to one. See
+    // `mirage_transport_reality::fragment_to_mtu`.
+    let burst = mirage_transport_reality::min_positive_gap(&tokens);
+    let tokens = mirage_transport_reality::fragment_to_mtu(tokens, ceiling, burst);
+    if tokens.is_empty() {
+        return None;
+    }
+    // Keep every record. QUIC's 1200-byte floor applies only to datagrams carrying
+    // an Initial, so small cover records still shape the small datagrams that make
+    // up most of a client's upstream - discarding them would throw away the useful
+    // majority to guard against the oversized minority. Only warn when nothing in
+    // the cover could hold a full-size datagram, since those will go out unpadded.
+    let biggest = tokens.iter().map(|&(sz, _)| sz).max().unwrap_or(0);
+    if biggest < mirage_quic_obfs::QUIC_MIN_HANDSHAKE_RECORD {
+        tracing::warn!(
+            direction = if want_down { "down" } else { "up" },
+            largest_record = biggest,
+            needed_for_full_size = mirage_quic_obfs::QUIC_MIN_HANDSHAKE_RECORD,
+            "h3: cover has no record large enough for a full-size QUIC datagram - small \
+             datagrams are still shaped, oversized ones go out unpadded. Use a cover with \
+             larger records in this direction to close that."
+        );
+    }
+    let shape = mirage_quic_obfs::QuicShape { tokens };
+    tracing::info!(
+        direction = if want_down { "down" } else { "up" },
+        records = shape.tokens.len(),
+        max_size = shape.max_size(),
+        mean_gap_ms = shape.mean_gap().as_millis() as u64,
+        "h3: datagram shaping from the replay cover"
+    );
+    Some(shape)
 }
 
 /// Build a QUIC server endpoint bound to `addr` (ALPN h3, self-signed cert).
@@ -838,8 +945,14 @@ pub fn h3_server_endpoint(
 ) -> Result<quinn::Endpoint, TransportError> {
     let cfg = server_quinn_config(server_name)?;
     match obfs_key {
-        Some(key) => mirage_quic_obfs::server_endpoint(addr, cfg, key)
-            .map_err(|e| TransportError::Other(format!("h3: obfs server endpoint: {e}"))),
+        Some(key) => mirage_quic_obfs::server_endpoint_shaped(
+            addr,
+            cfg,
+            key,
+            false,
+            h3_quic_shape(true, &key),
+        )
+        .map_err(|e| TransportError::Other(format!("h3: obfs server endpoint: {e}"))),
         None => quinn::Endpoint::server(cfg, addr)
             .map_err(|e| TransportError::Other(format!("h3: server endpoint: {e}"))),
     }
@@ -901,6 +1014,46 @@ mod tests {
         assert_eq!(b, vec![0x09]);
     }
 
+    /// Regression: every read in the accept path happens BEFORE any
+    /// authentication, on a connection that has already taken a session permit.
+    /// Unbounded, a peer that completes the QUIC handshake and then simply stops
+    /// writing pins that permit for ever, and repeating it exhausts the bridge's
+    /// session limit - a remote unauthenticated denial of service needing no
+    /// credential at all. The whole exchange must be deadline-bounded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accept_is_deadline_bounded_against_a_silent_peer() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ep = h3_server_endpoint("127.0.0.1:0".parse().unwrap(), "h3.test", None).unwrap();
+        let addr = ep.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let incoming = ep.accept().await.expect("incoming");
+            let conn = incoming.await.expect("server handshake");
+            // A silent peer: completes QUIC, then never writes a request.
+            h3_server_accept_conn(conn, Duration::from_millis(300)).await
+        });
+
+        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_quinn_config().unwrap());
+        let _conn = endpoint
+            .connect(addr, "h3.test")
+            .unwrap()
+            .await
+            .expect("client connect");
+
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("accept must not outlive its deadline")
+            .expect("server task");
+        assert!(res.is_err(), "a silent peer must not be accepted");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "accept must give up near its deadline, took {:?}",
+            started.elapsed()
+        );
+    }
+
     /// A benign HTTP/3 probe (a `GET /` with no `connect-udp` marker) must get a
     /// well-formed nginx 404 - never the silent hang that fingerprints the
     /// bridge (F11-M).
@@ -913,7 +1066,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let incoming = ep.accept().await.expect("incoming");
             let conn = incoming.await.expect("server handshake");
-            let res = h3_server_accept_conn(conn).await;
+            let res = h3_server_accept_conn(conn, Duration::from_secs(5)).await;
             assert!(
                 matches!(res, Err(TransportError::Auth(_))),
                 "a benign probe must not authenticate as a Mirage session"
@@ -1007,7 +1160,9 @@ mod tests {
         let server = tokio::spawn(async move {
             let incoming = ep.accept().await.expect("incoming");
             let conn = incoming.await.expect("server handshake");
-            let mut s = h3_server_accept_conn(conn).await.expect("accept h3");
+            let (mut s, server_seed) = h3_server_accept_conn(conn, Duration::from_secs(5))
+                .await
+                .expect("accept h3");
             let mut got = vec![0u8; up_c.len()];
             s.read_exact(&mut got).await.expect("server read");
             assert_eq!(got, up_c, "server payload mismatch");
@@ -1015,9 +1170,10 @@ mod tests {
             s.flush().await.expect("server flush");
             // hold until client done
             tokio::time::sleep(Duration::from_millis(200)).await;
+            server_seed
         });
 
-        let mut c = h3_client_connect(
+        let (mut c, client_seed) = h3_client_connect(
             addr,
             "h3.test",
             "h3.test",
@@ -1033,6 +1189,14 @@ mod tests {
         c.read_exact(&mut got).await.expect("client read");
         assert_eq!(got, down, "client payload mismatch");
 
-        server.await.unwrap();
+        // Envelope pacing is only coherent if both ends replay the same trace from
+        // the same offset, so the seed the client sends must be the seed the server
+        // reads. A silent divergence here would have the two halves wearing
+        // unrelated shapes, which is worse than not pacing at all.
+        let server_seed = server.await.unwrap();
+        assert_eq!(
+            client_seed, server_seed,
+            "both endpoints must derive the same pace seed"
+        );
     }
 }

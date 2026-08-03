@@ -91,11 +91,14 @@ PY
 fi
 if [ "${PARANOID:-0}" = 1 ]; then
   # Paranoid mode: config-driven strong posture. Use with TRANSPORT=reality (for the
-  # reality cover config) and MIRAGE_REALITY_PACE_PROFILE=<lib> (mounted at /profile).
+  # reality cover config) and MIRAGE_PROTEUS_PROFILE=<lib> (mounted at /profile).
+  # The profile is pinned here rather than left to auto-sourcing: a test must
+  # replay a KNOWN envelope, and the containers have no route to the internet to
+  # record their own.
   python3 - "$WORK/cfg/bridge.json" "$WORK/cfg/client.json" <<'PY'
 import json,sys
 for p in sys.argv[1:3]:
-    d=json.load(open(p)); d.update({"paranoid":True,"reality_pace_profile":"/profile"})
+    d=json.load(open(p)); d.update({"paranoid":True,"proteus_profile":"/profile"})
     json.dump(d,open(p,'w'),indent=2)
 PY
 fi
@@ -146,17 +149,28 @@ podman network create --subnet "$SUBNET" "$NET" >/dev/null
 podman run -d --name mirage-dest --network "$NET" --ip "$DEST_IP" "$IMG" sh -c \
   'python3 -c "import sys; b=b\"MIRAGE_E2E_OK\"*8000; sys.stdout.buffer.write(b\"HTTP/1.1 200 OK\r\nContent-Length: \"+str(len(b)).encode()+b\"\r\nConnection: close\r\n\r\n\"+b)" > /resp; \
    exec socat TCP-LISTEN:80,reuseaddr,fork EXEC:"cat /resp"' >/dev/null
-# Optional: forward the shaper-v2 envelope-pacing opt-in to BOTH endpoints so a
-# reality run can be validated with pacing on (MIRAGE_REALITY_PACE=video|browse|replay).
-# For replay, also mount the real-capture profile CSV and point both ends at it.
+# Optional: forward the Proteus opt-in to BOTH endpoints so a reality run can be
+# validated with it on (MIRAGE_PROTEUS=on, or an explicit video|browse|replay).
+# Also mount the real-capture profile and point both ends at it: a test needs a
+# KNOWN envelope, and these containers cannot reach the internet to record one.
 # No-op when unset - the default carrier byte path is unchanged.
 PACE_ARG=()
-[ -n "${MIRAGE_REALITY_PACE:-}" ] && PACE_ARG=(-e "MIRAGE_REALITY_PACE=$MIRAGE_REALITY_PACE")
-if [ -n "${MIRAGE_REALITY_PACE_PROFILE:-}" ]; then
+# Forward RUST_LOG into both daemons. Without this the image's ENV wins and a
+# debug-level investigation silently produces no output, which reads as "the
+# thing I am measuring never happens".
+[ -n "${RUST_LOG:-}" ] && PACE_ARG+=(-e "RUST_LOG=$RUST_LOG")
+# Append, never assign: assigning here silently discarded anything set above
+[ -n "${MIRAGE_PROTEUS:-}" ] && PACE_ARG+=(-e "MIRAGE_PROTEUS=$MIRAGE_PROTEUS")
+if [ -n "${MIRAGE_PROTEUS_PROFILE_UP:-}" ]; then
+  # Per-direction cover: downstream shape from one capture, upstream from another.
+  PACE_ARG+=(-e "MIRAGE_PROTEUS_PROFILE_UP=/profile_up" \
+             -v "$MIRAGE_PROTEUS_PROFILE_UP:/profile_up:ro,Z")
+fi
+if [ -n "${MIRAGE_PROTEUS_PROFILE:-}" ]; then
   # Mount the profile path (a single trace file OR a directory library) at /profile;
   # the carrier's read_profile handles either (a dir = a random trace per session).
-  PACE_ARG+=(-e "MIRAGE_REALITY_PACE_PROFILE=/profile" \
-             -v "$MIRAGE_REALITY_PACE_PROFILE:/profile:ro,Z")
+  PACE_ARG+=(-e "MIRAGE_PROTEUS_PROFILE=/profile" \
+             -v "$MIRAGE_PROTEUS_PROFILE:/profile:ro,Z")
 fi
 podman run -d --name mirage-bridge --network "$NET" --ip "$BRIDGE_IP" \
   "${PACE_ARG[@]}" \

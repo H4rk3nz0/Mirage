@@ -1,7 +1,8 @@
 //! `hickory-resolver`-backed [`DnsTxtResolver`].
 //!
-//! Gated behind the `hickory` feature. Drop this in wherever the
-//! in-memory mock is used in production code - no other changes needed.
+//! Always compiled - there is no `hickory` feature, and no build-time feature
+//! flags at all. Drop this in wherever the in-memory mock is used in production
+//! code; no other changes needed.
 //!
 //! # Resolver selection
 //!

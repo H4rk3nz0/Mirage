@@ -21,10 +21,12 @@ path = "src/bin/mirage-pt-client.rs"
 [dependencies]
 mirage-circuit = { workspace = true }
 mirage-common = { workspace = true }
+mirage-cover = { workspace = true }
 mirage-crypto = { workspace = true }
 mirage-discovery = { workspace = true }
 mirage-runtime = { workspace = true }
 mirage-mux = { workspace = true }
+mirage-onion = { workspace = true }
 mirage-session = { workspace = true }
 mirage-socks5 = { workspace = true }
 # `net` feature: the HTTPS-Date time source for the clock-skew pin (below).

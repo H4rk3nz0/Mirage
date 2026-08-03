@@ -53,9 +53,13 @@ validated IPs are dialed directly, closing DNS-rebind.
 with its own single-use capability token and can peel only its own layer, so no
 single hop sees both the client and the destination.
 
-**Forward-secret capability tokens + revocation.** Bridge access tokens are
-epoch-scoped; compromising an online issuer cannot forge tokens for past epochs.
-Clients honour signed revocations and drop a revoked bridge from their pool.
+**Forward-secure capability tokens + revocation.** Bridge access tokens are
+epoch-scoped and carry an inline operator-to-epoch-subkey certificate, minted
+offline when the invite is generated (a fresh subkey per token, so an invite's
+batch cannot be linked into a cohort at the terminating bridge). The bridge
+verifies the certificate chain against the operator key, with a grace window for
+the previous key during rotation. Clients honour signed revocations and drop a
+revoked bridge from their pool.
 
 **Whole-device VPN, fail-closed.** In TUN mode the client installs the OS routes
 that actually capture traffic (a split-default) and a bypass route for each
