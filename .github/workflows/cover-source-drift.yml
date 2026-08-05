@@ -1,0 +1,109 @@
+name: Cover source drift
+
+# Detect rot in the Proteus cover-source lists.
+#
+# `crates/cover/src/packs.rs` names, per region, the sites cover traffic is
+# recorded FROM. Those entries are REACHABILITY CLAIMS, and they decay without
+# anyone touching the repo: a site swaps its player for one that inlines no
+# manifest, an API starts demanding credentials, a CDN adds a header check, an
+# instance goes offline. Every one of those presents at runtime as a video class
+# that quietly never fills - the exact silent failure the pack system exists to
+# prevent - so something has to ask the question on a schedule.
+#
+# On its first run this caught `diode.zone` answering HTTP 502.
+#
+# ## What this job does NOT tell you
+#
+# A GitHub runner sits in a US/EU datacentre. It can confirm that a source's
+# DISCOVERY still works - that the API shape, the page markup and the manifest
+# format are what the adapter expects. It cannot confirm that the source is
+# reachable from Iran, China, Russia or Turkey, which is the property the
+# regional packs actually claim. A green run here means "the adapter is not
+# broken", never "the pack works in-region".
+#
+# In-region reachability can only be checked from in-region. Run
+# `mirage-cover-record --sources <pack> --check-sources` on a host that is
+# actually there.
+
+on:
+  schedule:
+    # 08:00 UTC every Monday - an hour before the JA3 drift job, so a week's
+    # source breakage and fingerprint breakage surface together.
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  resolve:
+    name: Video sources still resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the recorder
+        run: cargo build -p mirage-cover --bin mirage-cover-record
+
+      - name: Probe every pack
+        id: probe
+        shell: bash
+        run: |
+          # `-e` OFF deliberately: a probe that aborts on the first unreachable
+          # host would report one failure and hide the rest, when the entire
+          # point is a complete picture of what still works. The explicit
+          # `exit 1` at the end is the only failure path.
+          set +e -uo pipefail
+          BIN=target/debug/mirage-cover-record
+          dead=""
+          {
+            echo "# Cover source drift"
+            echo
+            echo "Discovery only, from a GitHub runner. This does **not** test"
+            echo "in-region reachability - see the workflow header."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for pack in global ru ir cn tr; do
+            echo "::group::$pack"
+            # Never let one pack's network flakiness abort the loop; the
+            # per-pack exit code below is the signal.
+            "$BIN" --sources "$pack" --check-sources --low-bitrate \
+              > "out-$pack.txt" 2>&1 || true
+            cat "out-$pack.txt"
+            echo "::endgroup::"
+
+            {
+              echo "## \`$pack\`"
+              echo
+              echo '```'
+              cat "out-$pack.txt"
+              echo '```'
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            # A pack is DEAD when nothing in it resolved. One dead entry among
+            # several is not an outage - the resolver moves to the next, which
+            # is the whole reason a pack lists more than one - so partial rot is
+            # reported and does not fail the run.
+            if grep -qE ": 0/[0-9]+ video sources resolved" "out-$pack.txt"; then
+              dead="$dead $pack"
+            fi
+            # Surface partial rot as an annotation so it is visible without
+            # opening the log.
+            while read -r line; do
+              echo "::warning title=Cover source failed ($pack)::$line"
+            done < <(grep -F "FAIL" "out-$pack.txt" || true)
+          done
+
+          if [ -n "$dead" ]; then
+            echo "::error title=Cover sources exhausted::No video source resolved for:$dead. \
+          Proteus will record no video for those regions until this is fixed."
+            exit 1
+          fi
+          echo "All packs resolved at least one video source."

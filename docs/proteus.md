@@ -85,7 +85,7 @@ this exists to destroy. That was measured rather than assumed: an experiment tha
 steered larger records to moments when data was waiting - changing no timing and
 no total bytes, only which record went where - scored **0.699** separability
 against a 0.544 control, with size-marginal features winning. Any demand-following
-rate leaks the same way, more crudely. See `tools/shaper-eval/ALIGNMENT.md`.
+rate leaks the same way, more crudely.
 
 What DOES scale the bill is connected time. Cover only flows while a session is
 open, so the cost is `rate x session-hours`, not `rate x 24` unless clients stay
@@ -152,11 +152,106 @@ So set `proteus_sources`:
 The presets are **a starting point, not a guarantee**. Reachability changes without notice
 and varies by ISP inside one country. If you know your own network, name your own sites.
 
-Regional packs supply **browse** sources only. Video capture drives the PeerTube playlist
-API and domestic video platforms do not speak it, so video falls back to the global set -
-and the daemon warns rather than leaving a video class that silently never fills. Browse is
-the more important class anyway: it carries the tunnel's upstream and is all the lean tier
-uses.
+### Video sources are per-platform, and a regional pack must not reach abroad
+
+Video capture needs an HLS master playlist, and there is no universal route from a video
+page to one. So each source names its own discovery method: PeerTube publishes the manifest
+in a video-detail object; Rutube's page inlines nothing but its `/api/play/options/` is
+public; OK.ru inlines the manifest URL in the page itself, double-escaped inside JSON inside
+an HTML attribute. Adding a platform means adding the few requests that platform needs.
+
+| pack | video sources | discovery |
+|---|---|---|
+| `global` | The PeerTube set | video-detail API |
+| `ru` | Rutube, OK.ru | play-options API; inlined manifest |
+| `ir` | Aparat | video API, HLS with progressive fallback |
+| `cn` | Bilibili | playurl API, **DASH** |
+| `tr` | puhutv (NTV, Kral Pop live) | inlined manifest |
+| your own list | your pages, then the PeerTube set | inlined manifest |
+
+**Every regional pack is domestic-only.** Falling back to a global platform is the exact
+failure `proteus_sources` exists to prevent: the fetch fails, the video class never fills,
+and repeatedly reaching for a blocked host is itself the signal. If a region's domestic
+sources fail, it records **no video** rather than reaching abroad. Browse still records, and
+browse is the more important class anyway - it carries the tunnel's upstream and is all a
+lean budget uses. Only a custom list keeps the global set, as a last group, because a list of
+browse pages carries no claim that a manifest is findable on any of them.
+
+### Not every platform serves HLS
+
+Bilibili - the only source that is both reachable and ordinary on a Chinese network - serves
+no HLS at all. Its DASH representations are byte ranges into one file, so the recorder drives
+them with sequential `Range` requests paced at the representation's real bitrate. That is
+what a player's buffer does, and it is already how PeerTube's `#EXT-X-BYTERANGE` playlists
+are handled. Aparat uses the same path when its signed HLS redirector refuses and only the
+per-profile progressive files are available.
+
+### Video cover carries a stall the length of one segment
+
+Measured, and it applies to **every** source including the global default:
+
+| source | segment duration | worst stall in the capture |
+|---|---|---|
+| PeerTube (global default) | 4.0-4.6 s | 5.8 s |
+| OK.ru (`ru`) | ~6 s | 6.1 s |
+| Aparat (`ir`) | 10 s | 10.1 s |
+| NTV via puhutv (`tr`) | 10 s | 10.0 s |
+| Bilibili (`cn`, **ranged**) | recorder's choice | **1.9 s** |
+
+A realtime video capture waits each segment's true duration, because that is what makes the
+trace replayable as continuous cover - its average rate is then the stream's real bitrate. The
+consequence is that the tunnel inherits the silence: a 10 s segment is a 10 s stall. The
+capture is not defective. A real player genuinely is silent between segment fetches, so this
+is a faithful recording of a bursty process.
+
+But it means **no HLS source meets the default 2 s latency ceiling** - 4-10 s segments are the
+industry norm and sub-2 s is rare. Three things follow, and they are worth being blunt about:
+
+- **Raising the bandwidth budget does not fix it.** A bigger budget buys a fatter variant of
+  the same stream, with the same segment durations. Only the *bandwidth* ceiling responds to
+  the budget; this one does not.
+- **Retrying does not fix it.** Segment duration is a publisher property, not a per-video
+  accident, so another draw stalls identically. The recorder therefore does not retry a
+  realtime video capture for a stall - it used to spend three full 360 s recording budgets,
+  about 18 minutes, arriving at the same trace (measured on Aparat: 10.2 s, 13.3 s, 10.1 s).
+- **The ranged path does not have the problem**, because there the recorder chooses the
+  request size and sizes it to this very ceiling. That is a genuine latency advantage of
+  DASH/progressive sources, not just a way to reach China.
+
+So: use browse cover for latency-sensitive traffic. Video is the class that buys THROUGHPUT,
+and the price is a worst-case stall of one segment.
+
+**The request size follows the latency budget, not the other way round.** With HLS the
+segment durations are whatever the publisher chose; with ranges the recorder picks them, so
+it asks for the number of bytes that represents a fraction of `max_gap_secs` of media. Sizing
+by a fixed byte count instead is a trap worth recording: 512 KiB of Bilibili's 158 kbit/s
+rendition is **26.5 seconds** of media, so a realtime capture idled 26.5 s between requests
+against a 2 s ceiling and every capture was rejected - the video class for `cn` could not
+fill at all under auto-sourcing. The chunk also aims at 60% of the ceiling rather than all of
+it, because the stall a capture is judged on is the sleep *plus* the time to first byte of
+the next response.
+
+So the thing that kept whole regions out was never extraction difficulty - Bilibili's API is
+public and unauthenticated. It was that the recorder spoke one container format.
+
+### Platforms that fight extraction
+
+Some platforms actively defeat automated access, and no in-tree adapter keeps up with them
+for long. For those, `--hls-cmd` runs a command and records whatever HLS URL it prints:
+
+```sh
+mirage-cover-record ./library --mode video --hls-cmd 'yt-dlp -g https://example/watch?v=...'
+```
+
+That gives you an extractor's entire catalogue **without Mirage depending on one**. Nothing
+is installed, invoked or required unless you set it, so the shipped binary stays
+self-contained. Note that YouTube in particular is the wrong cover source in most of the
+regions here - it is blocked in China, Russia and Iran, so reaching for it is precisely the
+signal being avoided. It is defensible where it is genuinely ordinary, which is what this
+flag is for.
+
+The extractor's own requests are not part of the capture: discovery runs before recording and
+on a separate event log. They do still go out un-tunnelled, like every other discovery fetch.
 
 ### The cover host is announced in the clear
 
@@ -332,38 +427,48 @@ tunnel that never connects, and presents as an unreachable bridge rather than as
 cover-selection mistake. The recorder therefore rejects captures below a measured upstream
 floor rather than letting them reach the library.
 
-## Cost, and what the tiers actually change
+## Cost: set a budget, not a tier
 
 Continuous cover costs what the covered activity costs, forever, in both directions. Every
 recording reports its own figure.
 
 Measured on real Wikipedia sessions, page weight alone spans **1.87 to 8.21 GB/day**. The
-tiers are a ceiling on that number, and they work by **rejecting a capture and recording a
+budget is a ceiling on that number, and it works by **rejecting a capture and recording a
 different one** - never by making a cheaper-looking flow.
 
-| tier | ceiling | what it is for |
-|---|---|---|
-| `lean` (default) | 2.5 GB/day | Everything, unless a carrier is too slow. |
-| `balanced` | 6.0 GB/day | HEADROOM, not concealment - see below. |
+```json
+{ "proteus_max_gb_day": 6.0 }
+{ "proteus_max_gb_day": "unlimited" }
+```
 
-**A tier does not buy concealment, and the table further down is why.** Lean, balanced and
-the former `aggressive` tier all measured at the harness's noise floor, with the mean
-drifting very slightly the WRONG way as cover was added (lean 0.546, balanced 0.553,
-aggressive 0.556). More cover bought nothing an observer could not already fail to see.
+The default is **2.5 GB/day**. Above **6 GB/day** the recorder also sources video, because
+that is the point at which a video capture stops blowing the budget on its own; above
+**20 GB/day** it takes the best variant rather than the cheapest. Those thresholds are
+`classes_for_budget` and `wants_low_bitrate`, and they follow the number directly - there is
+no tier in between.
 
-What a tier does buy is throughput, because the envelope is simultaneously the disguise and
-the bandwidth budget: a record goes out per schedule token whether or not the app has data,
-so app bytes displace padding rather than adding to it. Total bytes on the wire are the same
-idle or busy - which is the point - but it also means the envelope's rate IS the user's
-throughput ceiling. On the same lean envelope a 120 KB transfer took 7 s over Reality and
-24 s over WebSocket; the WebSocket carrier was comfortable at balanced. So raise the tier
-when a carrier is too slow, never to be harder to see.
+**Tiers are gone, and the table further down is why.** `lean`, `balanced` and the former
+`aggressive` all measured at the harness's noise floor, with the mean drifting very slightly
+the WRONG way as cover was added (lean 0.546, balanced 0.553, aggressive 0.556). More cover
+bought nothing an observer could not already fail to see - so a name that reads as "more
+protection" while meaning "more spending" was getting picked for the wrong reason. Naming the
+quantity makes the trade explicit.
 
-`aggressive` was removed. It was uncapped, it preferred video captures, it measured no less
-detectable than lean, and it was the only tier that produced a tunnel which would not come
-up at all - a video flow opens with a quiet stretch that a faithfully replayed handshake can
-crawl past. Its name also read as "more protection" while meaning "no spending limit". Old
-configs naming it still load, mapped to `balanced`. Every trace in the library remains a real capture replayed verbatim; a tier only
+What the budget does buy is throughput, because the envelope is simultaneously the disguise
+and the bandwidth budget: a record goes out per schedule token whether or not the app has
+data, so app bytes displace padding rather than adding to it. Total bytes on the wire are the
+same idle or busy - which is the point - but it also means the envelope's rate IS the user's
+throughput ceiling. On a 2.5 GB/day envelope a 120 KB transfer took 7 s over Reality and 24 s
+over WebSocket; the WebSocket carrier was comfortable at 6. So raise the budget when a carrier
+is too slow, never to be harder to see.
+
+Old configs still load. `lean`/`cheap`/`metered` resolve to 2.5 GB/day and
+`balanced`/`aggressive`/`max` to 6.0, via `legacy_tier_budget`. Note that `aggressive` was
+UNCAPPED and is deliberately not honoured as such: it measured no less detectable than lean,
+and it was the only setting that produced a tunnel which would not come up at all - a video
+flow opens with a quiet stretch that a faithfully replayed handshake cannot crawl past.
+
+Every trace in the library remains a real capture replayed verbatim; a budget only
 decides which real flow gets worn. That distinction is the whole argument above: selection
 among real flows adds no entropy, so it costs nothing in detectability.
 
@@ -407,9 +512,9 @@ smoothest one delivers the most - at every budget, with no security term on the 
 of the trade. Burstiness buys nothing. It is not a dial between speed and stealth; it is
 waste.
 
-`tools/shaper-eval/capacity.py` measures that waste directly: simulate a fetch arriving at
-a random moment and compare its mean completion to what the capture's own mean rate would
-give if the bytes were evenly spread. Measured on the chained timeline the pacer actually
+That waste is measured directly by simulating a fetch arriving at a random moment and
+comparing its mean completion to what the capture's own mean rate would give if the bytes
+were evenly spread. Measured on the chained timeline the pacer actually
 replays, six captures each way:
 
 | cover | sustained | burstiness | worst gap | 120 KB fetch, p90 | efficiency |
@@ -523,6 +628,69 @@ prints a FLOOR derived from sample size, and the measured controls exceed it: va
 reliable, whoever quotes them. Compare an active cell against ITS OWN replicated control,
 never against the printed floor.
 
+### A session wears ONE class, not a mixture
+
+The heterogeneity fix below excluded the UPSTREAM class from the downstream pool. That was
+right but incomplete: the defect is not specific to upstream, it is **pooling classes of
+different rates into one chain at all**. Measured on the global pack, all realtime:
+
+| class | rate | span |
+|---|---|---|
+| browse | 494, 670, 960 kbit/s | 24-32 s |
+| video | 330 kbit/s | 360 s |
+
+A chain drawn from that pool swings about **2.9x within one session**, and phase-to-phase rate
+variance is exactly what raises the separability floor. A censor does not have to identify the
+class - only to notice a flow whose rate steps in a way a real session's does not.
+
+**Measured with the project's own distinguisher**, `mirage-adversary`'s 14-feature classifier
+over 300-record windows (6 real browse + 4 real video realtime captures, 40 sessions per cell,
+cover seeds 0-39 scored against reference seeds 1000-1039 so no file is compared with itself):
+
+| session construction | best separator | per-window AUC | 16 windows pooled | verdict |
+|---|---|---|---|---|
+| **pooled** vs real browse | `frac_max_record` | **0.807** | **1.000** | SEPARABLE, +0.263 over the bar |
+| **pooled** vs real video | `mean_abs_succ_diff` | **0.759** | **1.000** | SEPARABLE, +0.218 over the bar |
+| one class (browse) vs real browse | `lag1_autocorr` | 0.511 | 0.562 | indistinguishable, -0.041 |
+| one class (video) vs real video | `mean_run_length` | 0.517 | 0.599 | indistinguishable, -0.029 |
+| null control: real vs real | `lag1_autocorr` | 0.511 | 0.562 | indistinguishable, -0.041 |
+
+The floor at this sample size is 0.552. A pooled session was separable from **both** references -
+it resembles neither a browsing session nor a streaming one, because it is a chimera of the two -
+and pooling 16 windows drove it to a perfect 1.000. The one-class sessions sit on the null
+control, which is the correct answer: cover that is a real capture replayed should be exactly as
+hard to pick out as the real capture.
+
+The 14 features are all derived from record sizes, so that table is the SIZE axis. Projecting the
+same schedules onto their inter-record GAP sequence and running the same estimator over that
+instead (`tools/cover-sources/class-mixing-gaps.py`) finds the leak was just as large on timing,
+and equally closed:
+
+| session construction | best separator | per-window AUC | 16 windows pooled |
+|---|---|---|---|
+| **pooled** vs real browse gaps | `lag1_autocorr` | **0.808** | **1.000** |
+| one class (browse) vs real browse gaps | `size_stddev` | 0.506 | 0.532 |
+| one class (video) vs real video gaps | `frac_max_record` | 0.510 | 0.536 |
+
+(The feature names still say "size" there and mean "gap" - it is the same estimator pointed at a
+different observable, which is why it is reported separately rather than folded into the table
+above. It is not the shipped metric.)
+
+Both axes agree, which is what you would expect: chaining a 30 s browse capture onto a 360 s
+video one changes the record sizes AND the gaps between them, so the mixture is visible whichever
+one a censor looks at. This says nothing about the residual timing signal discussed further down,
+which is a different measurement against a live tunnel.
+
+So `read_profile` now selects ONE class per session from the shared seed and chains only that
+class's traces. Both endpoints sort the same directory names and derive the same seed, so they
+choose alike and replay stays joint. Coverage is unchanged - every class is still worn, just
+whole-session rather than interleaved, which is also closer to what a real user does: they
+watch a video OR read pages, not both in alternating four-second phases.
+
+If the chosen class is empty it falls through to the next, because an empty schedule does not
+degrade to unpaced - it HANGS the session with zero bytes through. That fail-closed property
+is deliberate and is why filling every class matters for availability, not just for cover.
+
 ### The cause was cover heterogeneity - most of it, anyway
 
 A library ROOT pooled every class into the downstream schedule, so a session drew either a
@@ -561,7 +729,7 @@ Mechanisms ruled out along the way, by evidence rather than argument: the size a
 is never read), dropped tokens (zero in every run), Nagle (`TCP_NODELAY` is set, and is the
 wrong control anyway - it governs small segments awaiting an ACK, not packing a backlog),
 carrier connection count (two client ports, not one per transfer), and TCP frame merging
-under load (`segments.py`: runs longer than one frame 0.3% idle against 0.4% active, and an
+under load (runs longer than one frame measured 0.3% idle against 0.4% active, with an
 unchanged size histogram).
 
 ### A per-window number is the wrong threat model
@@ -757,9 +925,9 @@ distinguisher over the two.
 | `scripts/podman-e2e/cover-traffic.sh` | Can a censor tell an idle tunnel from a busy one, on a real cluster? Run it with `NULL_CONTROL=1` first, every time. |
 | `examples/flow_auc` | Scores a captured pair. Prints the pooled-floor verdict, the max-T permutation verdict, and the pooling curve. |
 | `examples/feature_floor` | Which FEATURES are unstable on captures with nothing to find? Run before believing a near-floor result. |
-| `tools/shaper-eval/capacity.py` | What does a cover capture actually deliver, and how much of its budget is undeliverable? |
-| `tools/shaper-eval/segments.py` | Is an apparent leak TCP segmentation rather than the pacer? |
-| `tools/shaper-eval/alignment.py` | Why demand-following shaping is not allowed. |
+| `scripts/wire-auc/` | The same idle-vs-busy question with no root, no containers and no capture privileges - for hosts where the podman harness cannot run. |
+| `tools/cover-sources/class-mixing-auc.py` | Does a session's cover look like one real session, or like a mixture of two? Size axis. |
+| `tools/cover-sources/class-mixing-gaps.py` | The same question on the timing axis. |
 
 Four rules, each of which was learned by getting it wrong in this repository:
 
@@ -796,9 +964,9 @@ the third is about whether the harness is measuring the tunnel or itself.
   traffic at all in the active windows: with nothing to detect the harness must report
   ~0.5, and whatever it reports above that is the floor under every other number it prints.
 
-## Separability by tier and carrier
+## Separability by budget and carrier
 
-Every cost tier against every carrier the harness can stand up, from the censor's vantage
+Every cover budget against every carrier the harness can stand up, from the censor's vantage
 point: can an observer tell an idle tunnel from one carrying real traffic? Produced by
 `scripts/podman-e2e/tier-matrix.sh`, rendered with `scripts/podman-e2e/matrix-md.py`, and
 regenerable - do not hand-edit the table.
@@ -809,7 +977,9 @@ covered instead by a paced client-server pair test in `crates/transport-meek`, w
 proves the framing is symmetric and carries data but is not a censor-vantage number.
 
 <!-- MATRIX-TABLE-START -->
-The `aggressive` rows are retained deliberately: that tier no longer exists, and this table
+These rows are labelled with the tier names in force when they were measured (`lean` = 2.5
+GB/day, `balanced` = 6.0, `aggressive` = uncapped); the names are gone but the measurements
+stand. The `aggressive` rows are retained deliberately: that setting no longer exists, and this table
 is the evidence for removing it. It measured no less detectable than `lean` while costing
 unbounded bandwidth, and it is the only tier that produced a tunnel which would not come up.
 
@@ -835,7 +1005,7 @@ unbounded bandwidth, and it is the only tier that produced a tunnel which would 
 
 Read every cell against two floors. This run's control scored 0.581 with nothing to find; separately, the estimator maximises over 14 features and so scores above 0.5 on any data at all - 0.681 at 16 flows per class, 0.552 at 150. A cell is marked *(at floor)* when it clears neither, which means it is indistinguishable from no signal at its own sample size.
 
-**Verdict: no carrier leaks user activity above the harness's own noise, at any tier.**
+**Verdict: no carrier leaks user activity above the harness's own noise, at any budget.**
 Every measured cell sits at or below the floor. The single exception, balanced/hysteria2
 downstream at 0.587 against a 0.581 floor, clears it by 0.006 and is answered by the same
 carrier at aggressive reading 0.532 - it is run-to-run variance, not a leak.
@@ -873,8 +1043,8 @@ size-based separator under those conditions and reads 0.536/0.559 here.
 
 ## What it actually costs in throughput
 
-The separability table says a tier does not change what a censor sees. This one says what a
-tier does change, and it is the number an operator will care about first.
+The separability table says the budget does not change what a censor sees. This one says what
+it does change, and it is the number an operator will care about first.
 
 | tier | carrier | median | best | worst | completed |
 |---|---|---|---|---|---|
@@ -896,10 +1066,10 @@ separability matrix measures. usage: scripts/podman-e2e/tier-throughput.sh <lib-
 session is open, busy or idle, so the sustainable rate is whatever you are willing to spend
 while connected (a per session-day figure - two hours online costs two hours of cover):
 
-| tier | ceiling | sustained |
+| budget | ceiling | sustained |
 |---|---|---|
-| lean | 2.5 GB/day | 0.23 Mbit/s |
-| balanced | 6 GB/day | 0.56 Mbit/s |
+| default | 2.5 GB/day | 0.23 Mbit/s |
+| video-capable | 6 GB/day | 0.56 Mbit/s |
 
 To sustain 10 Mbit/s of tunnel you would need 10 Mbit/s of cover running permanently -
 about 108 GB/day. There is no arrangement of this design that avoids that: a record leaves
@@ -916,7 +1086,7 @@ than 14.28 s. **These cells predate that change and understate what the current 
 produces**; they are kept because the separability matrix above was taken on the same
 captures, and re-quoting one without the other would mix two different runs.
 
-**The carrier does not matter; the envelope does.** Within a tier every carrier lands in the
+**The carrier does not matter; the envelope does.** Within a budget every carrier lands in the
 same band (lean 9-13 KB/s, balanced 13-21 KB/s). There is no faster carrier to switch to,
 and an earlier claim in this repo's history that WebSocket ran 3.4x slower than Reality was
 an artefact of comparing two single samples from a 14x-spread distribution.
@@ -926,7 +1096,7 @@ an artefact of comparing two single samples from a 14x-spread distribution.
 doubles, 4.4 -> 8.2 KB/s, so the painful moments hurt half as much. That, not the median, is
 the case for it.
 
-**So be clear about what this is - and what it is not.** At the default tiers Proteus is a
+**So be clear about what this is - and what it is not.** At the default budget Proteus is a
 low-bandwidth covert channel: messaging, text, light browsing, a two-to-three order of
 magnitude reduction on a fast domestic line.
 

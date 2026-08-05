@@ -22,7 +22,7 @@ Three classes are sourced, because the two directions want opposite things:
   control travels upstream, and reading gaps destroy that capacity: measured, adding dwell
   cut upstream payload from 3.93 to 0.91 KiB/s and turned a 2-second download into one
   that took up to 389. One capture cannot serve both directions.
-- **`video`** - a steady large-record envelope, on the balanced and aggressive tiers.
+- **`video`** - a steady large-record envelope, sourced once the budget reaches 6 GB/day.
 
 The library lands in `$MIRAGE_STATE_DIR/cover`, else `$XDG_STATE_HOME/mirage/cover`,
 else `~/.local/state/mirage/cover`.
@@ -55,7 +55,12 @@ mirage-cover-record ./library --mode browse --name upstream --count 20  # dense,
 mirage-cover-record ./library --mode upload --url https://your.host/upload
 ```
 
-- **video** - steady large TLS records (segmented HLS). Source: public PeerTube instances.
+- **video** - steady large TLS records. Source depends on `--sources`: public PeerTube
+  instances by default, and domestic platforms per region (Rutube/OK.ru for `ru`, Aparat for
+  `ir`, Bilibili for `cn`, puhutv for `tr`), plus any site that inlines an HLS manifest for a
+  custom list. HLS and DASH/progressive are both supported - Bilibili serves no HLS at all,
+  so its byte-ranged DASH representations are driven with `Range` requests paced at the
+  stream's real bitrate.
 - **browse** with `--realtime` - a real multi-page session with reading gaps. The
   downstream disguise.
 - **browse** without `--realtime`, into `--name upstream` - the same browsing, dense. The
@@ -67,6 +72,15 @@ mirage-cover-record ./library --mode upload --url https://your.host/upload
   `--url`, because it sends real bytes and will not pick a stranger's server for you.
 
 Override the source: `--hls <url>` (video), `--url <page>` (browse), `--peertube <host>`.
+
+For platforms that actively fight extraction, hand off to an external tool with
+`--hls-cmd`, which records whatever HLS URL the command prints:
+
+```sh
+mirage-cover-record ./library --mode video --hls-cmd 'yt-dlp -g <url>'
+```
+
+Mirage does not depend on yt-dlp - nothing is run unless you set this flag.
 
 Every recording prints what the envelope costs per direction if replayed continuously,
 along with the worst stall in each direction and how long the capture takes to open. Look
@@ -131,8 +145,13 @@ Pinning `proteus_profile` on a client opts out of the sync entirely.
 ### Walled gardens
 
 YouTube/TikTok need an extractor Mirage deliberately does not bundle (it rots as sites
-change). To use one as a source, resolve it out of band and pass the result:
-`mirage-cover-record ./library --hls "$(yt-dlp -g <url>)"`.
+change). Use `--hls-cmd 'yt-dlp -g <url>'` to hand off to one, or resolve it out of band and
+pass the result: `mirage-cover-record ./library --hls "$(yt-dlp -g <url>)"`.
+
+Worth knowing which regions this is actually for. YouTube is blocked in China, Russia and
+Iran, so recording cover from it there is the very signal Proteus exists to avoid - the
+domestic packs already cover those regions with platforms whose APIs are public. Reach for an
+extractor where the platform is genuinely ordinary on the local network.
 
 ## Notes
 

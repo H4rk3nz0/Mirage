@@ -318,6 +318,14 @@ struct Fetcher {
     out: Arc<Mutex<Vec<Event>>>,
     connector: TlsConnector,
     cur: Option<(String, Conn)>,
+    /// Sent as `Referer` on every request when set.
+    ///
+    /// Some CDNs hotlink-protect their media and answer 403 without it -
+    /// measured on Bilibili, where the same byte range is 403 bare and 206 with
+    /// `https://www.bilibili.com/`. It is also what a real player sends, so
+    /// setting it makes the capture MORE like the traffic being imitated, not
+    /// less.
+    referer: Option<String>,
 }
 
 impl Fetcher {
@@ -332,6 +340,7 @@ impl Fetcher {
             out,
             connector: TlsConnector::from(Arc::new(config)),
             cur: None,
+            referer: None,
         })
     }
 
@@ -414,7 +423,8 @@ impl Fetcher {
             Some(q) => format!("{}?{}", url.path(), q),
             None => url.path().to_string(),
         };
-        match request(conn, &host, &path, range, body).await {
+        let referer = self.referer.clone();
+        match request(conn, &host, &path, range, body, referer.as_deref()).await {
             Ok((status, location, body, keep)) => {
                 if !keep {
                     self.cur = None;
@@ -436,12 +446,17 @@ async fn request(
     path: &str,
     range: Option<(u64, u64)>,
     body: Option<&[u8]>,
+    referer: Option<&str>,
 ) -> io::Result<(u16, Option<String>, Vec<u8>, bool)> {
     // HLS byte-range segments (`#EXT-X-BYTERANGE`) address slices of ONE media
     // file. Without the Range header every "segment" fetch pulls the whole file,
     // so the recording is a few huge bursts instead of a stream.
     let range_hdr = match range {
         Some((off, len)) => format!("Range: bytes={}-{}\r\n", off, off + len - 1),
+        None => String::new(),
+    };
+    let referer_hdr = match referer {
+        Some(r) => format!("Referer: {r}\r\n"),
         None => String::new(),
     };
     let req = match body {
@@ -452,13 +467,15 @@ async fn request(
         // client-to-server records that direction actually needs.
         Some(b) => format!(
             "POST {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {UA}\r\n\
-             Accept: */*\r\nAccept-Encoding: identity\r\nContent-Type: application/octet-stream\r\n\
+             Accept: */*\r\nAccept-Encoding: identity\r\n{referer_hdr}\
+             Content-Type: application/octet-stream\r\n\
              Content-Length: {}\r\nConnection: keep-alive\r\n\r\n",
             b.len()
         ),
         None => format!(
             "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {UA}\r\n\
-             Accept: */*\r\nAccept-Encoding: identity\r\n{range_hdr}Connection: keep-alive\r\n\r\n"
+             Accept: */*\r\nAccept-Encoding: identity\r\n{range_hdr}{referer_hdr}\
+             Connection: keep-alive\r\n\r\n"
         ),
     };
     conn.get_mut().write_all(req.as_bytes()).await?;
@@ -562,6 +579,26 @@ fn attr(s: &str, key: &str) -> Option<String> {
     })
 }
 
+/// Repair a playlist URI whose query is preceded by a stray `&`.
+///
+/// Measured on the Dogus CDN that carries Turkey's broadcast channels: the
+/// master lists `ntv_360p.m3u8&?sid=...`, which resolves to a PATH ending in `&`
+/// and a query of `sid=...`. The server answers **200 with an empty body**, so
+/// the failure presents as "no segments" rather than as an error, and the whole
+/// source looks broken. Dropping the `&` that immediately precedes the first `?`
+/// yields the URI the CDN actually serves.
+///
+/// Narrow by construction: only a `&` directly before the FIRST `?` is removed,
+/// so a legitimate `&?` inside a query value is untouched.
+fn normalise_uri(uri: &str) -> std::borrow::Cow<'_, str> {
+    match uri.find('?') {
+        Some(q) if q > 0 && uri.as_bytes()[q - 1] == b'&' => {
+            std::borrow::Cow::Owned(format!("{}{}", &uri[..q - 1], &uri[q..]))
+        }
+        _ => std::borrow::Cow::Borrowed(uri),
+    }
+}
+
 /// Master playlist -> `(bandwidth, variant url)` list.
 fn parse_master(text: &str, base: &Url) -> Vec<(u64, Url)> {
     let lines: Vec<&str> = text.lines().collect();
@@ -575,7 +612,7 @@ fn parse_master(text: &str, base: &Url) -> Vec<(u64, Url)> {
                 .unwrap_or(0);
             if let Some(uri) = lines.get(i + 1).map(|s| s.trim()) {
                 if !uri.is_empty() && !uri.starts_with('#') {
-                    if let Ok(u) = base.join(uri) {
+                    if let Ok(u) = base.join(&normalise_uri(uri)) {
                         out.push((bw, u));
                     }
                 }
@@ -634,7 +671,7 @@ fn parse_media(text: &str, base: &Url) -> Vec<Seg> {
             }
         } else if l.starts_with('#') || l.is_empty() {
             continue;
-        } else if let Ok(u) = base.join(l) {
+        } else if let Ok(u) = base.join(&normalise_uri(l)) {
             let range = pending.take().map(|(len, off)| {
                 let key = u.to_string();
                 let off = off.unwrap_or_else(|| next_off.get(&key).copied().unwrap_or(0));
@@ -749,6 +786,786 @@ async fn peertube_hls(f: &mut Fetcher, instance: &str) -> io::Result<Url> {
         }
     }
     Err(io::Error::new(io::ErrorKind::Other, "no HLS video found"))
+}
+
+/// Undo the escaping a manifest URL picks up on its way into a page.
+///
+/// A site that inlines its manifest almost never does so as plain text: it is a
+/// string inside JSON, inside an HTML attribute, sometimes escaped twice over.
+/// Measured on OK.ru the literal bytes are
+/// `hlsManifestUrl\&quot;:\&quot;https://...m3u8?cmd=x\\u0026expires=...`, so a
+/// scanner that does not unescape first finds a URL truncated at the first `&`
+/// and fetches a 400. Order matters: the doubled form has to go before the
+/// single one, or it leaves a stray backslash mid-URL.
+fn unescape_embedded(s: &str) -> String {
+    let mut out = s.to_string();
+    for (from, to) in [
+        (r"\\u0026", "&"),
+        ("\\u0026", "&"),
+        (r"\\/", "/"),
+        ("\\/", "/"),
+        ("&amp;", "&"),
+        ("&quot;", "\""),
+        (r#"\""#, "\""),
+    ] {
+        if out.contains(from) {
+            out = out.replace(from, to);
+        }
+    }
+    out
+}
+
+/// Characters that cannot appear in a URL as it is written inside a page, and so
+/// bound one when scanning. `,` is deliberately absent going FORWARD: real query
+/// strings contain it (Rutube lists variant GUIDs comma-separated).
+const URL_STOP_BEFORE: &[char] = &['"', '\'', '<', '>', '\\', '(', ')', ',', '=', ' ', '\t'];
+const URL_STOP_AFTER: &[char] = &['"', '\'', '<', '>', '\\', ' ', '\t'];
+
+/// Every HLS manifest URL that appears in `text`, resolved against `base`.
+///
+/// Deliberately a substring scan rather than an HTML parse: the URL is as likely
+/// to be in a JSON blob inside a `<script>` as in an attribute, and a parser that
+/// only understood one of those would miss the common case.
+fn scan_manifests(text: &str, base: &Url) -> Vec<Url> {
+    let text = unescape_embedded(text);
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(i) = text[from..].find(".m3u8") {
+        let hit = from + i;
+        from = hit + ".m3u8".len();
+        let start = text[..hit].rfind(URL_STOP_BEFORE).map_or(0, |p| {
+            p + text[p..].chars().next().map_or(1, char::len_utf8)
+        });
+        let end = text[from..]
+            .find(URL_STOP_AFTER)
+            .map_or(text.len(), |p| from + p);
+        let tok = text[start..end].trim();
+        if tok.is_empty() {
+            continue;
+        }
+        if let Ok(u) = base.join(tok) {
+            if matches!(u.scheme(), "https" | "http") && seen.insert(u.as_str().to_string()) {
+                out.push(u);
+            }
+        }
+    }
+    out
+}
+
+/// Links on `text` whose URL contains `needle`, resolved absolute and deduped.
+fn links_containing(text: &str, base: &Url, needle: &str) -> Vec<Url> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("href=\"") {
+        rest = &rest[i + 6..];
+        let Some(end) = rest.find('"') else { break };
+        let val = &rest[..end];
+        rest = &rest[end + 1..];
+        if !val.contains(needle) {
+            continue;
+        }
+        if let Ok(u) = base.join(val) {
+            if matches!(u.scheme(), "https" | "http") && seen.insert(u.as_str().to_string()) {
+                out.push(u);
+            }
+        }
+    }
+    out
+}
+
+/// How many candidate video pages to open before giving up on one `Embedded`
+/// source. Each is a real page load; a source that has not yielded a manifest in
+/// three is not going to, and the next source is a better use of the time.
+const EMBEDDED_PAGE_TRIES: usize = 3;
+
+/// Confirm a candidate URL really is an HLS playlist before handing it on.
+///
+/// A scan finds strings that LOOK like manifests - a thumbnail sprite named
+/// `.m3u8.jpg`, a dead CDN path, a URL whose signature has expired. Handing one
+/// of those to the recorder costs a full retry cycle; one HEAD-shaped GET here
+/// costs nothing, because discovery runs on a throwaway event log that is never
+/// written to the library.
+async fn is_playlist(f: &mut Fetcher, u: &Url) -> bool {
+    matches!(f.get(u).await, Ok((200, b)) if b.starts_with(b"#EXTM3U"))
+}
+
+/// Find an HLS master playlist inlined in a site's own pages.
+///
+/// `video_path` marks links to video pages; `None` means scan `start` itself,
+/// which is what an operator's explicit URL means.
+async fn embedded_hls(f: &mut Fetcher, start: &Url, video_path: Option<&str>) -> io::Result<Url> {
+    let (st, body) = f.get(start).await?;
+    if st != 200 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("start page HTTP {st}"),
+        ));
+    }
+    let text = String::from_utf8_lossy(&body).into_owned();
+
+    // The start page occasionally carries a manifest itself (an autoplaying
+    // hero video), so it is always worth scanning before hopping.
+    for cand in scan_manifests(&text, start) {
+        if is_playlist(f, &cand).await {
+            return Ok(cand);
+        }
+    }
+    let Some(needle) = video_path else {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "no HLS manifest on page",
+        ));
+    };
+
+    let pages = links_containing(&unescape_embedded(&text), start, needle);
+    if pages.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("no links matching {needle}"),
+        ));
+    }
+    for i in shuffled(pages.len()).into_iter().take(EMBEDDED_PAGE_TRIES) {
+        let page = &pages[i];
+        let Ok((200, pbody)) = f.get(page).await else {
+            continue;
+        };
+        for cand in scan_manifests(&String::from_utf8_lossy(&pbody), page) {
+            if is_playlist(f, &cand).await {
+                return Ok(cand);
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Other,
+        "no HLS manifest on any video page",
+    ))
+}
+
+/// Rutube video IDs are 32 lowercase hex characters under `/video/`.
+fn rutube_ids(text: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("/video/") {
+        rest = &rest[i + "/video/".len()..];
+        let id: String = rest
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .take(32)
+            .collect();
+        if id.len() == 32 && seen.insert(id.clone()) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// Query Rutube for a random recent video with an HLS playlist.
+///
+/// Two hops rather than PeerTube's one, because Rutube's video-LIST API requires
+/// credentials (it answers 401 to an anonymous request) while its per-video
+/// play-options endpoint is public. So the IDs come off the homepage, which is a
+/// page a Russian user loads anyway.
+async fn rutube_hls(f: &mut Fetcher) -> io::Result<Url> {
+    let home = Url::parse("https://rutube.ru/")
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let (st, body) = f.get(&home).await?;
+    if st != 200 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("rutube home HTTP {st}"),
+        ));
+    }
+    let ids = rutube_ids(&String::from_utf8_lossy(&body));
+    if ids.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::Other, "no video ids on page"));
+    }
+    for i in shuffled(ids.len()).into_iter().take(EMBEDDED_PAGE_TRIES) {
+        let Ok(opts) = Url::parse(&format!(
+            "https://rutube.ru/api/play/options/{}/?no_404=true&referer=https%3A%2F%2Frutube.ru",
+            ids[i]
+        )) else {
+            continue;
+        };
+        let Ok((200, b)) = f.get(&opts).await else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_slice::<Value>(&b) else {
+            continue;
+        };
+        if let Some(u) = rutube_m3u8(&v) {
+            return Ok(u);
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::Other, "no HLS video found"))
+}
+
+/// The master-playlist URL in a Rutube play-options object.
+fn rutube_m3u8(v: &Value) -> Option<Url> {
+    let m = v.get("video_balancer")?.get("m3u8")?.as_str()?;
+    Url::parse(m).ok()
+}
+
+/// Run an operator's extractor command and take the last URL it prints.
+///
+/// Deliberately dumb: it runs what it is given through a shell and reads stdout.
+/// The command is operator configuration, exactly like `--url` or `--hls`, and
+/// carries the same trust - anyone who can set it can already run commands.
+/// `yt-dlp -g` prints the video URL and then the audio URL, so the LAST line is
+/// taken; a single-URL extractor is unaffected.
+fn hls_from_command(cmd: &str) -> io::Result<Url> {
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .output()
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("--hls-cmd could not run (is the extractor installed?): {e}"),
+            )
+        })?;
+    if !out.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "--hls-cmd exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let last = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("http://") || l.starts_with("https://"))
+        .next_back()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "--hls-cmd printed no http(s) URL",
+            )
+        })?;
+    Url::parse(last).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+}
+
+/// A resolved video source: what to drive, and how.
+///
+/// Not every platform serves HLS. Bilibili - the only video source that is
+/// reachable AND ordinary on a Chinese network - serves DASH representations
+/// that are byte ranges into ONE file, and plenty of smaller sites just serve a
+/// progressive MP4. Both are driven the same way: sequential `Range` requests
+/// paced at the stream's bitrate, which is what a player's buffer does and is
+/// already how the recorder handles PeerTube's `#EXT-X-BYTERANGE` playlists.
+///
+/// So the gap that kept whole regions out was never extraction difficulty; it
+/// was that the recorder only spoke one container format.
+#[derive(Debug, Clone)]
+pub enum Stream {
+    /// An HLS master or media playlist.
+    Hls(Url),
+    /// One media file, driven by byte ranges at `bitrate_bps`.
+    Ranged {
+        /// The media file.
+        url: Url,
+        /// Declared bitrate, which sets the pacing and the cover's cost.
+        bitrate_bps: u64,
+        /// `Referer` the CDN requires, if any. See [`Fetcher::referer`].
+        referer: Option<String>,
+    },
+}
+
+impl Stream {
+    /// The underlying URL, whatever the container.
+    #[must_use]
+    pub fn as_url(&self) -> &Url {
+        match self {
+            Self::Hls(u) | Self::Ranged { url: u, .. } => u,
+        }
+    }
+
+    /// The host serving it, for the recorded-trace line.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        self.as_url().host_str().unwrap_or("?")
+    }
+}
+
+/// Bounds on a ranged request, so a pathological bitrate cannot produce a chunk
+/// that is either a single packet or a multi-megabyte burst.
+const RANGE_CHUNK_MIN: u64 = 16 * 1024;
+const RANGE_CHUNK_MAX: u64 = 4 * 1024 * 1024;
+
+/// Bytes to request so that one chunk is `gap` seconds of media at `bitrate_bps`.
+///
+/// Sized in TIME, not bytes, and this is the whole point. A DASH player asks for
+/// roughly a segment at a time and then idles for about that segment's duration,
+/// so the request size follows from the cadence you want - not the other way
+/// round. A fixed byte count inverts that and breaks on low-bitrate streams: 512
+/// KiB of Bilibili's 158 kbit/s rendition is **26.5 seconds** of media, so a
+/// realtime capture would idle 26.5 s between requests against a 2 s latency
+/// ceiling, and every such capture would be rejected or kept with a warning.
+/// Deriving the chunk from the ceiling makes the recorder aim at the same number
+/// the acceptance check enforces, which is the same one-source-of-truth rule
+/// `record_one` already applies to `rt.max_gap`.
+fn range_chunk_bytes(bitrate_bps: u64, gap: Duration) -> u64 {
+    let secs = (gap.as_secs_f64() * RANGE_GAP_HEADROOM).max(0.25);
+    (((bitrate_bps as f64) / 8.0 * secs) as u64).clamp(RANGE_CHUNK_MIN, RANGE_CHUNK_MAX)
+}
+
+/// Fraction of the latency ceiling one chunk of media is allowed to be.
+///
+/// Aiming at the whole ceiling leaves no room for the request itself. The stall
+/// a capture is judged on is the sleep PLUS the time to first byte of the next
+/// response, so a chunk sized at 100% of the budget measures just OVER it and
+/// the capture is rejected - observed at 2.5 s against a 2.0 s ceiling. 0.6 of
+/// the default budget is 1.2 s, which is also exactly [`SEG_GAP_MAX`], the cap
+/// the HLS path uses for the same reason.
+const RANGE_GAP_HEADROOM: f64 = 0.6;
+
+/// Drive one byte-ranged media file and return its wire record envelope.
+///
+/// The DASH/progressive counterpart to [`record_stream`]. Pacing is the whole
+/// point: a chunk represents a known number of seconds of media, and waiting
+/// that long between requests is what makes the trace a STREAM whose average
+/// rate is the stream's real bitrate, rather than a bulk download that would be
+/// unaffordable as continuous cover.
+async fn record_ranged(
+    url: &Url,
+    bitrate_bps: u64,
+    referer: Option<&str>,
+    rt: RealTime,
+) -> io::Result<Vec<Event>> {
+    let start = Instant::now();
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let mut f = Fetcher::new(start, out.clone())?;
+    f.referer = referer.map(str::to_string);
+
+    // A zero or absurd bitrate would make the gap either zero (a bulk download)
+    // or unbounded. Clamp to something a real rendition could plausibly be.
+    let bitrate = bitrate_bps.clamp(50_000, 50_000_000);
+    // Aim each request at one latency budget's worth of media, so the gaps this
+    // produces are gaps the acceptance check will accept.
+    let chunk = range_chunk_bytes(bitrate, rt.max_gap);
+    let secs_per_chunk = chunk as f64 * 8.0 / bitrate as f64;
+    eprintln!(
+        "  ranged stream: {:.0} kbit/s, {} KiB per request, {:.1}s of media each \
+         ({:.2} GB/day if replayed continuously)",
+        bitrate as f64 / 1000.0,
+        chunk / 1024,
+        secs_per_chunk,
+        bitrate as f64 / 8.0 * 86400.0 / 1e9
+    );
+
+    let (max_segs, max_bytes, max_time) = rt.budget();
+    let mut got = 0usize;
+    let mut bytes = 0usize;
+    let mut off = 0u64;
+    while got < max_segs && bytes < max_bytes && start.elapsed() < max_time {
+        match f.get_ranged(url, Some((off, chunk))).await {
+            // 206 is the success status for a ranged request; a 200 means the
+            // server ignored Range and sent the whole file, which is not a
+            // stream and must not be paced as though it were.
+            Ok((206, b)) => {
+                if b.is_empty() {
+                    break;
+                }
+                bytes += b.len();
+                got += 1;
+                off += b.len() as u64;
+                // Short read means end of file: stop rather than spin on ranges
+                // past the end, which answer 416 forever.
+                if (b.len() as u64) < chunk {
+                    break;
+                }
+            }
+            // The server ignored Range and sent the whole file. The tap has
+            // already logged those records, so the capture is whatever that one
+            // burst was; there is nothing to pace and no point asking again.
+            Ok((200, _)) => break,
+            _ => break,
+        }
+        let want = Duration::from_secs_f64(secs_per_chunk);
+        tokio::time::sleep(if rt.real_time {
+            want
+        } else {
+            want.min(SEG_GAP_MAX)
+        })
+        .await;
+    }
+    drop(f);
+    let events = out.lock().unwrap().clone();
+    Ok(events)
+}
+
+/// A random recent Aparat video hash.
+///
+/// The tag listing is the API behind the homepage's own rails, so this is a
+/// request the site makes for every visitor rather than a scraper-shaped one.
+async fn aparat_hash(f: &mut Fetcher) -> io::Result<String> {
+    let list = Url::parse("https://www.aparat.com/api/fa/v1/video/video/list/tagid/1")
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let (st, body) = f.get(&list).await?;
+    if st != 200 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("aparat list HTTP {st}"),
+        ));
+    }
+    let text = String::from_utf8_lossy(&body);
+    let mut hashes = aparat_hashes(&text);
+    if hashes.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::Other, "no video hashes"));
+    }
+    let i = (rand_u64() as usize) % hashes.len();
+    Ok(hashes.swap_remove(i))
+}
+
+/// Video hashes in an Aparat listing response: the `uid` fields.
+fn aparat_hashes(text: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("\"uid\"") {
+        rest = &rest[i + 5..];
+        let Some(q) = rest.find('"') else { break };
+        let after = &rest[q + 1..];
+        let Some(end) = after.find('"') else { break };
+        let id = &after[..end];
+        rest = &after[end + 1..];
+        if !id.is_empty()
+            && id.len() <= 24
+            && id.chars().all(|c| c.is_ascii_alphanumeric())
+            && seen.insert(id.to_string())
+        {
+            out.push(id.to_string());
+        }
+    }
+    out
+}
+
+/// Playable streams in an Aparat video-detail object, best first.
+///
+/// The HLS link comes first, but it is only a CANDIDATE: that endpoint is a
+/// signed redirector which sometimes answers 400 (measured), while the
+/// per-profile CDN files are handed out plainly and a progressive file is a
+/// perfectly good ranged stream. Returning both and letting the caller VALIDATE
+/// is the point - preferring the HLS link unconditionally made the progressive
+/// path unreachable in exactly the case it exists for, because the recorder's
+/// retry loop re-resolves and picks the same broken link every time.
+///
+/// Profiles are ordered smallest-first by the API, which is the order a
+/// low-bitrate capture wants.
+fn aparat_candidates(d: &Value, low_bitrate: bool) -> Vec<Stream> {
+    let Some(attrs) = d.get("data").and_then(|x| x.get("attributes")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(u) = attrs
+        .get("hls")
+        .and_then(|h| h.get("link"))
+        .and_then(Value::as_str)
+        .and_then(|l| Url::parse(l).ok())
+    {
+        out.push(Stream::Hls(u));
+    }
+    if let Some(all) = attrs.get("file_link_all").and_then(Value::as_array) {
+        let pick = if low_bitrate { all.first() } else { all.last() };
+        if let Some(s) = pick.and_then(|p| {
+            Some(Stream::Ranged {
+                url: p
+                    .get("urls")?
+                    .as_array()?
+                    .first()?
+                    .as_str()
+                    .and_then(|u| Url::parse(u).ok())?,
+                referer: None,
+                // The API reports a size and a profile, not a bitrate. Rather
+                // than invent one, take the profile height as a coarse proxy -
+                // the pacing only has to be the right order of magnitude for the
+                // trace to read as a stream rather than a download.
+                bitrate_bps: aparat_profile_bps(p.get("profile").and_then(Value::as_str)),
+            })
+        }) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// A plausible bitrate for an Aparat profile label like `360p`.
+fn aparat_profile_bps(profile: Option<&str>) -> u64 {
+    match profile
+        .map(|p| p.trim_end_matches('p'))
+        .and_then(|p| p.parse::<u64>().ok())
+    {
+        Some(h) if h <= 144 => 150_000,
+        Some(h) if h <= 240 => 300_000,
+        Some(h) if h <= 360 => 600_000,
+        Some(h) if h <= 480 => 1_000_000,
+        Some(h) if h <= 720 => 2_000_000,
+        Some(_) => 4_000_000,
+        None => 600_000,
+    }
+}
+
+/// Query Aparat for a random recent video's stream.
+async fn aparat_stream_for(f: &mut Fetcher, low_bitrate: bool) -> io::Result<Stream> {
+    for _ in 0..EMBEDDED_PAGE_TRIES {
+        let hash = aparat_hash(f).await?;
+        let Ok(detail) = Url::parse(&format!(
+            "https://www.aparat.com/api/fa/v1/video/video/show/videohash/{hash}?pr=1&mf=1"
+        )) else {
+            continue;
+        };
+        let Ok((200, b)) = f.get(&detail).await else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_slice::<Value>(&b) else {
+            continue;
+        };
+        for cand in aparat_candidates(&v, low_bitrate) {
+            match &cand {
+                // Validate the playlist here so a refused redirector falls
+                // through to the progressive file NOW, rather than failing at
+                // record time and being re-picked on every retry.
+                Stream::Hls(u) if !is_playlist(f, u).await => continue,
+                // A ranged candidate is not probed: the first `Range` request is
+                // the recording, so a probe would cost a real fetch to learn
+                // what the capture is about to learn anyway.
+                _ => return Ok(cand),
+            }
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::Other, "no playable video"))
+}
+
+/// Bilibili's CDN requires this on media requests, and its API on `playurl`.
+const BILIBILI_REFERER: &str = "https://www.bilibili.com/";
+
+/// The DASH representation to wear from a Bilibili play-options object.
+///
+/// Bilibili serves no HLS: `dash.video[]` lists representations that are byte
+/// ranges into one file, each with a real `bandwidth`. Picking by bandwidth is
+/// picking the cover's 24/7 cost, so it follows the budget exactly as the HLS
+/// variant choice does.
+fn bilibili_stream(d: &Value, low_bitrate: bool) -> Option<Stream> {
+    let mut reps: Vec<(u64, &str)> = d
+        .get("data")?
+        .get("dash")?
+        .get("video")?
+        .as_array()?
+        .iter()
+        .filter_map(|r| {
+            Some((
+                r.get("bandwidth").and_then(Value::as_u64)?,
+                r.get("baseUrl")
+                    .or_else(|| r.get("base_url"))
+                    .and_then(Value::as_str)?,
+            ))
+        })
+        .collect();
+    reps.sort_by_key(|(bw, _)| *bw);
+    let (bw, url) = if low_bitrate {
+        reps.first()
+    } else {
+        reps.last()
+    }?;
+    Some(Stream::Ranged {
+        url: Url::parse(url).ok()?,
+        bitrate_bps: *bw,
+        // Bilibili hotlink-protects its CDN: the same range is 403 bare and 206
+        // with this, which is also exactly what its web player sends.
+        referer: Some(BILIBILI_REFERER.to_string()),
+    })
+}
+
+/// Query Bilibili for a random popular video's DASH stream.
+///
+/// Both endpoints are public and unauthenticated: `popular` is the site's own
+/// trending rail, and `playurl` is what the web player calls.
+async fn bilibili_stream_for(f: &mut Fetcher, low_bitrate: bool) -> io::Result<Stream> {
+    let list = Url::parse("https://api.bilibili.com/x/web-interface/popular")
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let (st, body) = f.get(&list).await?;
+    if st != 200 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("bilibili popular HTTP {st}"),
+        ));
+    }
+    let v: Value =
+        serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let arr = v
+        .get("data")
+        .and_then(|d| d.get("list"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no data.list[]"))?;
+    for i in shuffled(arr.len()).into_iter().take(EMBEDDED_PAGE_TRIES) {
+        let (Some(bvid), Some(cid)) = (
+            arr[i].get("bvid").and_then(Value::as_str),
+            arr[i].get("cid").and_then(Value::as_u64),
+        ) else {
+            continue;
+        };
+        // fnval=16 asks for DASH. Without it the API answers with a progressive
+        // MP4 and no bandwidth figure, which would leave the pacing guessing.
+        let Ok(play) = Url::parse(&format!(
+            "https://api.bilibili.com/x/player/playurl?bvid={bvid}&cid={cid}&fnval=16&fourk=1"
+        )) else {
+            continue;
+        };
+        let Ok((200, b)) = f.get(&play).await else {
+            continue;
+        };
+        let Ok(d) = serde_json::from_slice::<Value>(&b) else {
+            continue;
+        };
+        if let Some(s) = bilibili_stream(&d, low_bitrate) {
+            return Ok(s);
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::Other, "no DASH video found"))
+}
+
+/// The result of probing one video source.
+#[derive(Debug, Clone)]
+pub struct SourceCheck {
+    /// Which source was probed, as it appears in diagnostics.
+    pub source: String,
+    /// Preference group it belongs to; group 0 is tried first.
+    pub group: usize,
+    /// The host it resolved to, or why it failed.
+    pub outcome: Result<String, String>,
+}
+
+/// Probe every video source a pack lists, without recording anything.
+///
+/// The regional source lists are **reachability claims that will rot**: a site
+/// changes its player, an API starts demanding credentials, a CDN adds a header
+/// check. Each of those presents at runtime as a video class that quietly never
+/// fills, which is the failure mode this whole module is written to avoid - so
+/// there has to be a way to ask the question directly, from a machine on the
+/// network in question, before a user discovers it.
+///
+/// Resolution only: it stops at the manifest and never drives a stream, so the
+/// check is cheap enough to run on a schedule.
+pub async fn check_video_sources(pack: &packs::SourcePack, low_bitrate: bool) -> Vec<SourceCheck> {
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let Ok(mut f) = Fetcher::new(Instant::now(), out) else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
+    for (group, sources) in pack.video_sources().iter().enumerate() {
+        for src in sources {
+            let outcome = match video_source_stream(&mut f, src, low_bitrate).await {
+                Ok(s) => Ok(s.host().to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            results.push(SourceCheck {
+                source: video_source_label(src),
+                group,
+                outcome,
+            });
+        }
+    }
+    results
+}
+
+/// Probe every BROWSE source a pack lists, without recording anything.
+///
+/// Browse is checked as well as video because browse is the class that matters
+/// most: it carries the tunnel's upstream and is recorded at every budget, while
+/// video only appears above 6 GB/day. A checker that only looked at video would
+/// report a healthy pack whose actually-load-bearing sources were all blocked.
+///
+/// A page is "reachable" here if it answers 200 and returns a body worth
+/// recording. The floor is deliberately low - this is a reachability probe, not
+/// an acceptance check, and `record_one` already rejects a capture that turns
+/// out too thin.
+pub async fn check_browse_sources(pack: &packs::SourcePack) -> Vec<SourceCheck> {
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let Ok(mut f) = Fetcher::new(Instant::now(), out) else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
+    for url in pack.browse_urls() {
+        let outcome = match Url::parse(&url) {
+            Err(e) => Err(e.to_string()),
+            Ok(u) => match f.get(&u).await {
+                Ok((200, body)) if body.len() >= MIN_BROWSE_PROBE_BYTES => {
+                    Ok(format!("{} bytes", body.len()))
+                }
+                Ok((200, body)) => Err(format!("200 but only {} bytes", body.len())),
+                Ok((st, _)) => Err(format!("HTTP {st}")),
+                Err(e) => Err(e.to_string()),
+            },
+        };
+        results.push(SourceCheck {
+            source: url,
+            group: 0,
+            outcome,
+        });
+    }
+    results
+}
+
+/// Smallest body a browse probe treats as a real page.
+///
+/// Block pages and captive-portal interstitials are small; a real article is
+/// not. This only has to tell "the site answered" from "something answered for
+/// it".
+const MIN_BROWSE_PROBE_BYTES: usize = 2048;
+
+/// What to print when a source fails, so the operator can tell WHICH one did.
+fn video_source_label(src: &packs::VideoSource) -> String {
+    match src {
+        packs::VideoSource::PeerTube(h) => h.clone(),
+        packs::VideoSource::Rutube => "rutube.ru".to_string(),
+        packs::VideoSource::Aparat => "aparat.com".to_string(),
+        packs::VideoSource::Bilibili => "bilibili.com".to_string(),
+        packs::VideoSource::Embedded { start, .. } => start.clone(),
+    }
+}
+
+/// Resolve one video source to a drivable stream.
+async fn video_source_stream(
+    f: &mut Fetcher,
+    src: &packs::VideoSource,
+    low_bitrate: bool,
+) -> io::Result<Stream> {
+    // Set per source and always cleared, because one fetcher walks the whole
+    // list: a referer left set from a previous source would be sent to the next
+    // one, which is both wrong and conspicuous.
+    f.referer = match src {
+        packs::VideoSource::Bilibili => Some(BILIBILI_REFERER.to_string()),
+        _ => None,
+    };
+    let resolved = video_source_stream_inner(f, src, low_bitrate).await;
+    f.referer = None;
+    resolved
+}
+
+async fn video_source_stream_inner(
+    f: &mut Fetcher,
+    src: &packs::VideoSource,
+    low_bitrate: bool,
+) -> io::Result<Stream> {
+    match src {
+        packs::VideoSource::PeerTube(host) => peertube_hls(f, host).await.map(Stream::Hls),
+        packs::VideoSource::Rutube => rutube_hls(f).await.map(Stream::Hls),
+        packs::VideoSource::Aparat => aparat_stream_for(f, low_bitrate).await,
+        packs::VideoSource::Bilibili => bilibili_stream_for(f, low_bitrate).await,
+        packs::VideoSource::Embedded { start, video_path } => {
+            let u = Url::parse(start)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            embedded_hls(f, &u, video_path.as_deref())
+                .await
+                .map(Stream::Hls)
+        }
+    }
 }
 
 // --- record one stream ------------------------------------------------------
@@ -1358,6 +2175,20 @@ pub struct Args {
     pub url: Option<String>,
     /// Video: a specific PeerTube instance instead of a random one.
     pub instance: Option<String>,
+    /// Video: run this command and record whatever HLS URL it prints.
+    ///
+    /// The supported way to use an external extractor without Mirage depending
+    /// on one. `yt-dlp -g <url>` covers the platforms that actively fight
+    /// extraction - YouTube above all - which no in-tree adapter can keep up
+    /// with, and it stays entirely the operator's choice: nothing is installed,
+    /// invoked or required unless this is set, so the shipped binary remains
+    /// self-contained.
+    ///
+    /// The command's traffic is NOT part of the capture. Discovery runs before
+    /// recording starts and on a separate event log, so an extractor's own
+    /// scraper-shaped requests never enter the library - though they do go out
+    /// on the wire, un-tunnelled, like every other discovery fetch.
+    pub hls_cmd: Option<String>,
     /// Self-driving: minutes to wait between batches, or `None` to record once.
     pub loop_mins: Option<usize>,
     /// Keep only the K newest traces after each batch.
@@ -1395,29 +2226,38 @@ pub struct Args {
     pub max_gb_day: Option<f64>,
 }
 
-/// How much bandwidth Proteus is allowed to spend wearing its disguise.
+/// The default cover ceiling, in GB/day of continuous replay.
 ///
-/// Every tier replays real captured traffic - they differ only in WHICH real
-/// flow gets worn, never in whether it is real. See [`Args::max_gb_day`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Tier {
-    /// The default. Cheapest cover that still carries a tunnel, and the right
-    /// choice on a metered or mobile link - which is most of the people this
-    /// exists for.
-    #[default]
-    Lean,
-    /// More cover bandwidth, and video captures in the downstream pool.
-    ///
-    /// NOT more hidden. A 15-cell censor-vantage matrix measured lean, balanced
-    /// and the former aggressive tier ALL at the harness's noise floor, with the
-    /// mean if anything drifting the wrong way as cover was added (lean 0.546,
-    /// balanced 0.553). What this buys is HEADROOM: the envelope is
-    /// simultaneously the disguise and the bandwidth budget, so a thin one caps
-    /// the user's throughput. On the same lean envelope a 120 KB transfer took
-    /// 7 s on Reality and 24 s on WebSocket, and the WebSocket carrier was
-    /// comfortable at balanced. Reach for this when a carrier is too slow, not
-    /// when you want to be harder to see.
-    Balanced,
+/// The cheapest cover that still carries a tunnel, and the right choice on a
+/// metered or mobile link - which is most of the people this exists for. An
+/// operator who wants more says so as a NUMBER; see [`Args::max_gb_day`].
+pub const DEFAULT_MAX_GB_DAY: f64 = 2.5;
+
+/// The ceiling a legacy `lean`/`balanced` config name asked for, in GB/day.
+///
+/// Tiers are gone as a concept. They were never a concealment choice - a 15-cell
+/// censor-vantage matrix measured lean, balanced and the former `aggressive`
+/// tier ALL at the harness's noise floor, with the mean if anything drifting the
+/// wrong way as cover was added (lean 0.546, balanced 0.553). What a tier
+/// actually set was a bandwidth ceiling, and a name that reads as "more
+/// protection" while meaning "more spending" is the kind of thing an operator
+/// picks for the wrong reason. So the quantity is named directly and this
+/// function exists only so an existing config keeps working.
+///
+/// `None` for anything unrecognised, which callers resolve to the default rather
+/// than silently uncapping.
+#[must_use]
+pub fn legacy_tier_budget(name: &str) -> Option<f64> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "lean" | "cheap" | "metered" => Some(DEFAULT_MAX_GB_DAY),
+        // `aggressive` was an UNCAPPED tier that preferred video cover. It is
+        // gone: it measured no less detectable than lean, and it was the only
+        // tier to produce a tunnel that would not come up at all (a video
+        // capture opens with a quiet stretch a handshake cannot crawl past).
+        // Mapped to the strongest ceiling that remains rather than honoured.
+        "balanced" | "aggressive" | "max" => Some(6.0),
+        _ => None,
+    }
 }
 
 /// A daily cover budget: a number of GB/day, or explicitly unlimited.
@@ -1500,58 +2340,6 @@ impl CoverBudget {
     }
 }
 
-impl Tier {
-    /// The per-trace cost ceiling, in GB/day of continuous replay.
-    #[must_use]
-    pub fn max_gb_day(self) -> Option<f64> {
-        match self {
-            Self::Lean => Some(2.5),
-            Self::Balanced => Some(6.0),
-        }
-    }
-
-    /// Which classes to source, in the order they are recorded.
-    ///
-    /// Browse comes first: a realtime video capture waits the stream's true
-    /// segment gaps and so takes minutes, while a browse capture takes seconds,
-    /// and Proteus wearing SOMETHING real within seconds of startup beats
-    /// wearing nothing for six minutes.
-    #[must_use]
-    pub fn classes(self) -> &'static [(Mode, &'static str)] {
-        // Every tier records an `upstream` class. It is a browse capture without
-        // reading dwell, kept separate because the two directions want opposite
-        // things: the downstream disguise wants the idle gaps, and upstream
-        // capacity is destroyed by them. Without it a tunnel's flow control -
-        // which travels upstream - throttles every download.
-        match self {
-            Self::Lean => &[(Mode::Browse, "browse"), (Mode::Browse, UPSTREAM_CLASS)],
-            Self::Balanced => &[
-                (Mode::Browse, "browse"),
-                (Mode::Browse, UPSTREAM_CLASS),
-                (Mode::Video, "video"),
-            ],
-        }
-    }
-
-    /// Parse a config/env spelling. `None` for anything unrecognised.
-    #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "lean" | "cheap" | "metered" => Some(Self::Lean),
-            "balanced" => Some(Self::Balanced),
-            // "aggressive" was an UNCAPPED bandwidth tier that preferred video
-            // cover. It is gone: it measured no less detectable than lean, it was
-            // the only tier to produce a tunnel that would not come up (a video
-            // capture opens with a quiet stretch a handshake can crawl past), and
-            // the name read as "more protection" while meaning "no spending
-            // limit". Accepted here so an existing config keeps working, mapped
-            // to the strongest tier that remains.
-            "aggressive" | "max" => Some(Self::Balanced),
-            _ => None,
-        }
-    }
-}
-
 impl Args {
     /// A job with everything defaulted but the library root and the class. What
     /// the auto-sourcer uses: Proteus is a switch, so the code behind the switch
@@ -1571,6 +2359,9 @@ impl Args {
             hls: None,
             url: None,
             instance: None,
+            // Unattended sourcing never shells out. An extractor is an explicit
+            // operator choice, and the daemon must not acquire one by default.
+            hls_cmd: None,
             loop_mins: None,
             max: None,
             // Always-on cover is a 24/7 bandwidth bill, so the unattended path
@@ -1586,17 +2377,11 @@ impl Args {
             up_chunks: UPLOAD_CHUNKS,
             verbose: false,
             pack: packs::SourcePack::default(),
-            max_gb_day: Tier::default().max_gb_day(),
+            max_gb_day: Some(DEFAULT_MAX_GB_DAY),
         }
     }
 
-    /// [`Args::auto`] with an explicit cost tier and cover-source pack.
-    #[must_use]
-    pub fn auto_tier(lib: PathBuf, mode: Mode, tier: Tier, pack: packs::SourcePack) -> Self {
-        Self::auto_budget(lib, mode, tier.max_gb_day(), pack)
-    }
-
-    /// [`Args::auto_tier`] driven by the resolved BUDGET rather than a tier name.
+    /// [`Args::auto`] driven by the resolved BUDGET and cover-source pack.
     ///
     /// The budget decides the video bitrate, because the two are the same
     /// question. Taking the lowest HLS variant caps the envelope at a few
@@ -1656,8 +2441,8 @@ pub fn wants_low_bitrate(max_gb_day: Option<f64>) -> bool {
 
 /// Which classes to record for a resolved budget.
 ///
-/// Split from [`Tier::classes`] because the budget, not the tier name, is what
-/// decides whether a fat downstream capture is affordable.
+/// The budget, not any tier name, is what decides whether a fat downstream
+/// capture is affordable - so it is the only input.
 #[must_use]
 pub fn classes_for_budget(max_gb_day: Option<f64>) -> &'static [(Mode, &'static str)] {
     // Every budget records an `upstream` class: reading gaps destroy upstream
@@ -1794,61 +2579,38 @@ fn library_size(dir: &Path) -> usize {
 /// and the operator has to be told, because "it looked like it was on" is the
 /// failure this whole design exists to prevent.
 pub async fn keep_fresh(lib: PathBuf) {
-    keep_fresh_tier(lib, Tier::default(), packs::SourcePack::default()).await;
+    keep_fresh_sourcing(lib, packs::SourcePack::default(), Some(DEFAULT_MAX_GB_DAY)).await;
 }
 
-/// [`keep_fresh_tier`] that stops when `stop` is set.
+/// [`keep_fresh`] with an explicit source pack and daily ceiling.
+///
+/// `max_gb_day` of `None` means UNLIMITED: the recorder keeps whatever it
+/// captures, however heavy. The budget is the only knob, because the budget is
+/// the only thing that was ever being chosen - it decides both what a capture
+/// costs to replay and, through [`classes_for_budget`], whether a fat video
+/// capture is affordable at all.
+pub async fn keep_fresh_sourcing(lib: PathBuf, pack: packs::SourcePack, max_gb_day: Option<f64>) {
+    keep_fresh_inner(lib, pack, max_gb_day, None).await;
+}
+
+/// [`keep_fresh_sourcing`] that stops when `stop` is set.
 ///
 /// A client stops recording once it has pulled the bridge's library: continuing
 /// would keep making un-tunnelled requests it no longer needs, to sites that may
 /// be blocked where it is running. Checked BETWEEN captures rather than by
 /// aborting the task, so a trace is never left half-written on disk for the
 /// pacer to pick up.
-pub async fn keep_fresh_until(
-    lib: PathBuf,
-    tier: Tier,
-    pack: packs::SourcePack,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
-    keep_fresh_inner(lib, tier, pack, tier.max_gb_day(), Some(stop)).await;
-}
-
-/// [`keep_fresh_until`] with the daily ceiling given explicitly.
-///
-/// `max_gb_day` of `None` means UNLIMITED, and the tier then only decides which
-/// classes to record. Separating the two is the point: the budget is a
-/// throughput and bandwidth decision, and the class list is not.
 pub async fn keep_fresh_budget(
     lib: PathBuf,
-    tier: Tier,
     pack: packs::SourcePack,
     max_gb_day: Option<f64>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    keep_fresh_inner(lib, tier, pack, max_gb_day, Some(stop)).await;
-}
-
-/// [`keep_fresh_tier`] with the daily ceiling given explicitly.
-///
-/// `max_gb_day` of `None` means UNLIMITED: the recorder keeps whatever it
-/// captures, however heavy.
-pub async fn keep_fresh_tier_budget(
-    lib: PathBuf,
-    tier: Tier,
-    pack: packs::SourcePack,
-    max_gb_day: Option<f64>,
-) {
-    keep_fresh_inner(lib, tier, pack, max_gb_day, None).await;
-}
-
-/// [`keep_fresh`] at an explicit cost tier, recording from `pack`.
-pub async fn keep_fresh_tier(lib: PathBuf, tier: Tier, pack: packs::SourcePack) {
-    keep_fresh_inner(lib, tier, pack, tier.max_gb_day(), None).await;
+    keep_fresh_inner(lib, pack, max_gb_day, Some(stop)).await;
 }
 
 async fn keep_fresh_inner(
     lib: PathBuf,
-    tier: Tier,
     pack: packs::SourcePack,
     max_gb_day: Option<f64>,
     stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -1861,20 +2623,20 @@ async fn keep_fresh_inner(
     // Classes follow the BUDGET, not the tier name: video is where the
     // throughput is, and whether it is affordable is a budget question.
     let classes = classes_for_budget(max_gb_day);
-    let _ = tier;
     // Say up front when the chosen pack cannot supply one of the classes this
-    // tier wants. Video capture drives the PeerTube playlist API and domestic
-    // platforms do not speak it, so a regional pack falls back to the global
-    // PeerTube set - which on a censored network is very likely unreachable.
-    // Without this the operator sees a video class that simply never fills and
-    // has no way to know the reason is structural rather than transient.
+    // budget wants. A pack with no verified domestic video falls back to the
+    // global PeerTube set, which on a censored network is very likely
+    // unreachable. Without this the operator sees a video class that simply
+    // never fills and has no way to know the reason is structural rather than
+    // transient.
     if !pack.video_is_regional() && classes.iter().any(|(m, _)| *m == Mode::Video) {
         tracing::warn!(
             pack = pack.name(),
-            "proteus: this pack has no regional VIDEO sources, so video capture falls back to \
-             the global PeerTube set - which may be unreachable from here. Browse cover is \
-             unaffected. Supply an --hls URL for a reachable stream, or use the lean tier, \
-             which is browse-only."
+            "proteus: this pack has no verified domestic VIDEO sources, so video capture falls \
+             back to the global PeerTube set - which may be unreachable from here. Browse cover \
+             is unaffected. Supply an --hls URL for a stream you know is reachable, name your \
+             own sources with --sources, or stay under the video budget threshold, which is \
+             browse-only."
         );
     }
     let mut was_usable = false;
@@ -1996,10 +2758,12 @@ async fn keep_fresh_inner(
     }
 }
 
-/// Resolve a source URL: `--hls`/random PeerTube for video, `--url`/random page for browse.
-async fn resolve_source(args: &Args, start: Instant) -> io::Result<Url> {
+/// Resolve a source: the pack's video sources for video, `--url`/random page for browse.
+async fn resolve_source(args: &Args, start: Instant) -> io::Result<Stream> {
     let parse = |u: &str| {
-        Url::parse(u).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
+        Url::parse(u)
+            .map(Stream::Hls)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
     };
     match args.mode {
         // Upload posts real bytes to a real server, so there is deliberately no
@@ -2029,20 +2793,33 @@ async fn resolve_source(args: &Args, start: Instant) -> io::Result<Url> {
             if let Some(u) = &args.hls {
                 return parse(u);
             }
+            // An operator-supplied command is the escape hatch for platforms
+            // that fight extraction: `--hls-cmd 'yt-dlp -g <url>'` gets yt-dlp's
+            // whole catalogue without Mirage depending on yt-dlp. Nothing is
+            // installed or required by default, and the shipped binary stays
+            // self-contained.
+            if let Some(cmd) = &args.hls_cmd {
+                return hls_from_command(cmd).map(Stream::Hls);
+            }
             let out = Arc::new(Mutex::new(Vec::new()));
             let mut f = Fetcher::new(start, out)?;
-            let hosts = args.pack.peertube_hosts();
-            let instances: Vec<String> = match &args.instance {
-                Some(i) => vec![i.clone()],
-                None => shuffled(hosts.len())
-                    .into_iter()
-                    .map(|i| hosts[i].clone())
-                    .collect(),
+            // `--peertube HOST` pins one instance and skips the pack entirely;
+            // it is how an operator names a source they have verified.
+            let groups: Vec<Vec<packs::VideoSource>> = match &args.instance {
+                Some(i) => vec![vec![packs::VideoSource::PeerTube(i.clone())]],
+                None => args.pack.video_sources(),
             };
-            for inst in &instances {
-                match peertube_hls(&mut f, inst).await {
-                    Ok(u) => return Ok(u),
-                    Err(e) => eprintln!("  {inst}: {e}"),
+            // Groups in order, shuffled WITHIN each group. Shuffling across a
+            // group boundary would let the global fallback beat the operator's
+            // own list on a coin flip - which is the bug this ordering exists to
+            // prevent, not a detail.
+            for group in &groups {
+                for i in shuffled(group.len()) {
+                    let src = &group[i];
+                    match video_source_stream(&mut f, src, args.rt.low_bitrate).await {
+                        Ok(s) => return Ok(s),
+                        Err(e) => eprintln!("  {}: {e}", video_source_label(src)),
+                    }
                 }
             }
             Err(io::Error::new(io::ErrorKind::Other, "no source resolved"))
@@ -2077,10 +2854,22 @@ pub async fn record_one(args: &Args, dir: &Path) -> io::Result<Cost> {
         // ceiling exists to remove.
         let mut rt = args.rt;
         rt.max_gap = Duration::from_secs_f64(args.max_gap_secs);
-        let recorded = match args.mode {
-            Mode::Video => record_stream(&src, rt).await,
-            Mode::Browse => record_browse(&src, rt).await,
-            Mode::Upload => record_upload(&src, args.up_bytes, args.up_chunks).await,
+        // Video dispatches on the CONTAINER the source turned out to serve, not
+        // on the mode: a DASH or progressive source is still a video capture and
+        // still lands in the video class, it is just driven by byte ranges
+        // instead of a segment playlist.
+        let recorded = match (args.mode, &src) {
+            (Mode::Video, Stream::Hls(u)) => record_stream(u, rt).await,
+            (
+                Mode::Video,
+                Stream::Ranged {
+                    url,
+                    bitrate_bps,
+                    referer,
+                },
+            ) => record_ranged(url, *bitrate_bps, referer.as_deref(), rt).await,
+            (Mode::Browse, s) => record_browse(s.as_url(), rt).await,
+            (Mode::Upload, s) => record_upload(s.as_url(), args.up_bytes, args.up_chunks).await,
         };
         match recorded {
             Ok(events) => {
@@ -2265,7 +3054,23 @@ pub async fn record_one(args: &Args, dir: &Path) -> io::Result<Cost> {
                 // freeze. Reject and record another REAL flow - selection among
                 // real captures, never synthesis of a busier-looking fake.
                 if cost.max_gap_secs > args.max_gap_secs {
-                    if attempt < 3 {
+                    // Retrying only helps when the stall was ACCIDENTAL - a
+                    // page that happened to be quiet, so another draw may be
+                    // busier. A realtime video capture's gaps are not accidental:
+                    // they ARE the source's segment durations, waited faithfully
+                    // because that is what makes the trace replayable as
+                    // continuous cover. Measured, Aparat and Turkey's NTV both
+                    // publish 10 s segments and OK.ru around 6 s, so every draw
+                    // from those sources stalls the same way and the retry is
+                    // provably futile - it just spends two more full recording
+                    // budgets (2 x 360 s) arriving at the same trace.
+                    //
+                    // The ranged path does NOT land here, because there the
+                    // recorder chooses the request size and sizes it to this very
+                    // ceiling. That is a real advantage of DASH/progressive
+                    // sources for latency, not an accident.
+                    let structural = matches!(args.mode, Mode::Video) && args.rt.real_time;
+                    if attempt < 3 && !structural {
                         if args.verbose {
                             eprintln!(
                                 "  attempt {attempt}: worst stall {:.1}s exceeds the {:.1}s \
@@ -2285,21 +3090,48 @@ pub async fn record_one(args: &Args, dir: &Path) -> io::Result<Cost> {
                     // page load is either fast (costly) or waiting (a gap), so
                     // cheap cover cannot also be smooth. Name that, because it
                     // is the actionable part.
-                    tracing::warn!(
-                        stall_secs = cost.max_gap_secs,
-                        ceiling_secs = args.max_gap_secs,
-                        budget_gb_day = ?args.max_gb_day,
-                        "proteus: could not find cover under the latency ceiling; keeping this \
-                         capture anyway. A low bandwidth budget forces bursty cover - raising \
-                         it is what lowers worst-case latency"
-                    );
-                    if args.verbose {
-                        eprintln!(
-                            "  WARNING: kept a {:.1}s worst stall, over the {:.1}s latency \
-                             ceiling (no smoother page found in 3 tries). Cheap cover cannot \
-                             also be smooth; raise the bandwidth budget to lower this.",
-                            cost.max_gap_secs, args.max_gap_secs
+                    if structural {
+                        // Raising the budget does NOT fix this one: a bigger
+                        // budget buys a fatter variant of the same stream, and
+                        // the segment durations - which are what the stalls are -
+                        // do not change. Saying "raise the budget" here would
+                        // send an operator to spend money on nothing.
+                        tracing::warn!(
+                            stall_secs = cost.max_gap_secs,
+                            ceiling_secs = args.max_gap_secs,
+                            "proteus: this video source publishes segments longer than the \
+                             latency ceiling, so its cover carries stalls that long. A real \
+                             player is genuinely silent between segments, so the capture is \
+                             faithful - the tunnel simply inherits the silence. Raising the \
+                             bandwidth budget will NOT shorten it. Use browse cover for \
+                             latency-sensitive traffic, a source with shorter segments, or a \
+                             DASH/progressive source, where the recorder sizes its own requests"
                         );
+                        if args.verbose {
+                            eprintln!(
+                                "  WARNING: kept a {:.1}s worst stall, over the {:.1}s ceiling. \
+                                 This source's SEGMENTS are that long, so every capture from it \
+                                 stalls the same way and a bigger budget will not help.",
+                                cost.max_gap_secs, args.max_gap_secs
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            stall_secs = cost.max_gap_secs,
+                            ceiling_secs = args.max_gap_secs,
+                            budget_gb_day = ?args.max_gb_day,
+                            "proteus: could not find cover under the latency ceiling; keeping \
+                             this capture anyway. A low bandwidth budget forces bursty cover - \
+                             raising it is what lowers worst-case latency"
+                        );
+                        if args.verbose {
+                            eprintln!(
+                                "  WARNING: kept a {:.1}s worst stall, over the {:.1}s latency \
+                                 ceiling (no smoother page found in 3 tries). Cheap cover cannot \
+                                 also be smooth; raise the bandwidth budget to lower this.",
+                                cost.max_gap_secs, args.max_gap_secs
+                            );
+                        }
                     }
                 }
                 // No ceiling means take whatever was recorded, however heavy.
@@ -2352,7 +3184,7 @@ pub async fn record_one(args: &Args, dir: &Path) -> io::Result<Cost> {
                         events.len(),
                         measured / 1024,
                         label,
-                        src.host_str().unwrap_or("?")
+                        src.host()
                     );
                     println!("  envelope: {cost}");
                 }
@@ -2382,30 +3214,35 @@ mod tests {
         let lib = std::env::temp_dir().join("mirage-cover-ceiling-test");
 
         // Unlimited: nothing to compare against, so nothing can be rejected.
-        let mut a = Args::auto_tier(
+        let mut a = Args::auto_budget(
             lib.clone(),
             Mode::Browse,
-            Tier::Lean,
+            Some(DEFAULT_MAX_GB_DAY),
             packs::SourcePack::Global,
         );
-        a.max_gb_day = CoverBudget::Named("unlimited".into()).gb_per_day(Tier::Lean.max_gb_day());
+        a.max_gb_day = CoverBudget::Named("unlimited".into()).gb_per_day(Some(DEFAULT_MAX_GB_DAY));
         assert_eq!(
             a.max_gb_day, None,
             "unlimited must leave the recorder with no ceiling to enforce"
         );
 
         // A number is carried through verbatim, not rounded to a tier.
-        let mut b = Args::auto_tier(lib, Mode::Browse, Tier::Lean, packs::SourcePack::Global);
-        b.max_gb_day = CoverBudget::GbPerDay(9.0).gb_per_day(Tier::Lean.max_gb_day());
+        let mut b = Args::auto_budget(
+            lib,
+            Mode::Browse,
+            Some(DEFAULT_MAX_GB_DAY),
+            packs::SourcePack::Global,
+        );
+        b.max_gb_day = CoverBudget::GbPerDay(9.0).gb_per_day(Some(DEFAULT_MAX_GB_DAY));
         assert_eq!(
             b.max_gb_day,
             Some(9.0),
-            "an explicit budget must override the tier, not be replaced by it"
+            "an explicit budget must override the default, not be replaced by it"
         );
         assert_ne!(
             b.max_gb_day,
-            Tier::Lean.max_gb_day(),
-            "9 GB/day must not silently become the lean tier's 2.5"
+            Some(DEFAULT_MAX_GB_DAY),
+            "9 GB/day must not silently become the 2.5 default"
         );
     }
 
@@ -2582,31 +3419,24 @@ mod tests {
     }
 
     #[test]
-    fn lean_is_the_default_and_aggressive_is_gone_but_still_parses() {
-        // Lean is the default because it measured no more detectable than the
-        // heavier tiers and costs the least - which matters most for the metered
-        // and mobile links this is actually used on.
-        assert_eq!(Tier::default(), Tier::Lean);
-        assert_eq!(Tier::default().max_gb_day(), Some(2.5));
+    fn legacy_tier_names_still_resolve_to_a_budget() {
+        // Tiers are gone from the API, but a config written against them must
+        // keep working rather than failing to parse on upgrade.
+        assert_eq!(legacy_tier_budget("lean"), Some(DEFAULT_MAX_GB_DAY));
+        assert_eq!(legacy_tier_budget("metered"), Some(DEFAULT_MAX_GB_DAY));
+        assert_eq!(legacy_tier_budget("balanced"), Some(6.0));
+        assert_eq!(legacy_tier_budget(" BALANCED "), Some(6.0));
 
-        // The old spellings still resolve, so an existing config keeps working
-        // instead of failing to parse on upgrade. They map to the strongest tier
-        // that remains, never to something MORE expensive than asked for.
-        assert_eq!(Tier::parse("aggressive"), Some(Tier::Balanced));
-        assert_eq!(Tier::parse("max"), Some(Tier::Balanced));
-        assert_eq!(Tier::parse("lean"), Some(Tier::Lean));
-        assert_eq!(Tier::parse("balanced"), Some(Tier::Balanced));
-        assert_eq!(Tier::parse("nonsense"), None);
+        // `aggressive` was the UNCAPPED tier. It resolves to a ceiling, never to
+        // `None`: it measured no less detectable than lean and was the only
+        // setting that produced a tunnel which would not come up, so honouring
+        // "no limit" would restore a footgun the measurements already closed.
+        assert_eq!(legacy_tier_budget("aggressive"), Some(6.0));
+        assert_eq!(legacy_tier_budget("max"), Some(6.0));
 
-        // No tier is uncapped any more. An unbounded cover budget bought no
-        // measurable reduction in detectability and was the only setting that
-        // produced a tunnel which would not come up.
-        for t in [Tier::Lean, Tier::Balanced] {
-            assert!(
-                t.max_gb_day().is_some(),
-                "{t:?} must have a bandwidth ceiling"
-            );
-        }
+        // An unrecognised spelling must not silently uncap; callers fall back to
+        // the default ceiling.
+        assert_eq!(legacy_tier_budget("nonsense"), None);
     }
 
     #[test]
@@ -2637,6 +3467,234 @@ mod tests {
         assert_eq!(v[0].0, 800_000);
         assert_eq!(v[0].1.as_str(), "https://cdn.example/v/360.m3u8");
         assert_eq!(v[1].1.as_str(), "https://cdn2.example/720.m3u8");
+    }
+
+    #[test]
+    fn a_stray_ampersand_before_the_query_is_repaired() {
+        // Measured on the Dogus CDN carrying Turkey's broadcast channels. The
+        // unrepaired form resolves to a path ending in `&` and answers 200 with
+        // an EMPTY body, so the failure looks like "no segments" and the whole
+        // source reads as broken rather than as one malformed URI.
+        let base = Url::parse("https://dogus.daioncdn.net/ntv/ntv.m3u8").unwrap();
+        let m = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=550000\nntv_360p.m3u8&?sid=abc&ce=2\n";
+        let v = parse_master(m, &base);
+        assert_eq!(
+            v[0].1.as_str(),
+            "https://dogus.daioncdn.net/ntv/ntv_360p.m3u8?sid=abc&ce=2"
+        );
+        // Only a `&` directly before the FIRST `?` is stripped; one inside a
+        // query value is a legitimate character and must survive.
+        assert_eq!(normalise_uri("a.m3u8?x=1&?y=2"), "a.m3u8?x=1&?y=2");
+        assert_eq!(normalise_uri("plain.m3u8"), "plain.m3u8");
+    }
+
+    #[test]
+    fn a_ranged_chunk_is_one_latency_budget_of_media() {
+        // The regression this pins: a FIXED 512 KiB chunk is 26.5 seconds of
+        // Bilibili's 158 kbit/s rendition, so a realtime capture idled 26.5 s
+        // between requests against a 2 s ceiling - every such capture rejected,
+        // or kept with a warning as cover that stalls the tunnel for 26 s. The
+        // chunk has to follow the cadence, not the other way round.
+        let gap = Duration::from_secs_f64(DEFAULT_MAX_GAP_SECS);
+        for bitrate in [158_000u64, 252_244, 654_777, 2_166_129] {
+            let chunk = range_chunk_bytes(bitrate, gap);
+            let secs = chunk as f64 * 8.0 / bitrate as f64;
+            assert!(
+                secs <= DEFAULT_MAX_GAP_SECS * RANGE_GAP_HEADROOM + 0.01,
+                "{bitrate} bit/s -> {chunk} B is {secs:.1}s of media; the ceiling is \
+                 {DEFAULT_MAX_GAP_SECS}s and the request itself needs headroom inside it"
+            );
+        }
+
+        // The old constant, stated as the failure it was.
+        let old = 512.0 * 1024.0 * 8.0 / 158_000.0;
+        assert!(old > 25.0, "sanity: the fixed chunk really was {old:.1}s");
+
+        // Clamps keep a pathological bitrate from producing a single-packet
+        // request or a multi-megabyte burst, neither of which a player makes.
+        assert_eq!(range_chunk_bytes(1, gap), RANGE_CHUNK_MIN);
+        assert_eq!(range_chunk_bytes(u64::MAX / 16, gap), RANGE_CHUNK_MAX);
+        // A zero gap must not ask for a zero-length range.
+        assert!(range_chunk_bytes(500_000, Duration::ZERO) >= RANGE_CHUNK_MIN);
+    }
+
+    #[test]
+    fn bilibili_dash_picks_by_bandwidth_in_both_directions() {
+        // Bilibili serves no HLS at all, so this is the only path to Chinese
+        // domestic video. Bandwidth choice IS the 24/7 cover bill, exactly as
+        // the HLS variant choice is.
+        let d: Value = serde_json::from_str(
+            r#"{"data":{"dash":{"video":[
+                 {"bandwidth":654777,"baseUrl":"https://cdn.test/hi.m4s"},
+                 {"bandwidth":252244,"baseUrl":"https://cdn.test/lo.m4s"}]}}}"#,
+        )
+        .unwrap();
+        let Some(Stream::Ranged {
+            url,
+            bitrate_bps,
+            referer,
+        }) = bilibili_stream(&d, true)
+        else {
+            panic!("expected a ranged stream");
+        };
+        assert_eq!(url.as_str(), "https://cdn.test/lo.m4s");
+        assert_eq!(bitrate_bps, 252_244);
+        // Without this the CDN answers 403 to every range.
+        assert_eq!(referer.as_deref(), Some("https://www.bilibili.com/"));
+
+        let Some(Stream::Ranged { url, .. }) = bilibili_stream(&d, false) else {
+            panic!("expected a ranged stream");
+        };
+        assert_eq!(url.as_str(), "https://cdn.test/hi.m4s");
+        assert!(bilibili_stream(&serde_json::json!({"code": -404}), true).is_none());
+    }
+
+    #[test]
+    fn aparat_offers_hls_and_a_progressive_fallback_together() {
+        // Both must be OFFERED, in that order. Returning only the HLS link made
+        // the fallback unreachable in exactly the case it exists for: that
+        // endpoint is a signed redirector that answers 400 in the wild, and the
+        // recorder's retry loop re-resolves and picks the same broken link every
+        // time. The caller validates the playlist and moves to the progressive
+        // file when it does not answer.
+        let both: Value = serde_json::from_str(
+            r#"{"data":{"attributes":{"hls":{"link":"https://aparat.test/m.m3u8"},
+                 "file_link_all":[
+                   {"profile":"144p","urls":["https://cdn.test/144.apt"]},
+                   {"profile":"720p","urls":["https://cdn.test/720.apt"]}]}}}"#,
+        )
+        .unwrap();
+        let c = aparat_candidates(&both, true);
+        assert_eq!(c.len(), 2, "HLS plus a progressive fallback: {c:?}");
+        assert!(matches!(&c[0], Stream::Hls(u) if u.as_str() == "https://aparat.test/m.m3u8"));
+        let Stream::Ranged {
+            url, bitrate_bps, ..
+        } = &c[1]
+        else {
+            panic!("second candidate must be ranged");
+        };
+        assert_eq!(url.as_str(), "https://cdn.test/144.apt");
+        assert_eq!(*bitrate_bps, aparat_profile_bps(Some("144p")));
+
+        // The budget picks the profile, exactly as it picks an HLS variant.
+        let Stream::Ranged { url, .. } = &aparat_candidates(&both, false)[1] else {
+            panic!("expected a ranged candidate");
+        };
+        assert_eq!(url.as_str(), "https://cdn.test/720.apt");
+
+        // No HLS field at all: the progressive file is the only candidate.
+        let prog: Value = serde_json::from_str(
+            r#"{"data":{"attributes":{"file_link_all":[
+                 {"profile":"360p","urls":["https://cdn.test/360.apt"]}]}}}"#,
+        )
+        .unwrap();
+        let c = aparat_candidates(&prog, true);
+        assert_eq!(c.len(), 1);
+        assert!(
+            matches!(&c[0], Stream::Ranged { url, .. } if url.as_str() == "https://cdn.test/360.apt")
+        );
+
+        // A response carrying neither must yield nothing rather than panic.
+        assert!(aparat_candidates(&serde_json::json!({ "data": {} }), true).is_empty());
+    }
+
+    #[test]
+    fn aparat_hashes_are_alphanumeric_uids() {
+        let body = r#"{"data":[{"attributes":{"uid":"civlzbq"}},{"attributes":{"uid":"civlzbq"}},
+                      {"attributes":{"uid":"x5bnk56"}},{"attributes":{"uid":"not a hash!"}}]}"#;
+        assert_eq!(aparat_hashes(body), vec!["civlzbq", "x5bnk56"]);
+    }
+
+    #[test]
+    fn an_extractor_command_yields_its_last_url() {
+        // `yt-dlp -g` prints the video URL then the audio URL, so the last line
+        // is the one to take. Non-URL chatter must not be mistaken for output.
+        let u = hls_from_command(
+            "echo picking best format; echo https://a.test/v.m3u8; echo https://a.test/audio.m3u8",
+        )
+        .expect("command");
+        assert_eq!(u.as_str(), "https://a.test/audio.m3u8");
+        // A command that prints nothing usable must fail loudly rather than
+        // silently recording from somewhere else.
+        assert!(hls_from_command("echo no url here").is_err());
+        assert!(hls_from_command("exit 3").is_err());
+    }
+
+    #[test]
+    fn scan_finds_a_manifest_through_double_escaping() {
+        // The literal bytes OK.ru serves: a JSON string inside an HTML attribute,
+        // escaped twice. A scanner that skips the unescape finds a URL truncated
+        // at the first `&` and fetches a 400, so this is the case that matters.
+        let base = Url::parse("https://ok.ru/video/14941296593488").unwrap();
+        let page = r#"<div data-options="{\&quot;hlsManifestUrl\&quot;:\&quot;https://ok6-31.vkuser.net/video.m3u8?cmd=videoPlayerCdn\\u0026expires=1785967790424\\u0026mid=14941296593488\&quot;}"></div>"#;
+        let found = scan_manifests(page, &base);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let u = found[0].as_str();
+        assert!(u.starts_with("https://ok6-31.vkuser.net/video.m3u8?cmd=videoPlayerCdn"));
+        assert!(u.contains("&expires=1785967790424"), "query survived: {u}");
+        assert!(u.ends_with("&mid=14941296593488"), "not truncated: {u}");
+        assert!(!u.contains('\\'), "no stray backslash: {u}");
+    }
+
+    #[test]
+    fn scan_resolves_relative_manifests_and_keeps_commas() {
+        let base = Url::parse("https://v.example/watch/1").unwrap();
+        // A comma is legal in a query string - Rutube lists variant GUIDs that
+        // way - so it must not terminate the URL going forward.
+        let page = "var src = \"/hls/master.m3u8?guids=a_1080,b_720\";";
+        let found = scan_manifests(page, &base);
+        assert_eq!(
+            found.iter().map(Url::as_str).collect::<Vec<_>>(),
+            vec!["https://v.example/hls/master.m3u8?guids=a_1080,b_720"]
+        );
+    }
+
+    #[test]
+    fn scan_ignores_a_page_with_no_manifest() {
+        let base = Url::parse("https://v.example/").unwrap();
+        assert!(scan_manifests("<html><body>no video here</body></html>", &base).is_empty());
+    }
+
+    #[test]
+    fn rutube_ids_are_32_hex_under_video() {
+        // Only the fixed-width hex form is a video id; `/video/browse` and short
+        // hex fragments are navigation, and asking the play-options API about
+        // them wastes a round trip per candidate.
+        let html = "<a href=\"/video/0159941b24c63763c4a9aed839fad682/\">x</a>\
+                    <a href=\"/video/browse/\">nav</a>\
+                    <a href=\"/video/abc123/\">short</a>\
+                    <a href=\"/video/0159941b24c63763c4a9aed839fad682/\">dup</a>";
+        assert_eq!(
+            rutube_ids(html),
+            vec!["0159941b24c63763c4a9aed839fad682".to_string()]
+        );
+    }
+
+    #[test]
+    fn rutube_play_options_yields_the_master_playlist() {
+        let v: Value = serde_json::from_str(
+            r#"{"video_balancer":{"m3u8":"https://bl.rutube.ru/route/abc.m3u8?sign=x&expire=1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rutube_m3u8(&v).map(|u| u.as_str().to_string()),
+            Some("https://bl.rutube.ru/route/abc.m3u8?sign=x&expire=1".to_string())
+        );
+        // A response without a balancer must not panic or invent a URL.
+        assert!(rutube_m3u8(&serde_json::json!({"detail": "not found"})).is_none());
+    }
+
+    #[test]
+    fn links_containing_selects_only_video_pages() {
+        let base = Url::parse("https://ok.ru/video").unwrap();
+        let html = "<a href=\"/video/14941296593488\">a</a>\
+                    <a href=\"/profile/123\">b</a>\
+                    <a href=\"/video/14941296593488\">dup</a>";
+        let v = links_containing(html, &base, "/video/");
+        assert_eq!(
+            v.iter().map(Url::as_str).collect::<Vec<_>>(),
+            vec!["https://ok.ru/video/14941296593488"]
+        );
     }
 
     #[test]

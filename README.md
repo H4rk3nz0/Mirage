@@ -14,8 +14,8 @@
   <a href="docs/security-model.md">Security model</a>
 </p>
 
-> **Status:** `0.1.3-alpha.1`. Deployable today. Wire formats and config may still change
-> before `0.1.0`.
+> **Status:** `0.1.6-alpha.1`. Deployable today. Wire formats and config may still change
+> before a stable release.
 
 Mirage is not a single protocol. It is a **stack of interchangeable layers** - you pick
 what your network lets through, and the same session crypto rides on top of any of them.
@@ -74,10 +74,10 @@ files to copy anywhere.
 | | |
 |---|---|
 | **Both directions** | Client shapes what it sends up, bridge shapes what it sends down - a censor watching either sees real traffic. |
-| **Never twice the same** | Each session chains a random shuffle of real traces, so there's no fixed fingerprint and nothing loops. |
-| **Cover classes** | Web browsing by default; video too on the `balanced` tier - a video capture is the better downstream disguise, but its upstream is too sparse to carry a handshake, so the two get paired. |
-| **Self-contained** | The recorder pulls from real open sources (PeerTube, Wikipedia) using its own TLS stack - no yt-dlp, ffmpeg, tcpdump or python. |
-| **Demand alignment** | Big records are steered to the moments your data is actually waiting. Same timing, same sizes, same bandwidth - just spent when it is wanted. Measured 10x throughput for zero extra cost. |
+| **Never twice the same** | Each session chains a random shuffle of real traces from ONE cover class, so there's no fixed fingerprint, nothing loops, and the session's rate never steps mid-flow the way a mixture's does. |
+| **Cover classes** | Web browsing by default; video too once the budget reaches 6 GB/day - a video capture is the better downstream disguise, but its upstream is too sparse to carry a handshake, so the two get paired. |
+| **Self-contained** | The recorder pulls from real open sources using its own TLS stack - no yt-dlp, ffmpeg, tcpdump or python. Video sources are regional (PeerTube globally; Rutube/OK.ru, Aparat, Bilibili, puhutv domestically), and `--hls-cmd` can hand off to an external extractor if you want one, without Mirage depending on it. |
+| **No demand following** | Steering big records to the moments your data is waiting was implemented, measured at **0.699** separability against a 0.544 control, and switched OFF (`ALIGN_ALPHA_PERMILLE = 0`). A rate that tracks demand is the signal Proteus exists to remove, so the wire is identical busy or idle - enforced by a test. Throughput comes from choosing SMOOTHER cover instead. |
 | **Not every carrier** | Seven carriers wear the envelope. Plain TCP, obfs-tcp, dnstt and WebRTC do not, and nothing warns you - see [proteus.md](docs/proteus.md). |
 
 ### What it costs, plainly
@@ -87,13 +87,12 @@ Cover runs for as long as a session is open, busy or idle, so the envelope's rat
 means. (Per session-day: a client connected two hours a day pays for two hours, not
 twenty-four.)
 
-| tier | cover bill | sustained |
+| budget | cover bill | sustained |
 |---|---|---|
-| `lean` (default) | 2.5 GB/day | ~0.23 Mbit/s |
-| `balanced` | 6 GB/day | ~0.56 Mbit/s |
+| 2.5 GB/day (default) | 2.5 GB/day | ~0.23 Mbit/s |
+| 6 GB/day (video cover) | 6 GB/day | ~0.56 Mbit/s |
 
-Set your own instead of picking a tier - a number in GB/day, or `unlimited` for "I do not
-care, go fast":
+Set it directly - a number in GB/day, or `unlimited` for "I do not care, go fast":
 
 ```json
 { "proteus": true, "proteus_max_gb_day": 40 }
@@ -112,7 +111,7 @@ So the speed is a spending decision, not a property of the tool:
 | a real 1080p stream | ~5 Mbit/s | ~2 GB/hour connected | not yet validated |
 | a real 4K stream | 15-25 Mbit/s | 7-11 GB/hour connected | not yet validated |
 
-At the default tiers Proteus is a low-bandwidth channel - messaging, text, light browsing.
+At the default budget Proteus is a low-bandwidth channel - messaging, text, light browsing.
 It is not *inherently* one: browse cover is slow because web pages are small, and the
 budget is what admits a faster class. The video rows above are what the arithmetic says a
 real stream's envelope would carry; **they have not been run end to end**, so treat them as
@@ -120,8 +119,11 @@ the design's intent rather than a shipped capability. A deployment that needs li
 will not pay for it should run Reality or Shadowsocks-2022 *without* Proteus and accept
 that flow shape is then exposed to traffic analysis.
 
-Raising the budget also buys **latency**, not just throughput - bounding the cover's silent
-gaps is what stops short transfers waiting for the next burst. See
+Raising the budget also buys **latency** for browse cover - bounding the silent gaps is what
+stops short transfers waiting for the next burst. It does **not** for video: a video capture
+waits each segment's true duration, so the tunnel inherits a stall the length of one segment
+(measured 5.8 s on PeerTube, 10 s on Aparat), and a bigger budget only buys a fatter variant
+of the same stream. Video buys throughput; browse buys latency. See
 [proteus.md](docs/proteus.md) for the measurements and the concavity argument behind it.
 
 Want a *specific* envelope - your own site, a particular stream? Record it with

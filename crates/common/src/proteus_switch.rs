@@ -69,12 +69,14 @@ impl ProteusSwitch {
         self.mode().is_some()
     }
 
-    /// The cost tier named by this value, as a lowercase string, or `None` when
-    /// the value names no tier (in which case the caller's default applies).
+    /// The legacy cost-tier name in this value, lowercased, or `None` when it
+    /// names none (in which case the caller's default budget applies).
     ///
-    /// Kept as a string rather than a typed enum because `mirage-common` sits
-    /// below `mirage-cover`, where the tier is defined; the daemons parse it
-    /// there via `Tier::parse`.
+    /// Tiers are gone as a concept - what they set was a bandwidth ceiling, not
+    /// a concealment level - but a config written against them has to keep
+    /// working. `mirage-common` sits below `mirage-cover`, so the name is passed
+    /// up as a string and resolved to a GB/day ceiling there via
+    /// `mirage_cover::legacy_tier_budget`.
     #[must_use]
     pub fn tier_name(&self) -> Option<String> {
         match self {

@@ -296,7 +296,7 @@ fn pace_base(now: Instant, first_t: f64, is_replay: bool) -> Instant {
 
 /// How many upcoming tokens the size aligner may choose among.
 ///
-/// 32 measured best in `tools/shaper-eval/alignment.py`. Larger windows buy
+/// 32 measured best in the offline alignment study. Larger windows buy
 /// little extra throughput and give the aligner more room to restructure the
 /// sequence, which is the thing that costs detectability.
 const ALIGN_WINDOW: usize = 32;
@@ -313,8 +313,7 @@ const ALIGN_WINDOW: usize = 32;
 /// clustering real captures already contain.
 ///
 /// So an operator turning this up "to go faster" would make the tunnel MORE
-/// detectable while barely gaining, which is why it is a constant. See
-/// `tools/shaper-eval/ALIGNMENT.md`.
+/// detectable while barely gaining, which is why it is a constant.
 /// DISABLED (0). Measured on a live cluster, alignment is an ACTIVITY SIGNAL.
 ///
 /// The reasoning that justified it was wrong in a specific and instructive way.
@@ -339,7 +338,7 @@ const ALIGN_WINDOW: usize = 32;
 /// with `max_size` and `size_stddev` as the winning separators - both
 /// size-marginal, exactly the family the invariance argument claimed was safe.
 ///
-/// The offline study in `tools/shaper-eval/ALIGNMENT.md` compared pooled aligned
+/// The offline study that justified alignment compared pooled aligned
 /// sequences against pooled originals and never split them into idle and active
 /// windows, so it could not see this and reported the floor. That is the lesson
 /// worth keeping: the metric has to be computed the way the ADVERSARY computes
@@ -1551,8 +1550,32 @@ fn read_profile(path: &str, seed: u64, cover_host: Option<&str>) -> Option<Strin
         } else {
             downstream
         };
-        for sub in pool {
-            traces.extend(csv_traces_in(&sub));
+        // ONE class per session, chosen by the shared seed - not a pooled mix.
+        //
+        // Pooling classes puts traces of very different rates in one chain, and
+        // the session's rate then swings phase-to-phase with whichever trace the
+        // shuffle drew. That is the same defect that made the UPSTREAM class
+        // poisonous above, and it is not specific to upstream: measured on the
+        // global pack, realtime browse captures run 494-960 kbit/s over 24-32 s
+        // while a realtime video capture runs 330 kbit/s over 360 s, so a mixed
+        // chain swings ~2.9x within one session. Rate variance is exactly what
+        // raises the separability floor - a censor does not need to identify the
+        // class, only to notice that the flow's rate steps in a way a real
+        // session's does not.
+        //
+        // Both endpoints sort the same directory names and derive the same seed,
+        // so they select the same class and replay stays joint. Coverage is
+        // unaffected: every class is still worn, just whole-session rather than
+        // interleaved, which is also what a real user does - they watch a video
+        // OR read pages, not both in alternating four-second phases.
+        //
+        // Falls through to the next class if the chosen one is empty, because an
+        // empty schedule does not degrade to unpaced - it HANGS the session.
+        for &i in seeded_order(pool.len(), seed).iter() {
+            traces.extend(csv_traces_in(&pool[i]));
+            if !traces.is_empty() {
+                break;
+            }
         }
     }
     if traces.is_empty() {
@@ -1755,6 +1778,141 @@ mod tests {
         std::fs::create_dir_all(empty.join("browse")).expect("mkdir");
         assert!(read_profile(empty.to_str().expect("utf8"), 7, None).is_none());
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_active_tunnel_emits_the_same_wire_as_an_idle_one() {
+        // The activity signal, simulated at the only layer where activity can
+        // reach the wire at all.
+        //
+        // `SizeAligner::next` is handed `has_data`, and when `deviate` fires it
+        // takes the LARGEST buffered size while the app has bytes queued and the
+        // SMALLEST while it does not. That is a demand-following rate, and it was
+        // measured at 0.699 separability against a 0.544 control - which is why
+        // `ALIGN_ALPHA_PERMILLE` is 0 and the branch is unreachable.
+        //
+        // Unreachable today is not the same as unreachable tomorrow. This drives
+        // the real aligner over a real schedule twice - once as a saturated
+        // tunnel, once as a silent one - and asserts the emitted size sequence is
+        // byte-identical. If anyone re-enables alignment, or makes emission
+        // depend on the queue in some new way, this fails instead of shipping an
+        // activity signal.
+        //
+        // Verified to FAIL with ALIGN_ALPHA_PERMILLE set to 1000.
+        let csv = (0..400)
+            .map(|i| {
+                // Sizes that vary enough for "largest" and "smallest" to differ.
+                let sz = 200 + (i * 37) % 1200;
+                format!("0,{:.3},{sz},1", f64::from(i) * 0.01)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let profile = std::sync::Arc::new(
+            crate::pacer::MeasuredProfile::from_csv(&csv).expect("profile from csv"),
+        );
+
+        let run = |has_data: bool| -> Vec<usize> {
+            let mut stream = ScheduleStream::replay(profile.clone(), 42);
+            let mut aligner = SizeAligner::new(42);
+            (0..600)
+                .map(|_| aligner.next(&mut stream, Dir::Down, has_data).bytes)
+                .collect()
+        };
+
+        let active = run(true);
+        let idle = run(false);
+        assert_eq!(
+            active.len(),
+            idle.len(),
+            "an active tunnel emitted a different NUMBER of records than an idle one"
+        );
+        assert_eq!(
+            active, idle,
+            "the wire differs between a busy tunnel and a silent one - that is an \
+             activity signal, which is the whole thing Proteus exists to remove"
+        );
+        // Not vacuous: the schedule really does carry varied sizes, so an aligner
+        // that steered by demand would have produced a different sequence.
+        let distinct: std::collections::HashSet<usize> = active.iter().copied().collect();
+        assert!(
+            distinct.len() > 8,
+            "schedule too flat to detect steering: {} distinct sizes",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn a_session_wears_one_cover_class_not_a_mixture() {
+        // Pooling classes into one chain makes the session's RATE swing
+        // phase-to-phase with whichever trace the shuffle drew, and rate variance
+        // is what raises the separability floor - a censor need not identify the
+        // class, only notice a flow whose rate steps in a way a real session's
+        // does not. Measured on the global pack: realtime browse runs 494-960
+        // kbit/s over 24-32 s while realtime video runs 330 kbit/s over 360 s, so
+        // a mixed chain swung about 2.9x inside one session.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CTR: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "proteus_oneclass_{}_{}",
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(root.join("browse")).unwrap();
+        std::fs::create_dir_all(root.join("video")).unwrap();
+        for i in 0..4 {
+            std::fs::write(
+                root.join(format!("browse/{i}.csv")),
+                "t,size,dir\n0.0,111,1\n1.0,111,1\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(format!("video/{i}.csv")),
+                "t,size,dir\n0.0,222,1\n1.0,222,1\n",
+            )
+            .unwrap();
+        }
+        let root_s = root.to_str().unwrap();
+
+        // Whatever seed is used, a session must be pure: one class, never both.
+        let mut saw_browse = false;
+        let mut saw_video = false;
+        for seed in 0..24u64 {
+            let sched = read_profile(root_s, seed, None).expect("a schedule");
+            let b = sched.contains(",111,");
+            let v = sched.contains(",222,");
+            assert!(b || v, "seed {seed} produced no cover at all");
+            assert!(
+                !(b && v),
+                "seed {seed} mixed browse and video into one session"
+            );
+            saw_browse |= b;
+            saw_video |= v;
+        }
+        // ...and coverage is preserved: every class is still worn across sessions.
+        assert!(
+            saw_browse && saw_video,
+            "both classes must still be reachable - dropping one would narrow cover"
+        );
+
+        // Both endpoints derive the same seed, so they must build the SAME schedule.
+        for seed in [0u64, 7, 99] {
+            assert_eq!(
+                read_profile(root_s, seed, None),
+                read_profile(root_s, seed, None),
+                "selection must be deterministic or replay stops being joint"
+            );
+        }
+
+        // An empty class must not hand back an empty schedule: that HANGS the
+        // session rather than degrading to unpaced.
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        for seed in 0..24u64 {
+            assert!(
+                read_profile(root_s, seed, None).is_some(),
+                "seed {seed} fell into the empty class and produced nothing"
+            );
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 

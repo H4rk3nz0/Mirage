@@ -144,7 +144,7 @@ Every one is in the standard build.
 | **`mirage-publish`** | Publishes bridge announcements to Nostr / DNS / DHT. Run on your workstation. |
 | **`mirage-rotate`** | Key and invite rotation. |
 | **`mirage-cover-fetch`** | Downloads a real TLS transcript to use as cover material. |
-| **`mirage-cover-record`** | Records real traffic (video, web-browsing, or upload) into a Proteus replay library. Optional - `proteus = true` makes the daemon source its own; this is for pinning a specific envelope. Self-contained, no external tools. |
+| **`mirage-cover-record`** | Records real traffic (video, web-browsing, or upload) into a Proteus replay library. Optional - `proteus = true` makes the daemon source its own; this is for pinning a specific envelope. Self-contained, no external tools. Video sources are per-region and domestic-only (`--sources cn\|ir\|ru\|tr`), HLS and DASH/progressive both supported, and `--check-sources` reports which of them still resolve from your network. |
 | **`mirage-cohort-refresh`** | Diagnostic: asks a bridge for a cohort update. |
 | **`mirage-pt-client`** | Tor pluggable-transport (PT 2.1) adapter - run Mirage as a Tor PT. |
 

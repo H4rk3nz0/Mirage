@@ -1430,27 +1430,29 @@ fn apply_paranoid_bridge(config: &mut BridgeConfig, start_sourcing: bool) {
             // step must not be able to abort the process. Every caller today is
             // inside the runtime; degrade rather than rely on that staying true.
             if start_sourcing && tokio::runtime::Handle::try_current().is_ok() {
-                let tier = config
+                // A legacy `lean`/`balanced` name resolves to the ceiling it
+                // used to mean; anything else falls back to the default rather
+                // than silently uncapping.
+                let named_budget = config
                     .proteus
                     .as_ref()
                     .and_then(|p| p.tier_name())
-                    .and_then(|t| mirage_cover::Tier::parse(&t))
-                    .unwrap_or_default();
+                    .and_then(|t| mirage_cover::legacy_tier_budget(&t))
+                    .unwrap_or(mirage_cover::DEFAULT_MAX_GB_DAY);
                 let pack = config
                     .proteus_sources
                     .as_deref()
                     .and_then(mirage_cover::packs::SourcePack::parse)
                     .unwrap_or_default();
-                // An explicit budget overrides the tier's ceiling; "unlimited"
-                // resolves to no cap at all. The tier then only decides which
-                // classes to record.
+                // An explicit budget overrides any named default; "unlimited"
+                // resolves to no cap at all. The budget then decides the classes
+                // too, via `classes_for_budget`.
                 let ceiling = config
                     .proteus_max_gb_day
                     .as_ref()
-                    .map_or_else(|| tier.max_gb_day(), |b| b.gb_per_day(tier.max_gb_day()));
+                    .map_or_else(|| Some(named_budget), |b| b.gb_per_day(Some(named_budget)));
                 tracing::info!(
                     library = %dir.display(),
-                    ?tier,
                     ceiling_gb_day = ?ceiling,
                     sources = pack.name(),
                     "proteus: no profile configured, sourcing cover automatically"
@@ -1458,9 +1460,8 @@ fn apply_paranoid_bridge(config: &mut BridgeConfig, start_sourcing: bool) {
                 // Pass the RESOLVED ceiling, not the tier's. Computing it for
                 // the log and then handing the recorder the tier default made
                 // "unlimited" a no-op that reported itself as applied.
-                tokio::spawn(mirage_cover::keep_fresh_tier_budget(
+                tokio::spawn(mirage_cover::keep_fresh_sourcing(
                     dir.clone(),
-                    tier,
                     pack,
                     ceiling,
                 ));

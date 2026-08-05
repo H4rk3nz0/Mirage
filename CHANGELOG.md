@@ -8,6 +8,53 @@ then, pre-releases may make breaking changes between versions.
 ## [Unreleased]
 
 ### Added
+- **Regional VIDEO cover for every pack, and a container format to carry it.**
+  Video sourcing was PeerTube-only, so on a censored network the video class
+  reached for hosts that are blocked there - which both fails and is conspicuous
+  while failing. Each pack now names its own domestic sources with the DISCOVERY
+  METHOD alongside the host, because there is no universal route from a video page
+  to a playable stream:
+  - `ru` - Rutube (its video-list API needs credentials, but the per-video
+    play-options endpoint is public) and OK.ru (manifest inlined in the page,
+    double-escaped inside JSON inside an HTML attribute).
+  - `ir` - Aparat, HLS with a progressive fallback for when its signed redirector
+    refuses.
+  - `cn` - Bilibili, which serves **no HLS at all**.
+  - `tr` - the Dogus broadcast channels via puhutv.
+  - A generic scanner for any site that inlines a manifest, used first for a
+    custom `--sources` list.
+  The barrier to covering a region was never that these platforms are hard to
+  extract from - Bilibili's API is public and takes no credentials. It was that
+  the recorder spoke one container format. `Stream::Ranged` adds byte-range
+  driving for DASH and progressive sources, paced at the representation's real
+  bitrate, reusing the ranged-fetch path that already served PeerTube's
+  `#EXT-X-BYTERANGE` playlists.
+- `--hls-cmd <command>` - records whatever HLS URL an external extractor prints,
+  for platforms that actively fight extraction. Mirage does not depend on yt-dlp:
+  nothing is installed or invoked unless the flag is set, and `Args::auto`
+  hardcodes it off so unattended daemon sourcing can never shell out.
+- `--check-sources` - resolves every BROWSE and VIDEO source a pack names,
+  without recording, and reports which work from THIS network. The source lists
+  are reachability claims that rot silently: a site swaps its player, an API
+  starts demanding credentials, an instance goes offline, and each one presents at
+  runtime as a class that quietly never fills. On its first run it found
+  `diode.zone` answering HTTP 502 and `telewebion.com` gone from public DNS.
+- `.github/workflows/cover-source-drift.yml` - runs that probe weekly. Its header
+  states the limit plainly: a US/EU runner can confirm an adapter still matches a
+  site's API, never that the site is reachable from Iran or China, which is the
+  property a regional pack actually claims.
+- `scripts/wire-auc/` - censor-vantage ACTIVE-vs-IDLE separability with **no root,
+  no containers and no capture privileges**, for hosts where the podman harness
+  cannot run. A relay between a real client and a real bridge parses TLS record
+  headers off the stream; read() sizes are a kernel-buffering artefact, record
+  sizes are what crossed.
+- `tools/cover-sources/class-mixing-auc.py` and `class-mixing-gaps.py` -
+  reproduce the class-mixing measurement below on the size and timing axes.
+- Two guardrails that were each verified to FAIL when the defect they cover is
+  reintroduced, rather than merely to pass:
+  `adversary/tests/cover_class_mixing.rs` (a session must wear one cover class)
+  and `paced::tests::an_active_tunnel_emits_the_same_wire_as_an_idle_one` (the
+  emitted record sequence must not depend on whether the app has bytes queued).
 - **A permutation-derived null for the flow distinguisher**
   (`flow_classifier::null_model` / `NullModel::verdict`, used by
   `examples/flow_auc`). The old verdict compared the best of 14 features against
@@ -35,13 +82,12 @@ then, pre-releases may make breaking changes between versions.
   margin over each pooling level's OWN floor, because pooling shrinks the sample
   and the floor rises as samples fall - so raw accuracy climbs for two unrelated
   reasons and only the margin separates them.
-- `tools/shaper-eval/segments.py` - tests whether an activity signal is TCP
-  segment merging rather than the pacer. The classifier keys on sizes only, so any
-  separability it reports is a size-sequence difference and cannot be a timing
-  artifact; the pacer's frames are token-determined and identical idle or busy, so
-  a difference must enter below it. Refuted for this carrier: runs longer than one
-  frame measured 0.3% idle against 0.4% active, with an unchanged histogram.
-- `tools/shaper-eval/capacity.py` and a README for the directory.
+- TCP segment merging was ruled out as a source of apparent activity signal. The
+  classifier keys on sizes only, so any separability it reports is a size-sequence
+  difference and cannot be a timing artifact; the pacer's frames are
+  token-determined and identical idle or busy, so a difference would have to enter
+  below it. Refuted for this carrier: runs longer than one frame measured 0.3%
+  idle against 0.4% active, with an unchanged histogram.
 - **Proteus - replay-based traffic shaping, the flagship Reality upgrade.**
   Reality makes the *connection* look real; Proteus makes the *flow* look real,
   replaying the exact wire envelope (record sizes, direction, timing) of a
@@ -95,6 +141,39 @@ then, pre-releases may make breaking changes between versions.
   invite).
 
 ### Changed
+- **A session now wears ONE cover class, chosen from the shared seed, instead of
+  a pooled mixture.** `read_profile` chained traces from every downstream class at
+  once, so a session's rate stepped phase-to-phase with whichever trace the
+  shuffle drew. Measured with the project's own 14-feature distinguisher over real
+  captures, that was decisively separable - it resembles neither a browsing
+  session nor a streaming one, because it is a chimera of the two:
+
+  | session construction | size axis | timing axis | pooled 16 windows |
+  |---|---|---|---|
+  | pooled vs real browse | **0.807** | **0.808** | **1.000** |
+  | pooled vs real video | **0.759** | - | **1.000** |
+  | one class vs its own reference | 0.511 / 0.517 | 0.506 / 0.510 | 0.532-0.599 |
+
+  Floor 0.552. Both endpoints sort the same directory names and derive the same
+  seed, so they choose alike and replay stays joint; coverage is unchanged, every
+  class is still worn, just whole-session. That is also closer to what a real user
+  does - watch a video OR read pages, not both in alternating four-second phases.
+  The earlier fix that excluded the UPSTREAM class was right but incomplete: the
+  defect is pooling classes of different rates at all.
+- **Tiers are gone.** `Tier` was a two-variant enum threaded through five
+  `keep_fresh_*` wrappers into a function that did nothing with it
+  (`let _ = tier;`); its only live use was supplying a default budget. Replaced by
+  `DEFAULT_MAX_GB_DAY` and `legacy_tier_budget`, with the `keep_fresh_*` family
+  collapsed from five entry points to three. Old configs keep working -
+  `lean`/`cheap`/`metered` resolve to 2.5 GB/day, `balanced`/`aggressive`/`max` to
+  6.0. Note `aggressive` was UNCAPPED and deliberately does not resolve to "no
+  limit": it measured no less detectable than lean and was the only setting that
+  produced a tunnel which would not come up.
+- Documentation now separates what the budget buys. Raising it lowers worst-case
+  latency for BROWSE cover; it does nothing for video, where the stall is one
+  segment long and a bigger budget only buys a fatter variant of the same stream.
+  README, the operator guide and `docs/proteus.md` all said otherwise.
+
 - The README now headlines Proteus as the flagship Reality upgrade; the feature
   and operator docs cover cover classes, paranoid mode, and the cover recorder.
 - **Proteus cover is selected for smoothness, not just cost.** `min(capacity,
@@ -116,6 +195,38 @@ then, pre-releases may make breaking changes between versions.
   is documented for the first time.
 
 ### Fixed
+- **The ranged recorder's chunk size was a fixed 512 KiB, which is 26.5 seconds of
+  Bilibili's low-bitrate rendition against a 2 s latency ceiling.** Since
+  `Args::auto` sets `real_time`, this was the default in-daemon path: China's
+  video class could not produce an acceptable trace at all. A request now carries
+  one latency budget's worth of media (at 60% of the ceiling, leaving headroom for
+  the request's own time to first byte), derived from the bitrate rather than
+  fixed in bytes. Realtime Bilibili went from never completing to 1.9 s worst
+  stall, accepted first attempt.
+- **The recorder retried realtime video captures for a stall it could never
+  avoid.** Segment duration is a publisher property, so redrawing yields another
+  stream that stalls identically - measured on Aparat at 10.2 s, 13.3 s, 10.1 s
+  across three full 360 s recording budgets, about 18 minutes, before keeping the
+  trace anyway. Realtime video stalls now skip straight to keeping, and the
+  warning no longer advises raising the bandwidth budget, which would not have
+  helped. Turkey went from ~18 minutes per capture to 3:03.
+- **Aparat's progressive fallback was unreachable in the case it exists for.** The
+  HLS link was returned whenever it merely parsed, so the fallback only fired if
+  the field was absent - never when that signed redirector answered 400, which it
+  does. The candidate is now validated before use.
+- `telewebion.com` in the Iran browse pack answered NXDOMAIN from public DNS, so
+  the recorder lost a source every time it drew that entry. Replaced with
+  `divar.ir` and `zoomit.ir`.
+- **Two `mirage-cover-record` binaries were built, and which one shipped depended
+  on build order.** Cargo auto-discovered a stale 980-line standalone copy in
+  `crates/bridge/src/bin/` that had not been touched since v0.1.4-alpha.2 and knew
+  nothing about source packs, budgets or the upstream class; `cargo build` emitted
+  an output-filename collision warning that had gone unread.
+- `resolve_source` shuffled the whole video source list, so a custom `--sources`
+  list could lose to the global PeerTube fallback on a coin flip, contradicting
+  "an explicit list always wins over any preset". Sources are now grouped by
+  preference and shuffled only within a group.
+
 - **Cover acceptance measured gaps in one direction only.** `Cost` computed its
   worst gap over downstream records while `paced_handshake_budget` correctly took
   the worst over both, so nothing stopped a capture that supplies upstream from
@@ -150,6 +261,15 @@ then, pre-releases may make breaking changes between versions.
 - Cover captures now also report worst upstream gap and time-to-first-token per
   direction, so an operator reading a log can tell which ceiling a rejected
   capture missed.
+
+### Removed
+- `crates/bridge/src/bin/mirage-cover-record.rs` - a stale standalone duplicate of
+  the recorder that Cargo auto-discovered as a second binary of the same name.
+- `mirage_cover::Tier`, `Args::auto_tier`, `keep_fresh_tier`,
+  `keep_fresh_tier_budget` and `keep_fresh_until`. Configuration is unaffected;
+  the legacy tier NAMES still parse via `legacy_tier_budget`.
+- `SourcePack::peertube_hosts` - superseded by `video_sources`, which returns
+  preference-ordered groups of `VideoSource` rather than a flat host list.
 
 ### Security
 - `event-listener` 5.4.1 -> 5.4.2, clearing RUSTSEC-2026-0221 (`StackSlot<'_, T>`

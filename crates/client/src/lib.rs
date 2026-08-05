@@ -2410,7 +2410,6 @@ fn collect_transports(config: &ClientConfig) -> Result<Vec<TransportMode>, Strin
 /// degrades to pacing from whatever library already exists rather than crashing.
 fn spawn_cover_sourcing(
     dir: std::path::PathBuf,
-    tier: mirage_cover::Tier,
     pack: mirage_cover::packs::SourcePack,
     max_gb_day: Option<f64>,
 ) {
@@ -2418,7 +2417,6 @@ fn spawn_cover_sourcing(
         COVER_SOURCING.store(true, std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(mirage_cover::keep_fresh_budget(
             dir,
-            tier,
             pack,
             max_gb_day,
             cover_stop_flag(),
@@ -2473,12 +2471,15 @@ fn apply_paranoid(config: &mut ClientConfig, start_sourcing: bool) {
         None => {
             let dir = mirage_cover::default_library_dir();
             if start_sourcing {
-                let tier = config
+                // A legacy `lean`/`balanced` name resolves to the ceiling it
+                // used to mean; anything else falls back to the default rather
+                // than silently uncapping.
+                let named_budget = config
                     .proteus
                     .as_ref()
                     .and_then(|p| p.tier_name())
-                    .and_then(|t| mirage_cover::Tier::parse(&t))
-                    .unwrap_or_default();
+                    .and_then(|t| mirage_cover::legacy_tier_budget(&t))
+                    .unwrap_or(mirage_cover::DEFAULT_MAX_GB_DAY);
                 let pack = config
                     .proteus_sources
                     .as_deref()
@@ -2486,8 +2487,7 @@ fn apply_paranoid(config: &mut ClientConfig, start_sourcing: bool) {
                     .unwrap_or_default();
                 tracing::info!(
                     library = %dir.display(),
-                    ?tier,
-                    ceiling_gb_day = ?tier.max_gb_day(),
+                    ceiling_gb_day = ?named_budget,
                     sources = pack.name(),
                     "proteus: no profile configured, sourcing cover automatically"
                 );
@@ -2509,13 +2509,14 @@ fn apply_paranoid(config: &mut ClientConfig, start_sourcing: bool) {
                         );
                     }
                 }
-                // Explicit budget wins over the tier's ceiling; "unlimited"
-                // resolves to no cap. The tier then only picks the classes.
+                // An explicit budget wins over any named default; "unlimited"
+                // resolves to no cap. The budget then decides the classes too,
+                // via `classes_for_budget`.
                 let ceiling = config
                     .proteus_max_gb_day
                     .as_ref()
-                    .map_or_else(|| tier.max_gb_day(), |b| b.gb_per_day(tier.max_gb_day()));
-                spawn_cover_sourcing(dir.clone(), tier, pack, ceiling);
+                    .map_or_else(|| Some(named_budget), |b| b.gb_per_day(Some(named_budget)));
+                spawn_cover_sourcing(dir.clone(), pack, ceiling);
             }
             (
                 dir.to_string_lossy().into_owned(),
