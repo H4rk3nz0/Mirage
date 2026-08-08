@@ -58,13 +58,22 @@ impl PersistentClaimLog {
     pub fn open<P: AsRef<Path>>(path: P, fsync_every_write: bool) -> Result<Self, ClaimLogError> {
         let path = path.as_ref().to_path_buf();
         let already_exists = path.exists();
-        let mut f = OpenOptions::new()
-            .read(true)
+        // 0600 at create time. This log records claimed-token nonces - not
+        // secrets, but a plain record of who connected and when, which is
+        // exactly what a seized or shared bridge host should not hand over to
+        // another local account. Measured before this change: 0644.
+        let mut opts = OpenOptions::new();
+        opts.read(true)
             .write(true)
             .create(true)
             // Append-log: never truncate existing contents at open.
-            .truncate(false)
-            .open(&path)?;
+            .truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&path)?;
         if already_exists {
             let mut hdr = [0u8; MCRL_HEADER_LEN];
             let n = f.read(&mut hdr)?;

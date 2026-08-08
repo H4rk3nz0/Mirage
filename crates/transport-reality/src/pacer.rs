@@ -235,6 +235,36 @@ pub struct MeasuredProfile {
     pub tokens: Vec<EmitToken>,
     /// Total time span of the profile (seconds); one replay cycle lasts this long.
     pub span: f64,
+    /// Token index at which each chained trace begins, in replay order.
+    ///
+    /// Concatenation used to flatten the chain into one anonymous token stream, so
+    /// "which trace is being worn right now" was unrecoverable after parsing. That
+    /// makes a capture attributable to a trace FILE but not to a POSITION, and the
+    /// two are different claims: with [`crate::paced::CHAIN_LEN`] longer than a
+    /// small library the chain wraps inside a single session, so a bare token
+    /// offset is ambiguous between passes. Keeping the boundaries makes both the
+    /// current trace and the wrap points observable.
+    pub flow_starts: Vec<usize>,
+}
+
+/// Where a replay currently is: unambiguous across chain wraps.
+///
+/// `(trace, pass, offset)` rather than a bare offset, because the chain repeats
+/// within a session - offset 1200 on the first pass and on the second are
+/// different points in the session and would otherwise be indistinguishable in a
+/// capture. Reported BY the pacer rather than inferred by a harness from elapsed
+/// time: a harness that divides wall-clock by span and a pacer that counts tokens
+/// disagree under any stall, and nothing would notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayPosition {
+    /// Index of the chained trace being worn, in replay order.
+    pub trace: usize,
+    /// How many complete cycles of the whole chain have finished.
+    pub pass: u64,
+    /// Token index within the whole concatenated chain.
+    pub token: usize,
+    /// Token index measured from the start of the current trace.
+    pub token_in_trace: usize,
 }
 
 impl MeasuredProfile {
@@ -281,11 +311,15 @@ impl MeasuredProfile {
         let mut flow_start = rows[0].1;
         let mut base = 0.0f64;
         let mut last = 0.0f64;
+        // Token index where each chained trace begins. The first always starts at
+        // 0; every flow-id change opens another.
+        let mut flow_starts: Vec<usize> = vec![0];
         for (flow, t, sz, dir) in rows {
             if flow != cur_flow {
                 base = last + GAP;
                 flow_start = t;
                 cur_flow = flow;
+                flow_starts.push(tokens.len());
             }
             let tt = base + (t - flow_start).max(0.0);
             last = tt;
@@ -296,7 +330,19 @@ impl MeasuredProfile {
             });
         }
         let span = tokens.last().map(|e| e.t).unwrap_or(0.0);
-        Some(Self { tokens, span })
+        Some(Self {
+            tokens,
+            span,
+            flow_starts,
+        })
+    }
+
+    /// Which chained trace token index `i` falls in.
+    #[must_use]
+    pub fn trace_of(&self, i: usize) -> usize {
+        self.flow_starts
+            .partition_point(|&s| s <= i)
+            .saturating_sub(1)
     }
 }
 
@@ -308,6 +354,10 @@ struct ReplayState {
     cursor: usize,
     offset: f64,
     last_t: f64,
+    /// Completed cycles of the whole chain. Without it a token index is ambiguous
+    /// across wraps, and the chain wraps inside a single session whenever the
+    /// library is smaller than the chain length.
+    pass: u64,
 }
 
 /// The live pacer's driver: an unbounded, continuous schedule (generative from a
@@ -336,6 +386,28 @@ impl ScheduleStream {
     /// first token, which offsets the joint timeline by the up/down start gap.
     pub fn is_replay(&self) -> bool {
         self.replay.is_some()
+    }
+
+    /// Where this replay currently is, or `None` for a generative stream.
+    ///
+    /// The authoritative answer, from the component that owns the cursor. A
+    /// harness must read this rather than deriving position from elapsed time:
+    /// the two agree only while nothing stalls, and they diverge exactly in the
+    /// runs where position matters most.
+    #[must_use]
+    pub fn replay_position(&self) -> Option<ReplayPosition> {
+        let rs = self.replay.as_ref()?;
+        let n = rs.profile.tokens.len();
+        // `cursor` has already been advanced past the last emitted token, and
+        // sits at `n` only in the instant before a wrap is applied.
+        let token = if n == 0 { 0 } else { rs.cursor % n };
+        let trace = rs.profile.trace_of(token);
+        Some(ReplayPosition {
+            trace,
+            pass: rs.pass,
+            token,
+            token_in_trace: token - rs.profile.flow_starts.get(trace).copied().unwrap_or(0),
+        })
     }
 
     /// Start a continuous stream for `proc`, deterministic from `seed`.
@@ -382,6 +454,7 @@ impl ScheduleStream {
                 cursor: start,
                 offset,
                 last_t: 0.0,
+                pass: 0,
             }),
         }
     }
@@ -408,6 +481,18 @@ impl ScheduleStream {
                 // wrap: continue the clock just after the last emitted token
                 rs.cursor = 0;
                 rs.offset = rs.last_t + CYCLE_GAP - toks[0].t;
+                rs.pass += 1;
+                // The chain-wrap boundary, in the log, at the moment it happens.
+                // A library smaller than CHAIN_LEN wraps within one session, and
+                // whether windows either side of a wrap differ from windows in the
+                // middle of a trace has never been examined. This makes that
+                // boundary joinable against the capture without a second run.
+                tracing::debug!(
+                    pass = rs.pass,
+                    traces = rs.profile.flow_starts.len(),
+                    span_secs = rs.profile.span,
+                    "proteus: replay chain wrapped"
+                );
             }
             let src = toks[rs.cursor];
             let t = (src.t + rs.offset).max(rs.last_t);
@@ -591,6 +676,63 @@ pub fn envelope_down_bytes(schedule: &[EmitToken]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A replay must be able to say WHERE it is, unambiguously across wraps.
+    ///
+    /// "Pinned to one trace" and "pinned to one trace POSITION" are different
+    /// claims, and the alignment test depends on the second. With a library
+    /// smaller than the chain length the chain wraps inside a single session, so
+    /// a bare token offset is ambiguous between passes: this pins that `pass`
+    /// advances, that the trace index tracks the chained flow, and that the
+    /// position comes from the pacer rather than being inferable from a clock.
+    #[test]
+    fn a_replay_reports_its_position_unambiguously_across_wraps() {
+        // Three chained traces (flow ids 0,1,2), two tokens each.
+        let csv = "flow,t,size,dir\n\
+                   0,0.00,100,1\n0,0.01,100,-1\n\
+                   1,0.00,200,1\n1,0.01,200,-1\n\
+                   2,0.00,300,1\n2,0.01,300,-1\n";
+        let prof = MeasuredProfile::from_csv(csv).expect("parses");
+        assert_eq!(prof.tokens.len(), 6);
+        assert_eq!(
+            prof.flow_starts,
+            vec![0, 2, 4],
+            "one boundary per chained trace"
+        );
+        for (i, want) in [(0, 0), (1, 0), (2, 1), (3, 1), (4, 2), (5, 2)] {
+            assert_eq!(prof.trace_of(i), want, "token {i} belongs to trace {want}");
+        }
+
+        let mut s = ScheduleStream::replay(std::sync::Arc::new(prof), 0);
+        let p0 = s.replay_position().expect("a replay reports position");
+        assert_eq!(p0.pass, 0, "no wrap yet");
+
+        // Drain well past one full cycle and confirm the pass counter advances -
+        // the fact a bare offset cannot express.
+        let mut saw_pass_1 = false;
+        for _ in 0..40 {
+            let _ = s.next_for(Dir::Down);
+            if s.replay_position().is_some_and(|p| p.pass >= 1) {
+                saw_pass_1 = true;
+                break;
+            }
+        }
+        assert!(saw_pass_1, "chain must wrap and report a later pass");
+
+        let p = s.replay_position().expect("position");
+        assert!(p.trace < 3, "trace index stays in range, got {}", p.trace);
+        assert!(
+            p.token_in_trace < 2,
+            "offset within a 2-token trace must be 0 or 1, got {}",
+            p.token_in_trace
+        );
+
+        // A generative stream has no position to report, and must say so rather
+        // than inventing one.
+        let mut gen = ScheduleStream::new(video(), 7);
+        let _ = gen.next_for(Dir::Down);
+        assert_eq!(gen.replay_position(), None);
+    }
 
     fn video() -> CoverProcess {
         CoverProcess::Video {

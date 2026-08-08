@@ -99,6 +99,18 @@ pub const FEATURE_NAMES: [&str; N_FEATURES] = [
 /// "bulk transfer" shape that a 1:1 transport leaks and a shaper should break.
 const RECORD_MAX: u32 = 16384;
 
+/// One flow's feature vector, index-aligned with [`FEATURE_NAMES`].
+///
+/// Exposed so a caller can audit the SAMPLE before trusting an AUC over it -
+/// a feature that is constant by construction, or dominated by a single
+/// repeated value, produces a number that says nothing about the system.
+/// `measure_all` cannot detect that on its own because it only sees the
+/// resulting ranks.
+#[must_use]
+pub fn feature_vector(t: &FlowTrace) -> [f64; N_FEATURES] {
+    features(t)
+}
+
 fn features(t: &FlowTrace) -> [f64; N_FEATURES] {
     let n = t.record_sizes.len();
     if n == 0 {
@@ -731,6 +743,49 @@ pub fn flow_shape_distinguisher(
              single-feature classifier accuracy {:.3} (AUC {:.3}); F4 target ~ 0.5",
             d.top_feature, d.best_accuracy, d.top_auc
         )))
+    }
+}
+
+#[cfg(test)]
+mod sign_tests {
+    use super::*;
+
+    /// Inverting the classes must flip d' and leave the evidence unchanged.
+    ///
+    /// Reporting |d'| loses the direction, and direction is what separates one
+    /// mechanism from another - "load produces MORE dead air" and "load produces
+    /// LESS" are different findings with different fixes and identical
+    /// magnitudes. This pins both halves: the sign flips, the strength does not.
+    #[test]
+    fn inverting_the_classes_flips_the_sign_and_preserves_the_evidence() {
+        let a: Vec<FlowTrace> = (0..40)
+            .map(|i| FlowTrace::new(vec![100 + (i % 7) as u32; 60]))
+            .collect();
+        let b: Vec<FlowTrace> = (0..40)
+            .map(|i| FlowTrace::new(vec![400 + (i % 5) as u32; 60]))
+            .collect();
+
+        let ab = measure_all(&a, &b);
+        let ba = measure_all(&b, &a);
+        for i in 0..ab.len() {
+            // AUC(a,b) and AUC(b,a) must sum to 1 - that IS the sign.
+            assert!(
+                (ab[i] + ba[i] - 1.0).abs() < 1e-9,
+                "{}: AUC not antisymmetric ({} vs {})",
+                FEATURE_NAMES[i],
+                ab[i],
+                ba[i]
+            );
+            // ...and the two-sided evidence is identical either way round, so an
+            // N-to-decide computed from |d'| must not depend on class order.
+            let one_ab = ab[i].max(1.0 - ab[i]);
+            let one_ba = ba[i].max(1.0 - ba[i]);
+            assert!(
+                (one_ab - one_ba).abs() < 1e-9,
+                "{}: evidence changed with class order",
+                FEATURE_NAMES[i]
+            );
+        }
     }
 }
 

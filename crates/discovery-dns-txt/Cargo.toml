@@ -22,8 +22,15 @@ base64 = { workspace = true }
 # resolver is used is a RUNTIME config choice, never a cargo feature.
 hickory-resolver = { version = ">=0.24, <0.26", default-features = false, features = ["tokio-runtime", "system-config"] }
 
-[dev-dependencies]
+# RFC 2136 dynamic UPDATE, so the DNS channel can ROTATE instead of being a
+# hand-maintained static anchor. `dnssec-ring` is what carries TSIG's HMAC;
+# `ring` is already in the tree via rustls, so this adds no new crypto stack.
+# Always compiled, for the same reason the resolver is: one build, every
+# capability, and whether an operator publishes over DNS is a runtime choice.
+hickory-proto = { version = ">=0.24, <0.26", default-features = false, features = ["dnssec-ring"] }
 getrandom = "0.3"
+
+[dev-dependencies]
 hex = "=0.4.3"
 proptest = { workspace = true }
 

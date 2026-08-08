@@ -108,11 +108,24 @@ pub fn save_to_path<P: AsRef<Path>>(map: &SuccessRateMap, path: P) -> Result<(),
     let tmp = path.with_extension("tmp");
     let snap = map.snapshot();
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp)?;
+    // 0600 AT CREATE TIME, not chmod afterwards.
+    //
+    // This file records which transports succeeded on which network - which is
+    // to say, evidence that this machine runs Mirage and which carriers get out.
+    // On the client that is exactly what the user cannot afford to hand to
+    // another local account or a sandboxed app. Measured before this change: the
+    // real file sat at 0644 under a 0755 directory.
+    //
+    // Applying the mode at create time rather than after the write closes the
+    // window where the contents exist at the process umask.
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp)?;
     file.write_all(MSRP_MAGIC)?;
     file.write_all(&[MSRP_VERSION_V1])?;
     file.write_all(&(snap.len() as u32).to_be_bytes())?;

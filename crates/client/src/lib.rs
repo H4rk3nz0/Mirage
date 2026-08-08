@@ -201,6 +201,22 @@ struct ClientConfig {
     /// endpoints, like `proteus_profile`.
     #[serde(default)]
     proteus_profile_up: Option<String>,
+    /// Permit running Proteus with a cover host the trace library has no
+    /// recording for.
+    ///
+    /// Proteus wears `<proteus_profile>/<cover-host>/` when that subdirectory
+    /// exists, so the shaped envelope matches the site the carrier claims to be
+    /// talking to. With no such subdirectory it wears the generic class instead:
+    /// a prober sees the real cover host, a passive observer sees a flow shaped
+    /// like a different site, and no single-layer check finds the disagreement.
+    ///
+    /// That degradation used to be silent, which is how an entire measurement
+    /// campaign ran in the weaker mode without anyone knowing which mode it was
+    /// in. It is now refused unless set here - not because generic cover is
+    /// useless, but so that choosing it is deliberate and recorded rather than a
+    /// consequence of a directory that happens not to exist.
+    #[serde(default)]
+    proteus_generic_cover_ok: bool,
     /// Where the client records its own cover FROM, when it is self-sourcing:
     /// `global` (default), a region (`cn`, `ir`, `ru`, `tr`), or a
     /// comma-separated list of your own URLs.
@@ -2303,6 +2319,14 @@ fn collect_transports(config: &ClientConfig) -> Result<Vec<TransportMode>, Strin
         out.push(TransportMode::WebSocket { path });
     }
     if config.reality_enabled {
+        // The ClientHello is the first thing a censor sees and the cheapest thing
+        // it can classify on, and a template only stays camouflage while it still
+        // matches a browser people actually run. Drift is silent - a dated
+        // ClientHello keeps connecting perfectly, it just stops resembling the
+        // population it is hiding in - so it has to be surfaced by the calendar.
+        mirage_transport_reality::tls_fingerprint::warn_if_fingerprints_stale(
+            mirage_transport_reality::tls_fingerprint::today_days(),
+        );
         let sni = config
             .reality_sni
             .clone()
@@ -2412,6 +2436,7 @@ fn spawn_cover_sourcing(
     dir: std::path::PathBuf,
     pack: mirage_cover::packs::SourcePack,
     max_gb_day: Option<f64>,
+    cover_host: Option<String>,
 ) {
     if tokio::runtime::Handle::try_current().is_ok() {
         COVER_SOURCING.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2419,6 +2444,7 @@ fn spawn_cover_sourcing(
             dir,
             pack,
             max_gb_day,
+            cover_host,
             cover_stop_flag(),
         ));
     } else {
@@ -2516,7 +2542,10 @@ fn apply_paranoid(config: &mut ClientConfig, start_sourcing: bool) {
                     .proteus_max_gb_day
                     .as_ref()
                     .map_or_else(|| Some(named_budget), |b| b.gb_per_day(Some(named_budget)));
-                spawn_cover_sourcing(dir.clone(), pack, ceiling);
+                // Hand the recorder this client's cover host so the library gains
+                // `<lib>/<sni>/` and sessions wear the shape of the site they
+                // claim to be visiting, rather than a generic browse class.
+                spawn_cover_sourcing(dir.clone(), pack, ceiling, config.reality_sni.clone());
             }
             (
                 dir.to_string_lossy().into_owned(),
@@ -2546,6 +2575,44 @@ fn apply_paranoid(config: &mut ClientConfig, start_sourcing: bool) {
              this tool is for), set proteus_sources to a reachable region or list, or point \
              proteus_profile at a library shipped with your config."
         );
+    }
+    // Which trace set this session will actually wear, said once, at startup.
+    //
+    // Target-conditioned replay prefers `<library>/<cover-host>/` so the envelope
+    // matches the site the SNI claims, and falls back to the generic class when
+    // that directory is absent. The fallback was silent, and on the automatic
+    // path it was also the ONLY reachable state - nothing that ran by default
+    // ever created a per-host directory. So every deployment ran in the mode this
+    // file's own selection comment describes as separable, and no config, log or
+    // diagnostic distinguished it from the mode that is not.
+    //
+    // Warn rather than refuse HERE: this runs inside config normalisation, which
+    // must not be able to abort the process, and an auto-sourcing library legitimately
+    // has no per-host directory for the first few minutes of a cold start. The
+    // refusal for a PINNED library - a deliberate artifact that will never fill
+    // in on its own - is in `main`, where exiting is the caller's contract.
+    match mirage_transport_reality::resolve_profile_match(&profile, config.reality_sni.as_deref()) {
+        mirage_transport_reality::ProfileMatch::HostMatched(p) => {
+            tracing::info!(
+                traces = %p.display(),
+                cover_host = config.reality_sni.as_deref().unwrap_or(""),
+                "proteus: target-conditioned - the envelope matches the host this client claims"
+            );
+        }
+        mirage_transport_reality::ProfileMatch::Generic { wanted, .. } => {
+            tracing::warn!(
+                missing = %wanted.display(),
+                cover_host = config.reality_sni.as_deref().unwrap_or(""),
+                "proteus: GENERIC cover - no per-host traces for this cover host, so the shaped \
+                 envelope does not match the site the SNI announces. A prober sees the real \
+                 host; a passive observer sees a flow recorded elsewhere, and neither layer can \
+                 detect the disagreement on its own. Auto-sourcing records this host and clears \
+                 the warning once it lands; a pinned library needs the directory recording with \
+                 `mirage-cover-record --url https://<host>/ --name <host>`."
+            );
+        }
+        mirage_transport_reality::ProfileMatch::PinnedFile
+        | mirage_transport_reality::ProfileMatch::NoCoverHost => {}
     }
     mirage_transport_reality::set_pace_override(mode, Some(profile), profile_up);
 }
@@ -2962,6 +3029,15 @@ fn build_pool(mut config: ClientConfig, start_sourcing: bool) -> Result<EntryPoo
         // save will surface it.
         if let Some(parent) = std::path::Path::new(&path).parent() {
             let _ = std::fs::create_dir_all(parent);
+            // 0700. The state file itself is 0600, but a world-listable
+            // directory still tells another local account that this machine runs
+            // Mirage and when it last ran - the filename alone is the
+            // disclosure. Measured before this change: 0755.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
         let map = Arc::clone(&success_map);
         tokio::spawn(async move {
@@ -3380,6 +3456,9 @@ pub async fn cli_main() {
                 .unwrap_or_else(mirage_cover::default_library_dir);
             (mode, profile, config.proteus_profile.is_some())
         };
+        let cover_sni = config.reality_sni.clone();
+        // Read before `config` is moved into build_pool.
+        let mux_on = config.stream_mux_enabled;
         // Validating a config must not start fetching real traffic.
         let pool = match build_pool(config, false) {
             Ok(p) => p,
@@ -3426,10 +3505,103 @@ pub async fn cli_main() {
                 if n == 0 {
                     println!("               none yet - sessions run UNPACED until one lands");
                 }
+                // WHICH trace set the pacer resolves to, and why. The configured
+                // library root is not the answer: target-conditioned replay
+                // prefers `<root>/<cover-host>/` and falls back to the generic
+                // class when that does not exist. A dump that printed only the
+                // root recorded an ambiguous state as a resolved one, and the
+                // fallback is the mode this design is meant to avoid.
+                let m = mirage_transport_reality::resolve_profile_match(
+                    &profile.to_string_lossy(),
+                    cover_sni.as_deref(),
+                );
+                match &m {
+                    mirage_transport_reality::ProfileMatch::HostMatched(p) => println!(
+                        "  shaping:     TARGET-CONDITIONED - wears {} ({} traces)",
+                        p.display(),
+                        mirage_cover::count_traces(p)
+                    ),
+                    mirage_transport_reality::ProfileMatch::Generic { wanted, .. } => {
+                        println!(
+                            "  shaping:     GENERIC - no {}, so the envelope does NOT match \
+                             the host this client claims",
+                            wanted.display()
+                        );
+                    }
+                    mirage_transport_reality::ProfileMatch::PinnedFile => {
+                        println!("  shaping:     single pinned trace file (no host matching)");
+                    }
+                    mirage_transport_reality::ProfileMatch::NoCoverHost => {
+                        println!("  shaping:     generic (no reality_sni to match against)");
+                    }
+                }
             }
             None => println!("  proteus:     off (bridge must match)"),
         }
+        // Report the settings that SILENTLY change what a session looks like on
+        // the wire, whether or not the operator wrote them down. `--check-config`
+        // exists to record resolved state, and a resolved-state dump that omits
+        // a defaulted value is a faithful record of an ambiguous one.
+        //
+        // `stream_mux_enabled` defaults true, and under Proteus that makes the
+        // client hold exactly ONE carrier regardless of how many connections the
+        // app opens ("one connection, one envelope"). That single fact decides
+        // whether concurrent-carrier count can track load - it changed the
+        // meaning of an entire measurement campaign, and it appeared in no
+        // config file and no diagnostic.
+        println!(
+            "  stream mux:  {} (bridge must match){}",
+            if mux_on { "on" } else { "off" },
+            if mux_on {
+                " - one carrier per bridge under Proteus"
+            } else {
+                " - a carrier PER connection; carrier count then tracks load"
+            }
+        );
+        {}
         std::process::exit(0);
+    }
+
+    // Refuse a PINNED library that has no traces for the cover host it claims.
+    //
+    // Pinning turns auto-sourcing off, so a pinned library that lacks
+    // `<root>/<cover-host>/` will never gain it: the mismatch between the shaped
+    // envelope and the announced SNI is permanent, and it used to be invisible.
+    // Making it an explicit opt-in rather than a silent default is the point -
+    // generic cover is a defensible choice, but it has to be a choice. The same
+    // shape as refusing an SS-2022-only wire without `wu_evasion`.
+    //
+    // Only for pinned libraries. An auto-sourced one records the cover host and
+    // resolves this on its own, so refusing there would reject a state that
+    // repairs itself within minutes of a cold start.
+    if let (Some(pinned), Some(sni)) = (
+        config.proteus_profile.as_deref(),
+        config.reality_sni.as_deref(),
+    ) {
+        let generic = mirage_transport_reality::resolve_profile_match(pinned, Some(sni));
+        if generic.is_generic() && !config.proteus_generic_cover_ok {
+            let wanted = match &generic {
+                mirage_transport_reality::ProfileMatch::Generic { wanted, .. } => wanted.clone(),
+                _ => std::path::PathBuf::new(),
+            };
+            eprintln!(
+                "fatal: proteus_profile is pinned to {pinned}, which has no traces recorded \
+                 against the cover host this client announces ({sni}).\n\
+                 \n\
+                 The carrier will claim {sni} in its SNI while wearing an envelope recorded \
+                 somewhere else. A prober sees the real site and a passive observer sees a \
+                 different one; no single layer can detect the disagreement.\n\
+                 \n\
+                 Record the host's own shape:\n\
+                 \x20   mirage-cover-record {pinned} --url https://{sni}/ --name {sni}\n\
+                 (this creates {})\n\
+                 \n\
+                 Or accept generic cover deliberately, by setting \
+                 \"proteus_generic_cover_ok\": true in the client config.",
+                wanted.display()
+            );
+            std::process::exit(2);
+        }
     }
 
     // Windows: TUN mode needs Administrator (Wintun adapter + route changes).
@@ -7765,13 +7937,23 @@ const FRESH_TOKEN_LOW_WATERMARK: usize = 3;
 const PACED_HANDSHAKE_FLOOR: Duration = Duration::from_secs(60);
 
 fn maintenance_handshake_timeout(pool: &EntryPool) -> Duration {
+    maintenance_handshake_timeout_for(pool, mirage_transport_reality::pacing_active())
+}
+
+/// The floor calculation, with the pacing state passed in.
+///
+/// Split out because pacing is PROCESS-GLOBAL state: reading it inside meant the
+/// unit test raced any other test in the same binary that resolved a paced
+/// config, and failed about two runs in five depending on which won. The
+/// production path still reads the global; only the decision is testable.
+fn maintenance_handshake_timeout_for(pool: &EntryPool, pacing_active: bool) -> Duration {
     const FLOOR: Duration = Duration::from_secs(10);
     // Under pacing the floor has to be higher. Handshake bytes leave only on a
     // schedule token and a low-bitrate cover trace has multi-second idle gaps, so
     // 10s is not a slow network - it is arithmetically unreachable. An operator
     // who turns on pacing without also raising `handshake_timeout_secs` would
     // otherwise get the credential-starvation failure back by default.
-    let floor = if mirage_transport_reality::pacing_active() {
+    let floor = if pacing_active {
         PACED_HANDSHAKE_FLOOR
     } else {
         FLOOR
@@ -9440,21 +9622,27 @@ mod success_recording_tests {
         // A paced deployment raises the handshake budget; maintenance must use it,
         // not the old hardcoded 10s that made refresh fail every time.
         assert_eq!(
-            maintenance_handshake_timeout(&pool_of(vec![mk(120)])),
+            maintenance_handshake_timeout_for(&pool_of(vec![mk(120)]), false),
             Duration::from_secs(120)
         );
         // Mixed pool: the most patient entry sets the budget, so one fast entry
         // cannot starve a paced one.
         assert_eq!(
-            maintenance_handshake_timeout(&pool_of(vec![mk(5), mk(90), mk(30)])),
+            maintenance_handshake_timeout_for(&pool_of(vec![mk(5), mk(90), mk(30)]), false),
             Duration::from_secs(90)
         );
         // Floor (unpaced): a short configured budget never lowers maintenance
         // below the historical 10s default. Under pacing the floor is higher -
         // see PACED_FLOOR - because a paced handshake cannot finish in 10s.
         assert_eq!(
-            maintenance_handshake_timeout(&pool_of(vec![mk(2)])),
+            maintenance_handshake_timeout_for(&pool_of(vec![mk(2)]), false),
             Duration::from_secs(10)
+        );
+        // And the paced floor, which the flaky version could only observe by
+        // accident when another test happened to turn pacing on first.
+        assert_eq!(
+            maintenance_handshake_timeout_for(&pool_of(vec![mk(2)]), true),
+            PACED_HANDSHAKE_FLOOR
         );
     }
 

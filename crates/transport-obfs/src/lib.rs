@@ -31,8 +31,17 @@
 //!
 //! # Threat model fit
 //!
-//! - **T1 (signature DPI):** [ok] - wire bytes are uniform random;
-//!   no protocol-specific signature.
+//! - **T1 (signature DPI):** [ok] - wire bytes are uniform random from byte 0.
+//!   The knock is nonce+tag; everything after it is XORed with a per-connection
+//!   keystream (`obfs_wrap_client` / `obfs_wrap_server`).
+//!
+//!   This was NOT true before v0.1.6-alpha and the claim here was wrong. The
+//!   raw socket was handed back after the knock, so the session layer's
+//!   cleartext header sat at a fixed offset: measured off a real socket,
+//!   `bytes[64..67]` were `4D 49 01` ("MI", MSG_TYPE_1) on every connection,
+//!   with a fixed 1285-byte first flight. That is a DPI `memcmp`, not a
+//!   statistical classifier - strictly worse than the entropy issue below,
+//!   which is at least only a probabilistic tell.
 //! - **T2 (active prober):** [ok WHEN an invite obfs secret is provisioned]
 //!   (audit #9) - the knock is then keyed on a per-bridge secret carried only
 //!   inside the confidential invite, so a prober who merely scraped the
@@ -278,7 +287,12 @@ impl ClientTransport for ObfsClientTransport {
             .await
             .map_err(|_| TransportError::Timeout(inputs.deadline))?
             .map_err(TransportError::Io)?;
-        Ok(Box::pin(stream))
+        // Everything after the knock rides a keystream. Handing back the raw
+        // socket here put the session layer's cleartext header straight on the
+        // wire: measured, bytes[64..67] were `4D 49 01` ("MI", MSG_TYPE_1) on
+        // every single connection, which is a DPI memcmp at a fixed offset - and
+        // the first flight is a fixed 1285 bytes to go with it.
+        Ok(Box::pin(obfs_wrap_client(stream, &tag, &nonce)))
     }
 }
 
@@ -349,12 +363,18 @@ fn endpoint_to_socket_addr(ep: &Endpoint) -> Result<std::net::SocketAddr, Transp
 /// Caller still MUST close the stream after this function
 /// returns Err - the jitter only delays the close, it does not
 /// perform cover-forwarding.
+/// Returns the `(knock_key, nonce)` needed to build the post-auth keystream.
+/// The caller MUST wrap the stream with [`obfs_wrap_server`] using them - the
+/// bytes after the knock are keystreamed, so a caller that keeps reading the
+/// raw socket sees garbage. (Caught by an end-to-end roundtrip test rather than
+/// review: the client was wrapped before this signature was, and the bridge
+/// failed with "handshake frame length out of range".)
 pub async fn obfs_server_authenticate<S>(
     stream: &mut S,
     bridge_static_pk: &[u8; 32],
     obfs_secret: Option<&[u8; 32]>,
     deadline: Duration,
-) -> Result<(), TransportError>
+) -> Result<([u8; 32], [u8; 32]), TransportError>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
@@ -378,7 +398,9 @@ where
     if !ok {
         return Err(TransportError::Auth("obfs auth verify failed"));
     }
-    Ok(())
+    // `presented` equals the expected tag on the success path, so it is the
+    // shared value both ends key the keystream on.
+    Ok((presented, nonce))
 }
 
 /// Draw a post-read jitter from `[OBFS_AUTH_FAIL_JITTER_MIN,
@@ -677,5 +699,292 @@ mod tests {
             }
             prop_assert!(!obfs_auth_verify(&pk, &nonce, &buf));
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Post-auth stream obfuscation (finding: fixed-plaintext signature)
+// ---------------------------------------------------------------------------
+
+/// Domain-separated labels for the two directional keystreams. Separate streams
+/// per direction because XORing both with the SAME keystream would let anyone
+/// who captures the flow recover `c2s XOR s2c` - the classic two-time-pad.
+const OBFS_STREAM_LABEL_C2S: &[u8] = b"mirage-obfs-stream-v1-c2s";
+const OBFS_STREAM_LABEL_S2C: &[u8] = b"mirage-obfs-stream-v1-s2c";
+
+/// A keystream derived from the knock key and the client's nonce.
+///
+/// # This is OBFUSCATION, not encryption
+///
+/// In legacy mode the knock key is derived from the bridge's PUBLIC key, so
+/// anyone who scraped an announcement can regenerate this keystream and strip
+/// it. That is fine and intended: confidentiality comes from the Noise session
+/// inside. The job here is only to stop the carrier presenting the same
+/// plaintext bytes at the same offset on every connection. Do not build
+/// anything on it that needs secrecy.
+struct ObfsKeystream {
+    reader: blake3::OutputReader,
+    /// Scratch so we can XOR without allocating per write.
+    block: [u8; 64],
+    /// Unconsumed bytes remaining in `block`.
+    have: usize,
+    /// Offset of the first unconsumed byte in `block`.
+    pos: usize,
+}
+
+impl ObfsKeystream {
+    fn new(knock_key: &[u8; 32], nonce: &[u8; 32], label: &[u8]) -> Self {
+        let mut h = blake3::Hasher::new_keyed(knock_key);
+        h.update(label);
+        h.update(nonce);
+        Self {
+            reader: h.finalize_xof(),
+            block: [0u8; 64],
+            have: 0,
+            pos: 0,
+        }
+    }
+
+    /// XOR `buf` in place, advancing the keystream by exactly `buf.len()`.
+    ///
+    /// Advancing by exactly the bytes consumed is the whole correctness
+    /// requirement: if either side ever advances by a different amount the
+    /// streams desynchronise and every later byte is garbage.
+    fn apply(&mut self, buf: &mut [u8]) {
+        let mut i = 0;
+        while i < buf.len() {
+            if self.pos == self.have {
+                self.reader.fill(&mut self.block);
+                self.have = self.block.len();
+                self.pos = 0;
+            }
+            let n = (self.have - self.pos).min(buf.len() - i);
+            for k in 0..n {
+                buf[i + k] ^= self.block[self.pos + k];
+            }
+            self.pos += n;
+            i += n;
+        }
+    }
+}
+
+/// Largest chunk encrypted per `poll_write`. Bounds the buffer a partial write
+/// can leave pending.
+const OBFS_WRITE_CHUNK: usize = 16 * 1024;
+
+/// A stream whose bytes are XORed with a per-connection keystream.
+///
+/// Wraps the socket AFTER the 64-byte knock, so the knock itself stays exactly
+/// as it was (random nonce + tag) and only the session bytes behind it change.
+pub struct ObfsStream<S> {
+    inner: S,
+    tx: ObfsKeystream,
+    rx: ObfsKeystream,
+    /// Ciphertext produced but not yet accepted by the socket. Must be drained
+    /// before any new plaintext is encrypted, or the keystream order breaks.
+    pending: Vec<u8>,
+    /// How much of `pending` has been written.
+    sent: usize,
+}
+
+impl<S> ObfsStream<S> {
+    /// `client_side` selects which label this end WRITES with; the other is
+    /// used to read. Getting this backwards deadlocks the handshake, so it is a
+    /// single boolean rather than two independently-passed labels.
+    fn new(inner: S, knock_key: &[u8; 32], nonce: &[u8; 32], client_side: bool) -> Self {
+        let (tx_label, rx_label) = if client_side {
+            (OBFS_STREAM_LABEL_C2S, OBFS_STREAM_LABEL_S2C)
+        } else {
+            (OBFS_STREAM_LABEL_S2C, OBFS_STREAM_LABEL_C2S)
+        };
+        Self {
+            inner,
+            tx: ObfsKeystream::new(knock_key, nonce, tx_label),
+            rx: ObfsKeystream::new(knock_key, nonce, rx_label),
+            pending: Vec::new(),
+            sent: 0,
+        }
+    }
+}
+
+/// Wrap a client-side stream (writes with the c2s keystream).
+pub fn obfs_wrap_client<S>(inner: S, knock_key: &[u8; 32], nonce: &[u8; 32]) -> ObfsStream<S> {
+    ObfsStream::new(inner, knock_key, nonce, true)
+}
+
+/// Wrap a bridge-side stream (writes with the s2c keystream).
+pub fn obfs_wrap_server<S>(inner: S, knock_key: &[u8; 32], nonce: &[u8; 32]) -> ObfsStream<S> {
+    ObfsStream::new(inner, knock_key, nonce, false)
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ObfsStream<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        let before = buf.filled().len();
+        match std::pin::Pin::new(&mut me.inner).poll_read(cx, buf) {
+            std::task::Poll::Ready(Ok(())) => {
+                let filled = buf.filled_mut();
+                // Only the bytes THIS call produced, or the keystream would be
+                // applied twice to anything already in the buffer.
+                me.rx.apply(&mut filled[before..]);
+                std::task::Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ObfsStream<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let me = self.get_mut();
+        // Drain first: the keystream is ordered, so new plaintext cannot be
+        // encrypted until everything already encrypted has left.
+        while me.sent < me.pending.len() {
+            match std::pin::Pin::new(&mut me.inner).poll_write(cx, &me.pending[me.sent..]) {
+                std::task::Poll::Ready(Ok(0)) => {
+                    return std::task::Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                }
+                std::task::Poll::Ready(Ok(n)) => me.sent += n,
+                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+        me.pending.clear();
+        me.sent = 0;
+        if buf.is_empty() {
+            return std::task::Poll::Ready(Ok(0));
+        }
+        let take = buf.len().min(OBFS_WRITE_CHUNK);
+        me.pending.extend_from_slice(&buf[..take]);
+        me.tx.apply(&mut me.pending);
+        // Report the plaintext consumed. The ciphertext is ours to finish
+        // delivering, which the drain above and `poll_flush` guarantee.
+        match std::pin::Pin::new(&mut me.inner).poll_write(cx, &me.pending) {
+            std::task::Poll::Ready(Ok(n)) => {
+                me.sent = n;
+                std::task::Poll::Ready(Ok(take))
+            }
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+            std::task::Poll::Pending => std::task::Poll::Ready(Ok(take)),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        while me.sent < me.pending.len() {
+            match std::pin::Pin::new(&mut me.inner).poll_write(cx, &me.pending[me.sent..]) {
+                std::task::Poll::Ready(Ok(0)) => {
+                    return std::task::Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                }
+                std::task::Poll::Ready(Ok(n)) => me.sent += n,
+                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+        me.pending.clear();
+        me.sent = 0;
+        std::pin::Pin::new(&mut me.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        std::pin::Pin::new(&mut me.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Client and server must pick OPPOSITE keystreams. If both wrapped with the
+    /// same label every byte would still round-trip through a loopback pair by
+    /// accident in one direction, so this exercises BOTH directions with
+    /// different payloads.
+    #[tokio::test]
+    async fn client_and_server_wrappers_interoperate_both_ways() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let key = [9u8; 32];
+        let nonce = [3u8; 32];
+        let mut c = obfs_wrap_client(a, &key, &nonce);
+        let mut s = obfs_wrap_server(b, &key, &nonce);
+
+        let up = b"client-to-bridge payload".to_vec();
+        let down = b"bridge-to-client, a different length entirely".to_vec();
+
+        c.write_all(&up).await.expect("write up");
+        c.flush().await.expect("flush up");
+        let mut got_up = vec![0u8; up.len()];
+        s.read_exact(&mut got_up).await.expect("read up");
+        assert_eq!(got_up, up, "c2s direction corrupted");
+
+        s.write_all(&down).await.expect("write down");
+        s.flush().await.expect("flush down");
+        let mut got_down = vec![0u8; down.len()];
+        c.read_exact(&mut got_down).await.expect("read down");
+        assert_eq!(got_down, down, "s2c direction corrupted");
+    }
+
+    /// The keystream must advance by exactly the bytes consumed. Many small
+    /// writes and one big read must agree with one big write and many small
+    /// reads, or the two ends desynchronise the moment TCP segments differently
+    /// from how the application wrote.
+    #[tokio::test]
+    async fn chunking_does_not_desynchronise_the_keystream() {
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let key = [1u8; 32];
+        let nonce = [2u8; 32];
+        let mut c = obfs_wrap_client(a, &key, &nonce);
+        let mut s = obfs_wrap_server(b, &key, &nonce);
+
+        // Larger than OBFS_WRITE_CHUNK so the partial-write path is exercised.
+        let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        let expect = payload.clone();
+        let writer = tokio::spawn(async move {
+            for piece in payload.chunks(1_237) {
+                c.write_all(piece).await.expect("write piece");
+            }
+            c.flush().await.expect("flush");
+            c
+        });
+        let mut got = vec![0u8; expect.len()];
+        s.read_exact(&mut got).await.expect("read all");
+        let _c = writer.await.expect("join");
+        assert_eq!(
+            got, expect,
+            "keystream desynchronised across chunk boundaries"
+        );
+    }
+
+    /// Two connections must never produce the same keystream, or a captured
+    /// pair leaks `p1 XOR p2`.
+    #[test]
+    fn a_different_nonce_gives_a_different_keystream() {
+        let key = [4u8; 32];
+        let mut k1 = ObfsKeystream::new(&key, &[0u8; 32], OBFS_STREAM_LABEL_C2S);
+        let mut k2 = ObfsKeystream::new(&key, &[1u8; 32], OBFS_STREAM_LABEL_C2S);
+        let (mut a, mut b) = ([0u8; 64], [0u8; 64]);
+        k1.apply(&mut a);
+        k2.apply(&mut b);
+        assert_ne!(a, b, "same keystream for different nonces");
+
+        // ...and the two DIRECTIONS must differ, or c2s XOR s2c is a two-time pad.
+        let mut c = [0u8; 64];
+        ObfsKeystream::new(&key, &[0u8; 32], OBFS_STREAM_LABEL_S2C).apply(&mut c);
+        assert_ne!(a, c, "c2s and s2c keystreams are identical");
     }
 }

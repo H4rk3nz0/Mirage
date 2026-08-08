@@ -54,6 +54,73 @@ use std::fmt::Write;
 
 // Template struct
 
+/// How a [`TlsFingerprintTemplate`] was obtained, and when it was last checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TemplateProvenance {
+    /// The browser build this template claims to imitate, e.g. `"Chrome 133"`.
+    pub claims_to_be: &'static str,
+    /// Days since the Unix epoch when this template was last verified against a
+    /// real ClientHello from that build. Days, not seconds: the resolution that
+    /// matters here is "which browser release", and a date a human can read in
+    /// the source is more likely to be updated than a timestamp.
+    pub checked_days: u32,
+    /// How the bytes were obtained. This decides whether the template can be
+    /// RE-DERIVED when the browser moves, or only re-transcribed by hand.
+    pub source: TemplateSource,
+}
+
+/// Where a template's bytes came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateSource {
+    /// Transcribed by hand from documentation, a fingerprint database, or
+    /// another implementation.
+    ///
+    /// The weaker provenance, and worth naming rather than leaving implicit: a
+    /// hand-written template cannot be regenerated from anything, so keeping it
+    /// current means a person re-reading a spec, and drift is silent. It is the
+    /// same borrow-versus-imitate distinction that decides REALITY over a
+    /// synthesised handshake, applied one level down - the handshake is borrowed
+    /// from a real host, but the ClientHello announcing it is imitated.
+    HandTranscribed,
+    /// Extracted from a packet capture of the real browser. Re-derivable: point
+    /// the extractor at a fresh capture and the template regenerates.
+    CapturedFromBrowser,
+}
+
+/// Beyond this, a template is describing a browser that has moved on.
+///
+/// Chrome ships a stable release roughly every four weeks and changes
+/// fingerprint-relevant details several times a year. 180 days is about four
+/// releases - long enough not to cry wolf, short enough that a template cannot
+/// quietly become a unique identifier. Warn rather than refuse: a slightly dated
+/// ClientHello still beats refusing to start, which is the same trade the trace
+/// staleness policy makes.
+pub const FINGERPRINT_STALE_DAYS: u32 = 180;
+
+impl TemplateProvenance {
+    /// Age in days at `now_days`, or `None` if stamped in the future.
+    #[must_use]
+    pub fn age_days(&self, now_days: u32) -> Option<u32> {
+        now_days.checked_sub(self.checked_days)
+    }
+
+    /// Whether this template is past [`FINGERPRINT_STALE_DAYS`].
+    #[must_use]
+    pub fn is_stale(&self, now_days: u32) -> bool {
+        self.age_days(now_days)
+            .is_some_and(|d| d > FINGERPRINT_STALE_DAYS)
+    }
+}
+
+/// Today, in days since the Unix epoch, for staleness checks.
+#[must_use]
+pub fn today_days() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u32::try_from(d.as_secs() / 86_400).unwrap_or(u32::MAX))
+        .unwrap_or(0)
+}
+
 /// One signed parameter set describing how to emit a ClientHello
 /// with a specific JA3/JA4 fingerprint.
 ///
@@ -67,6 +134,18 @@ use std::fmt::Write;
 pub struct TlsFingerprintTemplate {
     /// Diagnostic name, used in logs + metrics labels.
     pub name: &'static str,
+    /// What browser and version this template claims to be, and when that claim
+    /// was last checked against reality.
+    ///
+    /// A ClientHello template is a perishable good. Chrome changes extension
+    /// ordering, GREASE placement, key-share groups and cipher lists on its
+    /// release cadence, so a template that matched the modal browser when it was
+    /// written drifts into being a UNIQUE IDENTIFIER - the failure is not that it
+    /// looks like nothing, it is that it looks like exactly one thing. That is a
+    /// far more likely cause of being blocked than any residual in the traffic
+    /// envelope, and the same defect the trace library had: correct on the day it
+    /// was written, with nothing to notice when it stopped being.
+    pub provenance: TemplateProvenance,
     /// `legacy_version` advertised in the ClientHello record body.
     /// TLS 1.3 clients write `0x0303` here and signal real
     /// version via the `supported_versions` extension.
@@ -268,6 +347,15 @@ pub const SIG_RSA_PKCS1_SHA512: u16 = 0x0601;
 /// contribute to JA3 discrimination anyway.
 pub const CHROME_DESKTOP: TlsFingerprintTemplate = TlsFingerprintTemplate {
     name: "chrome-desktop",
+    provenance: TemplateProvenance {
+        claims_to_be: "Chrome 133",
+        // 2026-01-15. Stamped at the value the code actually reflects, not
+        // at today: the extension set and X25519MLKEM768 group were last
+        // reconciled with a real browser then. Dating it today would make
+        // the staleness check assert its own freshness.
+        checked_days: 20468,
+        source: TemplateSource::HandTranscribed,
+    },
     legacy_version: [0x03, 0x03],
     cipher_suites: &[
         0x1301, // TLS_AES_128_GCM_SHA256
@@ -346,6 +434,15 @@ pub const CHROME_DESKTOP: TlsFingerprintTemplate = TlsFingerprintTemplate {
 /// majority baseline of their deployment's users.
 pub const FIREFOX_DESKTOP: TlsFingerprintTemplate = TlsFingerprintTemplate {
     name: "firefox-desktop",
+    provenance: TemplateProvenance {
+        claims_to_be: "Firefox 135",
+        // 2026-01-15. Stamped at the value the code actually reflects, not
+        // at today: the extension set and X25519MLKEM768 group were last
+        // reconciled with a real browser then. Dating it today would make
+        // the staleness check assert its own freshness.
+        checked_days: 20468,
+        source: TemplateSource::HandTranscribed,
+    },
     legacy_version: [0x03, 0x03],
     cipher_suites: &[
         0x1301, // TLS_AES_128_GCM_SHA256
@@ -403,6 +500,15 @@ pub const FIREFOX_DESKTOP: TlsFingerprintTemplate = TlsFingerprintTemplate {
 /// diversity across a Mirage deployment.
 pub const SAFARI_DESKTOP: TlsFingerprintTemplate = TlsFingerprintTemplate {
     name: "safari-desktop",
+    provenance: TemplateProvenance {
+        claims_to_be: "Safari 18",
+        // 2026-01-15. Stamped at the value the code actually reflects, not
+        // at today: the extension set and X25519MLKEM768 group were last
+        // reconciled with a real browser then. Dating it today would make
+        // the staleness check assert its own freshness.
+        checked_days: 20468,
+        source: TemplateSource::HandTranscribed,
+    },
     legacy_version: [0x03, 0x03],
     cipher_suites: &[
         0x1301, 0x1302, 0x1303, 0xC02C, 0xC02B, 0xC030, 0xC02F, 0x009D, 0x009C, 0x0035, 0x002F,
@@ -607,11 +713,98 @@ fn write_u8_list(out: &mut String, xs: &[u8]) {
     }
 }
 
+/// Warn once, at startup, for every template that has gone stale.
+///
+/// The point is that the drift is otherwise SILENT. A ClientHello does not stop
+/// working when Chrome moves on - it keeps connecting, and simply stops matching
+/// the population it is hiding in. Nothing in a running system surfaces that, so
+/// it has to be surfaced by the calendar.
+///
+/// Warn rather than refuse, for the same reason the trace policy warns: a dated
+/// ClientHello still beats a client that will not start. Callers wanting a hard
+/// stop can check [`TemplateProvenance::is_stale`] directly.
+pub fn warn_if_fingerprints_stale(now_days: u32) {
+    for t in ALL_TEMPLATES {
+        let p = &t.provenance;
+        if p.is_stale(now_days) {
+            tracing::warn!(
+                template = t.name,
+                claims_to_be = p.claims_to_be,
+                age_days = p.age_days(now_days).unwrap_or(0),
+                stale_after_days = FINGERPRINT_STALE_DAYS,
+                hand_transcribed = matches!(p.source, TemplateSource::HandTranscribed),
+                "TLS fingerprint template has not been checked against a real browser \
+                 for longer than the staleness budget. Browsers change extension order, \
+                 GREASE placement and key-share groups every few releases, so a template \
+                 that is out of date does not look like nothing - it looks like exactly \
+                 one thing, which is worse. Re-derive it from a current capture."
+            );
+        }
+    }
+}
+
 // Tests
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shipped template must declare what it claims to be, when that was last
+    /// checked, and how it was obtained.
+    ///
+    /// The ClientHello is the first thing a censor sees and the cheapest thing to
+    /// classify on, and these templates are HAND-TRANSCRIBED - they cannot be
+    /// regenerated from anything, so keeping them current is a person re-reading a
+    /// spec and drift is silent. That is the same defect the trace library had
+    /// before it carried a capture date: correct on the day it was written, with
+    /// no mechanism to notice when it stopped being.
+    #[test]
+    fn every_shipped_template_declares_its_provenance() {
+        for t in ALL_TEMPLATES {
+            let p = &t.provenance;
+            assert!(
+                !p.claims_to_be.is_empty(),
+                "{}: must name the browser build it imitates",
+                t.name
+            );
+            assert!(
+                p.checked_days > 19_000,
+                "{}: checked_days looks unset ({})",
+                t.name,
+                p.checked_days
+            );
+            // A template stamped in the future would silently never go stale.
+            assert!(
+                p.checked_days <= today_days(),
+                "{}: stamped in the future - staleness would never fire",
+                t.name
+            );
+        }
+    }
+
+    /// The staleness rule must fire, and must not fire early.
+    #[test]
+    fn fingerprint_staleness_has_a_boundary_and_both_sides_of_it() {
+        let p = TemplateProvenance {
+            claims_to_be: "Chrome 133",
+            checked_days: 20_000,
+            source: TemplateSource::HandTranscribed,
+        };
+        assert_eq!(p.age_days(20_000), Some(0));
+        assert!(!p.is_stale(20_000), "same day is not stale");
+        assert!(
+            !p.is_stale(20_000 + FINGERPRINT_STALE_DAYS),
+            "exactly at the budget is not yet stale"
+        );
+        assert!(
+            p.is_stale(20_000 + FINGERPRINT_STALE_DAYS + 1),
+            "one day past the budget IS stale"
+        );
+        // A clock that moved backwards reports unknown age rather than wrapping
+        // to a huge number and declaring everything stale.
+        assert_eq!(p.age_days(19_999), None);
+        assert!(!p.is_stale(19_999));
+    }
 
     // ----------- JA3 string pinning (A26 drift detection) -----------
 

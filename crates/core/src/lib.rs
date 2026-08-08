@@ -757,8 +757,11 @@ mod tests {
         let (bx_sk, bx_pk, bed_pk, op_pk) = (k.bx_sk, k.bx_pk, k.bed_pk, k.op_pk);
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            if obfs {
-                mirage_transport_obfs::obfs_server_authenticate(
+            // The obfs branch yields a DIFFERENT stream type (the post-knock
+            // bytes are keystreamed), so both arms are boxed to one type rather
+            // than trying to rebind `sock`.
+            let stream: std::pin::Pin<Box<dyn mirage_transport::AsyncReadWrite + Send>> = if obfs {
+                let (knock_key, nonce) = mirage_transport_obfs::obfs_server_authenticate(
                     &mut sock,
                     &bx_pk,
                     None,
@@ -766,10 +769,15 @@ mod tests {
                 )
                 .await
                 .expect("obfs server auth");
-            }
+                Box::pin(mirage_transport_obfs::obfs_wrap_server(
+                    sock, &knock_key, &nonce,
+                ))
+            } else {
+                Box::pin(sock)
+            };
             let mut rs = ReplaySet::new(16);
             let mut v = TokenVerifier::new(&mut rs, now);
-            let mut s = accept(sock, &bx_sk, &bed_pk, &op_pk, &mut v)
+            let mut s = accept(stream, &bx_sk, &bed_pk, &op_pk, &mut v)
                 .await
                 .expect("bridge accept");
             let mut buf = [0u8; 5];

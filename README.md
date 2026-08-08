@@ -14,7 +14,7 @@
   <a href="docs/security-model.md">Security model</a>
 </p>
 
-> **Status:** `0.1.6-alpha.1`. Deployable today. Wire formats and config may still change
+> **Status:** `0.1.7-alpha.1`. Deployable today. Wire formats and config may still change
 > before a stable release.
 
 Mirage is not a single protocol. It is a **stack of interchangeable layers** - you pick
@@ -128,7 +128,11 @@ of the same stream. Video buys throughput; browse buys latency. See
 
 Want a *specific* envelope - your own site, a particular stream? Record it with
 `mirage-cover-record` and set `proteus_profile`; that pins the library and turns
-auto-sourcing off. See [cover sources](tools/cover-sources/README.md).
+auto-sourcing off. A pinned library must contain traces for the cover host you
+announce (`<lib>/<host>/`) or the client refuses to start - wearing an envelope
+recorded against a different site than your SNI claims is a mismatch no single
+layer can detect, and pinning means it will never repair itself. Auto-sourcing
+records your cover host for you. See [cover sources](tools/cover-sources/README.md).
 
 One switch turns on the whole strong posture: `"paranoid": true`. Details in the
 **[feature reference](docs/features.md)** and **[operator guide](docs/operators.md)**.
@@ -240,7 +244,10 @@ nix build .#mirage-bridge             # or reproducibly, via Nix
 No feature flags, no system libraries. The desktop GUI (`mirage-client-gui`)
 renders with Slint's software renderer - it builds with plain `cargo` and links
 only the standard C runtime. On Linux it's a glibc build that uses your existing
-desktop (X11/Wayland) at run time; it ships in the `...-gui` release archives.
+desktop at run time; it ships in the `...-gui` release archives. On Wayland it
+routes through XWayland, because pointer input is not delivered reliably to the
+pinned Slint version on a native Wayland surface (`MIRAGE_FORCE_WAYLAND=1` opts
+out).
 
 ---
 

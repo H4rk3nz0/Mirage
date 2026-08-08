@@ -6,7 +6,7 @@
 // Mirage design system: a connection orb, an in-control row, saved profiles, a
 // live discovery panel, and session stats - all cool blue-slate with teal = ok.
 
-import { VerticalBox, HorizontalBox, ScrollView, LineEdit, TextEdit } from "std-widgets.slint";
+import { VerticalBox, HorizontalBox, ScrollView, TextEdit } from "std-widgets.slint";
 
 // One row of the bridges table, mirrored from the daemon's /api/bridges JSON.
 export struct BridgeRow {
@@ -42,6 +42,241 @@ export struct ChannelRow {
     healthy: bool,
 }
 
+// ===========================================================================
+// Design tokens
+//
+// One source for every colour, size, radius and duration in the UI. Before this
+// the values were inline at each use site, which is how the interface drifted:
+// nine border radii (4/5/7/8/10/12/14/15/17px) doing the job of three, nine
+// font sizes with no ramp, and a dozen one-off hex colours - #14283f, #223247,
+// #12233a, #182438 - that are all "surface, slightly lifted" and none of which
+// agree. Individually invisible; collectively the reason it reads as untidy.
+//
+// `retro` is the hinge for the Win98 easter egg. Because every token resolves
+// through here, flipping one boolean re-skins the whole app - so the theme swap
+// costs a palette, not a second UI. Slint has no CSS, so 98.css cannot be
+// loaded; these are its values, hand-ported (98.css is MIT).
+// ===========================================================================
+global Theme {
+    // Flipped by clicking the connection orb. See `retro-taps` on AppWindow.
+    in-out property <bool> retro: false;
+
+    // ---- Surfaces ----
+    // Windows 98's actual desktop was #008080. Authentic, and unpleasant across a
+    // whole window: at full-bleed it is a saturated cyan that fights every grey
+    // panel sitting on it. Darkened and desaturated to roughly a third of the
+    // original chroma - still unmistakably the teal desktop, no longer glaring.
+    // Swap this one token for #008080 if you want the museum-accurate eyesore.
+    out property <color> bg: root.retro ? #1e4d4d : #0b1220;
+    out property <color> surface: root.retro ? #c0c0c0 : #131d2e;     // 98: button face
+    out property <color> surface-2: root.retro ? #c0c0c0 : #0f1826;
+    out property <color> surface-lift: root.retro ? #dfdfdf : #182438; // hover
+    out property <color> surface-sink: root.retro ? #a8a8a8 : #101a29; // pressed
+    out property <color> surface-sel: root.retro ? #000080 : #12233a;  // selected row
+
+    // ---- Lines. In retro these are the bevel highlight/shadow pair. ----
+    out property <color> line: root.retro ? #808080 : #213045;
+    out property <color> line-2: root.retro ? #ffffff : #2b3d55;
+    out property <color> bevel-hi: #ffffff;
+    out property <color> bevel-lo: #808080;
+    out property <color> bevel-black: #000000;
+
+    // ---- Text ----
+    out property <color> text-hi: root.retro ? #000000 : #e9eff8;
+    out property <color> muted: root.retro ? #404040 : #8494ab;
+    // Text sitting directly on the window BACKGROUND rather than on a panel.
+    //
+    // In the dark theme both surfaces are dark, so one pair of text colours
+    // covers everything. Retro breaks that: panels are light grey (wanting black
+    // text) while the desktop is dark teal (wanting white). Reusing `muted` there
+    // put #404040 on #1e4d4d and the section labels and log toggle effectively
+    // disappeared - legible in the dark theme, invisible in retro, from one
+    // shared token.
+    out property <color> on-bg: root.retro ? #ffffff : #e9eff8;
+    out property <color> on-bg-muted: root.retro ? #cfdcdc : #8494ab;
+    out property <color> on-accent: root.retro ? #ffffff : #041020;
+
+    // ---- Connection state, as its own palette ----
+    //
+    // The orb used to borrow `accent`/`amber`/`coral`/`muted` - three accents and
+    // a TEXT colour. That coupling is why it looked wrong in retro: `muted` is
+    // tuned for reading against a panel, and as a 100px graphic on the teal
+    // desktop it read as a dead grey smudge.
+    //
+    // Retro values are picked for contrast against the #1e4d4d desktop rather
+    // than for period accuracy: true VGA #008000/#800000 are darker than the
+    // background they sit on and simply vanish.
+    out property <color> state-idle: root.retro ? #000080 : #8494ab;  // navy when off
+    out property <color> state-busy: root.retro ? #d4b106 : #e4a94a;  // connecting
+    out property <color> state-ok:   root.retro ? #22c55e : #33c8ac;  // connected
+    out property <color> state-bad:  root.retro ? #e05252 : #e86a72;  // error
+
+    // ---- Accents ----
+    out property <color> azure: root.retro ? #000080 : #4f9fe6;
+    out property <color> azure-bright: root.retro ? #1084d0 : #62b0f2;
+    out property <color> violet: root.retro ? #000080 : #9385f2;
+    out property <color> accent: root.retro ? #008000 : #33c8ac;   // teal = connected/ok
+    out property <color> amber: root.retro ? #808000 : #e4a94a;
+    out property <color> coral: root.retro ? #800000 : #e86a72;
+
+    // Tinted backdrops, derived rather than hand-picked, so an accent change
+    // carries its own washes with it instead of stranding four stale hexes.
+    out property <color> accent-wash: root.retro ? #c0c0c0 : #14283f;
+    out property <color> danger-wash: root.retro ? #c0c0c0 : #241519;
+    out property <color> danger-line: root.retro ? #808080 : #5c2830;
+    out property <color> danger-sink: root.retro ? #a8a8a8 : #2a1a20;
+    out property <color> danger-lift: root.retro ? #dfdfdf : #241a1f;
+
+    // Secondary button (Browse / Save): a filled slate chip, not an outline.
+    out property <color> btn-2: root.retro ? #c0c0c0 : #223247;
+    out property <color> btn-2-lift: root.retro ? #dfdfdf : #2a3c53;
+
+    // Deepest well - the log pane, which should read as recessed, not as
+    // another card. In retro it is the classic sunken white text field.
+    out property <color> well: root.retro ? #ffffff : #070c15;
+    // Modal scrim.
+    out property <color> scrim: #000000cc;
+
+    // ---- Spacing: a 4px scale. Every gap and pad snaps to it. ----
+    out property <length> s1: 4px;
+    out property <length> s2: 8px;
+    out property <length> s3: 12px;
+    out property <length> s4: 16px;
+    out property <length> s5: 20px;
+    out property <length> s6: 28px;
+
+    // ---- Radii: three steps, not nine. Retro squares everything off. ----
+    out property <length> r-sm: root.retro ? 0px : 8px;    // controls, chips
+    out property <length> r-md: root.retro ? 0px : 12px;   // cards, rows
+    out property <length> r-lg: root.retro ? 0px : 16px;   // panels
+    out property <length> r-pill: root.retro ? 0px : 999px;
+
+    // ---- Type ramp ----
+    out property <length> t-micro: 10px;   // section labels, meta
+    out property <length> t-small: 11px;
+    out property <length> t-body: 13px;
+    out property <length> t-lead: 15px;
+    out property <length> t-stat: 17px;    // numeric readouts
+    out property <length> t-title: 20px;   // the one hero line
+    out property <int> w-bold: 700;
+    out property <int> w-med: 600;
+
+    // ---- Control heights ----
+    out property <length> h-control: 44px;
+    out property <length> h-row: 52px;
+    out property <length> h-tile: 62px;
+
+    // ---- Motion. Retro has none: Win98 did not animate. ----
+    out property <duration> quick: root.retro ? 0ms : 120ms;
+    out property <duration> fade: root.retro ? 0ms : 450ms;
+    out property <duration> slow: root.retro ? 0ms : 700ms;
+    out property <duration> breath: 2400ms;
+}
+
+// ===========================================================================
+// Surface: the one box everything is drawn on.
+//
+// In modern mode it is a flat rectangle with a radius and a hairline border. In
+// retro mode it is a Windows 98 BEVEL, and the bevel is the whole point: the
+// palette alone does not read as 98. Right greys, square corners and no
+// animation still look like a flat grey theme, because 98's visual grammar is
+// two pixels of fake light on every single surface.
+//
+// 98.css draws it with four stacked inset shadows:
+//
+//   raised   inset -1px -1px #0a0a0a, inset  1px  1px #ffffff,
+//            inset -2px -2px #808080, inset  2px  2px #dfdfdf
+//   sunken   inset -1px -1px #ffffff, inset  1px  1px #808080,
+//            inset -2px -2px #dfdfdf, inset  2px  2px #0a0a0a
+//
+// Slint has no inset shadow, so the same thing is drawn as eight 1px edge
+// rectangles - an outer pair and an inner pair, each with a light and a dark
+// side. `sunken` (and `pressed`, which is the same geometry) swaps which side
+// gets the light.
+// ===========================================================================
+component Surface inherits Rectangle {
+    in property <bool> sunken: false;
+    in property <bool> pressed: false;
+    in property <length> radius: Theme.r-md;
+    in property <color> fill: Theme.surface;
+    in property <color> flat-border: Theme.line;
+
+    // Light comes from the top-left unless the control is pushed in or carved out.
+    property <bool> inverted: root.sunken || root.pressed;
+    property <color> out-tl: root.inverted ? #808080 : #ffffff;
+    property <color> out-br: root.inverted ? #ffffff : #0a0a0a;
+    property <color> in-tl: root.inverted ? #0a0a0a : #dfdfdf;
+    property <color> in-br: root.inverted ? #dfdfdf : #808080;
+
+    background: root.fill;
+    border-radius: Theme.retro ? 0px : root.radius;
+    // Modern keeps its hairline; retro draws its own edges below, so the plain
+    // border must go or it prints a fifth line over the bevel.
+    border-width: Theme.retro ? 0px : 1px;
+    border-color: root.flat-border;
+
+    if Theme.retro: Rectangle {
+        // outer ring
+        Rectangle { x: 0; y: 0; width: parent.width; height: 1px; background: root.out-tl; }
+        Rectangle { x: 0; y: 0; width: 1px; height: parent.height; background: root.out-tl; }
+        Rectangle { x: 0; y: parent.height - 1px; width: parent.width; height: 1px; background: root.out-br; }
+        Rectangle { x: parent.width - 1px; y: 0; width: 1px; height: parent.height; background: root.out-br; }
+        // inner ring, inset by one pixel
+        Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: 1px; background: root.in-tl; }
+        Rectangle { x: 1px; y: 1px; width: 1px; height: parent.height - 2px; background: root.in-tl; }
+        Rectangle { x: 1px; y: parent.height - 2px; width: parent.width - 2px; height: 1px; background: root.in-br; }
+        Rectangle { x: parent.width - 2px; y: 1px; width: 1px; height: parent.height - 2px; background: root.in-br; }
+    }
+    @children
+}
+
+// A text field that belongs to this design system.
+//
+// `LineEdit` from std-widgets carries Slint's own theme - a pale rounded box
+// that reads as pasted in from another application against the dark card, and
+// which ignores every token above. This is the same control built from the
+// primitives: token-coloured, focus-ringed in azure, and square in retro mode
+// with a sunken bevel, like a real Win98 text field.
+component Field inherits Rectangle {
+    in property <string> placeholder;
+    in-out property <string> text <=> ti.text;
+    in property <bool> enabled: true;
+    callback accepted();
+
+    height: Theme.h-control;
+    border-radius: Theme.r-sm;
+    background: Theme.retro ? #ffffff : (ti.has-focus ? Theme.surface-2 : Theme.well);
+    border-width: Theme.retro ? 2px : 1px;
+    // Retro: sunken bevel (dark on top/left) is the whole visual grammar of a
+    // Win98 input. Modern: a quiet line that brightens to azure on focus.
+    border-color: Theme.retro ? Theme.bevel-lo
+        : (ti.has-focus ? Theme.azure : Theme.line);
+    animate border-color, background { duration: Theme.quick; }
+
+    HorizontalLayout {
+        padding-left: Theme.s3;
+        padding-right: Theme.s3;
+        ti := TextInput {
+            vertical-alignment: center;
+            color: Theme.text-hi;
+            font-size: Theme.t-body;
+            single-line: true;
+            enabled: root.enabled;
+            accepted => { root.accepted(); }
+        }
+    }
+    // Placeholder rides above the input, shown only when empty - TextInput has
+    // no placeholder of its own.
+    if ti.text == "": Text {
+        x: Theme.s3;
+        text: root.placeholder;
+        color: Theme.muted;
+        font-size: Theme.t-body;
+        vertical-alignment: center;
+        height: parent.height;
+    }
+}
+
 export component AppWindow inherits Window {
     // Reflect connection state in the titlebar / taskbar entry.
     title: root.running ? "Mirage - Connected"
@@ -49,9 +284,9 @@ export component AppWindow inherits Window {
         : root.is-error ? "Mirage - Disconnected"
         : "Mirage";
     icon: @image-url("../assets/icon.png");
-    default-font-size: 14px;
+    default-font-size: Theme.t-lead;
     preferred-width: 480px;
-    preferred-height: 860px;
+    preferred-height: 780px;
     min-width: 420px;
     min-height: 620px;
     background: root.bg;
@@ -97,6 +332,41 @@ export component AppWindow inherits Window {
     in-out property <bool> show-log: false;
     in-out property <bool> show-connect: false;      // reveal connect form while running
     property <bool> pulse: false;                    // drives the orb breath
+    // Easter egg: consecutive taps on the connection orb. Resets on a pause, so
+    // the trigger is five DELIBERATE clicks rather than five accumulated over a
+    // session - otherwise a fidgety user re-skins their app by accident and has
+    // no idea what they did or how to undo it.
+    property <int> retro-taps: 0;
+    // The window starts at the FIRST tap and is not restarted per tap.
+    //
+    // The obvious spelling - `running = false; running = true;` inside the click
+    // handler - silently does nothing: Slint 1.9's Timer exposes only `interval`,
+    // `running` and `triggered` (no `restart()`), `running` is an `in` property,
+    // and both assignments collapse into one evaluation. So the timer kept
+    // counting from the first tap and wiped the counter mid-sequence; five clicks
+    // had to land inside 1.4 s or nothing happened, which is why it looked dead.
+    //
+    // Binding `running` to an expression is the reliable form: it flips false ->
+    // true when the first tap lands and false again when the counter clears.
+    // 10 s, not 3. The window runs from the FIRST tap, and a person clicking five
+    // times deliberately - looking at the thing between clicks - takes four or
+    // five seconds. At 3 s it reset before they arrived and the egg looked dead.
+    // The automated test passed only because it clicked every 350 ms, i.e. faster
+    // than anyone actually does it.
+    tap-window := Timer {
+        interval: 10000ms;
+        running: root.retro-taps > 0;
+        triggered => { root.retro-taps = 0; }
+    }
+    // Bumped on every tap so the orb visibly answers each click. Doubles as the
+    // diagnostic: if the orb does not twitch when clicked, the TouchArea is not
+    // receiving events and the counter is not the problem.
+    property <bool> tap-kick: false;
+    tap-kick-timer := Timer {
+        interval: 140ms;
+        running: root.tap-kick;
+        triggered => { root.tap-kick = false; }
+    }
 
     // ---- Events to Rust ----
     callback start();
@@ -119,30 +389,33 @@ export component AppWindow inherits Window {
     property <bool> is-error: root.daemon-state == "error";
     property <bool> stopped: root.daemon-state == "stopped" || root.daemon-state == "error";
 
-    // Identity palette (see the design system).
-    property <color> bg: #0b1220;
-    property <color> surface: #131d2e;
-    property <color> surface-2: #0f1826;
-    property <color> line: #213045;
-    property <color> line-2: #2b3d55;
-    property <color> text-hi: #e9eff8;
-    property <color> muted: #8494ab;
-    property <color> azure: #4f9fe6;
-    property <color> azure-bright: #62b0f2;
-    property <color> violet: #9385f2;
-    property <color> accent: #33c8ac;    // teal = connected / ok
-    property <color> amber: #e4a94a;
-    property <color> coral: #e86a72;
+    // Identity palette - now aliases onto `Theme` rather than literals, so the
+    // ~200 existing `root.<colour>` references stay valid while gaining a single
+    // source (and, with it, the retro swap) without a risky mass rename.
+    property <color> bg: Theme.bg;
+    property <color> surface: Theme.surface;
+    property <color> surface-2: Theme.surface-2;
+    property <color> line: Theme.line;
+    property <color> line-2: Theme.line-2;
+    property <color> text-hi: Theme.text-hi;
+    property <color> muted: Theme.muted;
+    property <color> azure: Theme.azure;
+    property <color> azure-bright: Theme.azure-bright;
+    property <color> violet: Theme.violet;
+    property <color> accent: Theme.accent;
+    property <color> amber: Theme.amber;
+    property <color> coral: Theme.coral;
 
     // Orb / state colour follows the daemon state.
-    property <color> state-color: root.running ? root.accent
-        : root.starting ? root.amber
-        : root.is-error ? root.coral
-        : root.muted;
+    // One source for the orb, the header pill dot and the status text.
+    property <color> state-color: root.running ? Theme.state-ok
+        : root.starting ? Theme.state-busy
+        : root.is-error ? Theme.state-bad
+        : Theme.state-idle;
 
     // Gentle breath for the connection orb (only animates while connected).
     Timer {
-        interval: 2400ms;
+        interval: Theme.breath;
         running: root.running;
         triggered => { root.pulse = !root.pulse; }
     }
@@ -153,9 +426,9 @@ export component AppWindow inherits Window {
             background: root.surface-2;
             height: 56px;
             HorizontalLayout {
-                padding-left: 18px;
-                padding-right: 16px;
-                spacing: 11px;
+                padding-left: Theme.s5;
+                padding-right: Theme.s4;
+                spacing: Theme.s3;
                 Image {
                     source: @image-url("../assets/mark.png");
                     width: 26px;
@@ -165,8 +438,8 @@ export component AppWindow inherits Window {
                 Text {
                     text: "MIRAGE";
                     color: root.text-hi;
-                    font-size: 16px;
-                    font-weight: 700;
+                    font-size: Theme.t-stat;
+                    font-weight: Theme.w-bold;
                     vertical-alignment: center;
                 }
                 Rectangle { horizontal-stretch: 1; }
@@ -174,14 +447,14 @@ export component AppWindow inherits Window {
                 Rectangle {
                     y: (parent.height - self.height) / 2;
                     height: 30px;
-                    border-radius: 15px;
+                    border-radius: self.height / 2;
                     background: root.surface;
                     border-width: 1px;
                     border-color: root.line;
                     HorizontalLayout {
-                        padding-left: 12px;
-                        padding-right: 13px;
-                        spacing: 8px;
+                        padding-left: Theme.s3;
+                        padding-right: Theme.s3;
+                        spacing: Theme.s2;
                         Rectangle {
                             width: 8px; height: 8px; border-radius: 4px;
                             y: (parent.height - self.height) / 2;
@@ -193,7 +466,7 @@ export component AppWindow inherits Window {
                                 : root.starting ? "Connecting"
                                 : root.is-error ? "Error" : "Not connected";
                             color: root.muted;
-                            font-size: 12px;
+                            font-size: Theme.t-body;
                             vertical-alignment: center;
                         }
                     }
@@ -206,17 +479,17 @@ export component AppWindow inherits Window {
         ScrollView {
             vertical-stretch: 1;
             VerticalBox {
-                padding: 18px;
-                spacing: 16px;
+                padding: Theme.s5;
+                spacing: Theme.s4;
                 // Pack content at the top; a sparse (disconnected) screen leaves the
                 // slack at the bottom instead of a dead gap floating in the middle.
                 alignment: LayoutAlignment.start;
 
                 // ---- Connection hero: the orb + state ----
                 VerticalLayout {
-                    spacing: 12px;
-                    padding-top: 6px;
-                    padding-bottom: 2px;
+                    spacing: Theme.s3;
+                    padding-top: Theme.s2;
+                    padding-bottom: Theme.s1;
                     // Orb: layered concentric glow, a crisp definition ring, and a
                     // breathing ring while connected. State colour cross-fades on
                     // connect/disconnect so nothing snaps.
@@ -229,7 +502,7 @@ export component AppWindow inherits Window {
                             y: (parent.height - self.height) / 2;
                             background: root.state-color;
                             opacity: 0.10;
-                            animate background { duration: 450ms; }
+                            animate background { duration: Theme.fade; }
                         }
                         // Crisp definition ring (always present, gives the orb an edge).
                         Rectangle {
@@ -239,7 +512,7 @@ export component AppWindow inherits Window {
                             border-width: 1px;
                             border-color: root.state-color;
                             opacity: 0.30;
-                            animate border-color { duration: 450ms; }
+                            animate border-color { duration: Theme.fade; }
                         }
                         // Breathing ring (only while connected).
                         if root.running: Rectangle {
@@ -249,9 +522,9 @@ export component AppWindow inherits Window {
                             x: (parent.width - self.width) / 2;
                             y: (parent.height - self.height) / 2;
                             border-width: 2px;
-                            border-color: root.accent;
+                            border-color: Theme.state-ok;
                             opacity: root.pulse ? 0.0 : 0.55;
-                            animate width, height, opacity { duration: 2400ms; easing: ease-in-out; }
+                            animate width, height, opacity { duration: Theme.breath; easing: ease-in-out; }
                         }
                         // Core glow.
                         Rectangle {
@@ -260,51 +533,114 @@ export component AppWindow inherits Window {
                             y: (parent.height - self.height) / 2;
                             background: root.state-color;
                             opacity: 0.30;
-                            animate background { duration: 450ms; }
+                            animate background { duration: Theme.fade; }
                         }
-                        // Core.
+                        // Core. Nudges outward on hover so the orb feels alive to
+                        // the cursor - the only hint that it is clickable at all.
                         Rectangle {
-                            width: 16px; height: 16px; border-radius: 8px;
+                            width: root.tap-kick ? 26px : (orb-ta.has-hover ? 19px : 16px);
+                            height: root.tap-kick ? 26px : (orb-ta.has-hover ? 19px : 16px);
+                            border-radius: self.width / 2;
                             x: (parent.width - self.width) / 2;
                             y: (parent.height - self.height) / 2;
                             background: root.state-color;
-                            animate background { duration: 450ms; }
+                            animate background { duration: Theme.fade; }
+                            animate width, height { duration: Theme.quick; easing: ease-out; }
+                        }
+
+                        // ---- Easter egg: five taps on the orb -> Windows 98 ----
+                        //
+                        // Deliberately undiscoverable by accident. One stray click
+                        // does nothing visible; the reveal only starts on the third
+                        // tap, so someone poking at the orb gets a nudge before the
+                        // whole app changes out from under them. Taps reset after
+                        // 1.4 s of stillness, so five DELIBERATE clicks are needed,
+                        // not five clicks spread over a session.
+                        // Sized to the orb, not to the row.
+                        //
+                        // This briefly filled the whole hero row while chasing what
+                        // turned out to be a Wayland input bug (see
+                        // `prefer_xwayland` in main.rs) - which made the entire
+                        // width of the window clickable, so the theme could be
+                        // toggled from empty space nowhere near the orb.
+                        //
+                        // 84px matches the visible definition ring (72px) plus a
+                        // little slop: big enough to hit comfortably, small enough
+                        // that it is unmistakably the orb you are clicking.
+                        orb-ta := TouchArea {
+                            width: 84px;
+                            height: 84px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            // `pointer-event` on DOWN rather than `clicked`.
+                            //
+                            // Kept as belt-and-braces, not as a diagnosis. The orb
+                            // sits inside a ScrollView (a Flickable), which can
+                            // treat press-move-release as a drag and swallow a
+                            // child's `clicked`; counting the press happens before
+                            // anything can decide the gesture was a scroll. That
+                            // was a plausible theory for the dead orb and it was
+                            // NOT the cause - the cause was Wayland pointer input
+                            // never reaching the widget at all. Retained because
+                            // press-counting is strictly more robust here, but do
+                            // not read it as an explanation of anything.
+                            pointer-event(ev) => {
+                                if (ev.kind == PointerEventKind.down) {
+                                    root.retro-taps += 1;
+                                    root.tap-kick = true;
+                                    if (root.retro-taps >= 5) {
+                                        Theme.retro = !Theme.retro;
+                                        root.retro-taps = 0;
+                                    }
+                                }
+                            }
+                        }
+                        // Countdown pips: appear from tap 3, so the last two taps
+                        // are visibly a countdown rather than a mystery.
+                        if root.retro-taps >= 1: HorizontalLayout {
+                            y: parent.height - 6px;
+                            alignment: center;
+                            spacing: Theme.s1;
+                            for i in [0, 1, 2, 3, 4]: Rectangle {
+                                width: 4px; height: 4px; border-radius: 2px;
+                                background: i < root.retro-taps ? root.azure : root.line;
+                            }
                         }
                     }
                     Text {
                         text: root.running ? "Connected"
                             : root.starting ? "Establishing tunnel"
                             : root.is-error ? "Disconnected" : "Not connected";
-                        color: root.text-hi;
-                        font-size: 19px;
-                        font-weight: 700;
+                        color: Theme.on-bg;
+                        font-size: Theme.t-title;
+                        font-weight: Theme.w-bold;
                         horizontal-alignment: center;
                     }
                     // SOCKS address as a click-to-copy pill (with a brief "copied" flash).
                     if root.running: HorizontalLayout {
                         alignment: center;
                         Rectangle {
-                            border-radius: 7px;
+                            border-radius: Theme.r-sm;
                             background: copy-ta.pressed ? root.surface-2
                                 : (copy-ta.has-hover ? root.surface : transparent);
-                            animate background { duration: 120ms; }
+                            animate background { duration: Theme.quick; }
                             copy-ta := TouchArea { clicked => { root.copy-bind(); } }
                             HorizontalLayout {
-                                padding-left: 10px; padding-right: 10px;
-                                padding-top: 3px; padding-bottom: 3px;
-                                spacing: 7px;
+                                padding-left: Theme.s2; padding-right: Theme.s2;
+                                padding-top: Theme.s1; padding-bottom: Theme.s1;
+                                spacing: Theme.s2;
                                 Text {
                                     // socks5h:// (not socks5://) so apps resolve DNS at the
                                     // bridge, over the tunnel - never leaking queries locally.
                                     text: root.copied ? "copied to clipboard" : "socks5h://" + root.bind-addr;
                                     color: root.copied ? root.accent : root.muted;
-                                    font-size: 12px;
+                                    font-size: Theme.t-body;
                                     vertical-alignment: center;
                                 }
                                 Text {
                                     text: root.copied ? "" : "copy";
                                     color: copy-ta.has-hover ? root.azure : root.line-2;
-                                    font-size: 10px;
+                                    font-size: Theme.t-micro;
                                     vertical-alignment: center;
                                 }
                             }
@@ -314,24 +650,24 @@ export component AppWindow inherits Window {
                         text: "via " + root.via-carrier + (root.paranoid ? " + Proteus" : "")
                             + (root.via-bridge != "" ? " - bridge " + root.via-bridge : "");
                         color: root.azure-bright;
-                        font-size: 11px;
+                        font-size: Theme.t-small;
                         horizontal-alignment: center;
                     }
                 }
 
                 // ---- Control row (connected) ----
                 if root.running: HorizontalLayout {
-                    spacing: 8px;
+                    spacing: Theme.s2;
                     // Re-discover (disabled + relabelled while a walk is in flight)
                     Rectangle {
                         height: 46px;
                         horizontal-stretch: 1;
-                        border-radius: 10px;
+                        border-radius: Theme.r-md;
                         background: rd-touch.pressed && !root.discovery-active ? root.surface-2 : root.surface;
                         border-width: 1px;
                         border-color: root.discovery-active ? root.line
                             : (rd-touch.has-hover ? root.azure : root.line);
-                        animate background, border-color { duration: 120ms; }
+                        animate background, border-color { duration: Theme.quick; }
                         rd-touch := TouchArea {
                             enabled: !root.discovery-active;
                             clicked => { root.rediscover(); }
@@ -339,40 +675,40 @@ export component AppWindow inherits Window {
                         Text {
                             text: root.discovery-active ? "Searching" : "Re-discover";
                             color: root.discovery-active ? root.azure : root.text-hi;
-                            font-size: 12px; font-weight: 600;
+                            font-size: Theme.t-body; font-weight: Theme.w-med;
                             opacity: root.discovery-active && root.pulse ? 0.6 : 1.0;
-                            animate opacity { duration: 700ms; }
+                            animate opacity { duration: Theme.slow; }
                         }
                     }
                     // Reconnect
                     Rectangle {
                         height: 46px;
                         horizontal-stretch: 1;
-                        border-radius: 10px;
+                        border-radius: Theme.r-md;
                         background: rc-touch.pressed ? root.surface-2 : root.surface;
                         border-width: 1px;
                         border-color: rc-touch.has-hover ? root.azure : root.line;
-                        animate background, border-color { duration: 120ms; }
+                        animate background, border-color { duration: Theme.quick; }
                         rc-touch := TouchArea { clicked => { root.reconnect(); } }
                         Text {
                             text: "Reconnect";
-                            color: root.text-hi; font-size: 12px; font-weight: 600;
+                            color: root.text-hi; font-size: Theme.t-body; font-weight: Theme.w-med;
                         }
                     }
                     // Paranoid (toggle)
                     Rectangle {
                         height: 46px;
                         horizontal-stretch: 1;
-                        border-radius: 10px;
-                        background: root.paranoid ? #14283f : (pn-touch.pressed ? root.surface-2 : root.surface);
+                        border-radius: Theme.r-md;
+                        background: root.paranoid ? Theme.accent-wash : (pn-touch.pressed ? root.surface-2 : root.surface);
                         border-width: 1px;
                         border-color: root.paranoid ? root.azure : (pn-touch.has-hover ? root.azure : root.line);
-                        animate background, border-color { duration: 120ms; }
+                        animate background, border-color { duration: Theme.quick; }
                         pn-touch := TouchArea { clicked => { root.toggle-paranoid(); } }
                         Text {
                             text: "Paranoid";
                             color: root.paranoid ? root.azure : root.text-hi;
-                            font-size: 12px; font-weight: 600;
+                            font-size: Theme.t-body; font-weight: Theme.w-med;
                         }
                     }
                 }
@@ -380,67 +716,66 @@ export component AppWindow inherits Window {
                 // Disconnect (connected) - subordinate, full-width, coral text.
                 if root.running || root.starting: Rectangle {
                     height: 38px;
-                    border-radius: 10px;
-                    background: dc-touch.pressed ? #2a1a20 : root.surface-2;
+                    border-radius: Theme.r-md;
+                    background: dc-touch.pressed ? Theme.danger-sink : root.surface-2;
                     border-width: 1px;
                     border-color: root.line;
                     dc-touch := TouchArea { clicked => { root.stop(); } }
-                    Text { text: "Disconnect"; color: root.coral; font-size: 12px; font-weight: 600; }
+                    Text { text: "Disconnect"; color: root.coral; font-size: Theme.t-body; font-weight: Theme.w-med; }
                 }
 
                 // ---- Live throughput (up = azure, down = violet) ----
                 if root.running: HorizontalLayout {
-                    spacing: 9px;
+                    spacing: Theme.s2;
                     Rectangle {
-                        horizontal-stretch: 1; height: 54px; border-radius: 12px;
+                        horizontal-stretch: 1; height: 54px; border-radius: Theme.r-md;
                         background: root.surface; border-width: 1px; border-color: root.line;
                         HorizontalLayout {
-                            padding-left: 14px; padding-right: 14px; spacing: 10px;
-                            Text { text: "Up"; color: root.muted; font-size: 11px; font-weight: 700; vertical-alignment: center; }
+                            padding-left: Theme.s3; padding-right: Theme.s3; spacing: Theme.s2;
+                            Text { text: "Up"; color: root.muted; font-size: Theme.t-small; font-weight: Theme.w-bold; vertical-alignment: center; }
                             Rectangle { horizontal-stretch: 1; }
-                            Text { text: root.throughput-up; color: root.azure; font-size: 16px; font-weight: 700; vertical-alignment: center; }
+                            Text { text: root.throughput-up; color: root.azure; font-size: Theme.t-stat; font-weight: Theme.w-bold; vertical-alignment: center; }
                         }
                     }
                     Rectangle {
-                        horizontal-stretch: 1; height: 54px; border-radius: 12px;
+                        horizontal-stretch: 1; height: 54px; border-radius: Theme.r-md;
                         background: root.surface; border-width: 1px; border-color: root.line;
                         HorizontalLayout {
-                            padding-left: 14px; padding-right: 14px; spacing: 10px;
-                            Text { text: "Down"; color: root.muted; font-size: 11px; font-weight: 700; vertical-alignment: center; }
+                            padding-left: Theme.s3; padding-right: Theme.s3; spacing: Theme.s2;
+                            Text { text: "Down"; color: root.muted; font-size: Theme.t-small; font-weight: Theme.w-bold; vertical-alignment: center; }
                             Rectangle { horizontal-stretch: 1; }
-                            Text { text: root.throughput-down; color: root.violet; font-size: 16px; font-weight: 700; vertical-alignment: center; }
+                            Text { text: root.throughput-down; color: root.violet; font-size: Theme.t-stat; font-weight: Theme.w-bold; vertical-alignment: center; }
                         }
                     }
                 }
 
                 // ---- Error banner ----
                 if root.error-text != "": Rectangle {
-                    border-radius: 10px;
-                    background: #241519;
+                    border-radius: Theme.r-md;
+                    background: Theme.danger-wash;
                     border-width: 1px;
-                    border-color: #5c2830;
+                    border-color: Theme.danger-line;
                     VerticalBox {
-                        padding: 12px;
-                        Text { text: root.error-text; color: root.coral; font-size: 12px; wrap: word-wrap; }
+                        padding: Theme.s3;
+                        Text { text: root.error-text; color: root.coral; font-size: Theme.t-body; wrap: word-wrap; }
                     }
                 }
 
                 // ---- Connect form (idle, or when revealed while running) ----
-                if root.stopped || root.show-connect: Rectangle {
-                    border-radius: 14px;
-                    background: root.surface;
-                    border-width: 1px;
-                    border-color: root.line;
+                if root.stopped || root.show-connect: Surface {
+                    radius: Theme.r-lg;
+                    fill: root.surface;
+                    flat-border: root.line;
                     VerticalBox {
-                        padding: 18px;
-                        spacing: 12px;
-                        Text { text: "New connection"; font-weight: 700; color: root.text-hi; }
+                        padding: Theme.s5;
+                        spacing: Theme.s3;
+                        Text { text: "New connection"; font-weight: Theme.w-bold; color: root.text-hi; }
                         Text {
                             text: "Paste an invite (mirage://...) or point to a client.json.";
-                            color: root.muted; font-size: 12px; wrap: word-wrap;
+                            color: root.muted; font-size: Theme.t-body; wrap: word-wrap;
                         }
-                        invite-edit := LineEdit {
-                            placeholder-text: "mirage://...";
+                        invite-edit := Field {
+                            placeholder: "mirage://...";
                             text <=> root.invite;
                             accepted => {
                                 if (root.invite != "" || root.config-path != "") {
@@ -450,9 +785,9 @@ export component AppWindow inherits Window {
                             }
                         }
                         HorizontalBox {
-                            spacing: 8px;
-                            path-edit := LineEdit {
-                                placeholder-text: "or select a client.json";
+                            spacing: Theme.s2;
+                            path-edit := Field {
+                                placeholder: "or select a client.json";
                                 text <=> root.config-path;
                                 horizontal-stretch: 1;
                                 accepted => {
@@ -462,26 +797,34 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            Rectangle {
-                                width: 92px; border-radius: 10px;
-                                background: br-touch.pressed ? root.surface-2 : (br-touch.has-hover ? #2a3c53 : #223247);
-                                animate background { duration: 120ms; }
+                            Surface {
+                                width: 92px; height: Theme.h-control; radius: Theme.r-md;
+                                pressed: br-touch.pressed;
+                                fill: Theme.retro ? Theme.surface
+                                    : (br-touch.pressed ? root.surface-2
+                                    : (br-touch.has-hover ? Theme.btn-2-lift : Theme.btn-2));
+                                flat-border: transparent;
+                                animate background { duration: Theme.quick; }
                                 br-touch := TouchArea { clicked => { root.browse(); } }
-                                Text { text: "Browse"; color: root.text-hi; font-size: 13px; }
+                                Text { text: "Browse"; color: root.text-hi; font-size: Theme.t-body; }
                             }
                         }
                         HorizontalBox {
-                            spacing: 8px;
-                            name-edit := LineEdit {
-                                placeholder-text: "Name to save this as a profile";
+                            spacing: Theme.s2;
+                            name-edit := Field {
+                                placeholder: "Name to save this as a profile";
                                 text <=> root.profile-name;
                                 horizontal-stretch: 1;
                             }
-                            Rectangle {
-                                width: 92px; border-radius: 10px;
-                                background: sv-touch.pressed ? root.surface-2 : (sv-touch.has-hover ? #2a3c53 : #223247);
-                                animate background { duration: 120ms; }
-                                opacity: (root.profile-name != "" && (root.invite != "" || root.config-path != "")) ? 1.0 : 0.45;
+                            Surface {
+                                width: 92px; height: Theme.h-control; radius: Theme.r-md;
+                                pressed: sv-touch.pressed;
+                                fill: Theme.retro ? Theme.surface
+                                    : (sv-touch.pressed ? root.surface-2
+                                    : (sv-touch.has-hover ? Theme.btn-2-lift : Theme.btn-2));
+                                flat-border: transparent;
+                                animate background { duration: Theme.quick; }
+                                opacity: (root.profile-name != "" && (root.invite != "" || root.config-path != "")) ? 1.0 : 0.55;
                                 sv-touch := TouchArea {
                                     clicked => {
                                         if (root.profile-name != "" && (root.invite != "" || root.config-path != "")) {
@@ -489,35 +832,54 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
-                                Text { text: "Save"; color: root.text-hi; font-size: 13px; }
+                                Text { text: "Save"; color: root.text-hi; font-size: Theme.t-body; }
                             }
                         }
-                        Rectangle {
-                            height: 46px; border-radius: 10px;
-                            background: cn-touch.pressed ? root.azure.darker(0.25)
-                                : (cn-touch.has-hover ? root.azure-bright : root.azure);
-                            animate background { duration: 120ms; }
-                            opacity: (root.invite != "" || root.config-path != "") ? 1.0 : 0.45;
+                        // Primary action. The not-yet-usable state is a QUIET
+                        // control, not a faded bright one: dimming a saturated
+                        // azure to 45% produced a muddy half-blue that reads as
+                        // "this button is broken" rather than "fill something in
+                        // first". Unavailable should look calm, not damaged.
+                        Surface {
+                            property <bool> ready: root.invite != "" || root.config-path != "";
+                            height: Theme.h-control;
+                            radius: Theme.r-md;
+                            pressed: cn-touch.pressed;
+                            // Retro has no "primary blue" - a 98 dialog's default
+                            // button is the same grey face with a heavier outline,
+                            // so the accent fill is dropped rather than recoloured.
+                            fill: Theme.retro ? Theme.surface
+                                : (!self.ready ? Theme.surface-2
+                                : (cn-touch.pressed ? root.azure.darker(0.25)
+                                : (cn-touch.has-hover ? root.azure-bright : root.azure)));
+                            flat-border: self.ready ? transparent : Theme.line;
+                            animate background { duration: Theme.quick; }
                             cn-touch := TouchArea {
+                                enabled: parent.ready;
                                 clicked => {
-                                    if (root.invite != "" || root.config-path != "") {
-                                        root.show-connect = false;
-                                        root.start();
-                                    }
+                                    root.show-connect = false;
+                                    root.start();
                                 }
                             }
-                            Text { text: "Connect"; color: #041020; font-weight: 700; font-size: 15px; }
+                            Text {
+                                text: "Connect";
+                                color: Theme.retro ? (parent.ready ? Theme.text-hi : Theme.muted)
+                                    : (parent.ready ? Theme.on-accent : Theme.muted);
+                                font-weight: Theme.w-bold;
+                                font-size: Theme.t-lead;
+                                animate color { duration: Theme.quick; }
+                            }
                         }
                     }
                 }
 
                 // ---- Profiles ----
                 if root.profiles.length > 0: VerticalLayout {
-                    spacing: 8px;
+                    spacing: Theme.s2;
                     HorizontalLayout {
                         Text {
                             text: "PROFILES";
-                            color: root.muted; font-size: 10px; font-weight: 700;
+                            color: Theme.on-bg-muted; font-size: Theme.t-micro; font-weight: Theme.w-bold;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -526,26 +888,26 @@ export component AppWindow inherits Window {
                             pi-touch := TouchArea { clicked => { root.show-connect = !root.show-connect; } }
                             Text {
                                 text: root.show-connect ? "close" : "+ Paste invite";
-                                color: root.azure; font-size: 11px; font-weight: 600;
+                                color: root.azure; font-size: Theme.t-small; font-weight: Theme.w-med;
                                 horizontal-alignment: right; vertical-alignment: center;
                             }
                         }
                     }
                     for p in root.profiles: Rectangle {
                         height: 52px;
-                        border-radius: 12px;
-                        background: p.active ? #12233a
+                        border-radius: Theme.r-md;
+                        background: p.active ? Theme.surface-sel
                             : (prow-touch.pressed ? root.surface-2
-                            : (prow-touch.has-hover ? #182438 : root.surface));
+                            : (prow-touch.has-hover ? Theme.surface-lift : root.surface));
                         border-width: 1px;
                         border-color: p.active ? root.azure
                             : (prow-touch.has-hover ? root.line-2 : root.line);
-                        animate background, border-color { duration: 120ms; }
+                        animate background, border-color { duration: Theme.quick; }
                         prow-touch := TouchArea { clicked => { root.load-profile(p.name); } }
                         HorizontalLayout {
-                            padding-left: 13px;
-                            padding-right: 10px;
-                            spacing: 11px;
+                            padding-left: Theme.s3;
+                            padding-right: Theme.s2;
+                            spacing: Theme.s3;
                             Rectangle {
                                 width: 9px; height: 9px; border-radius: 5px;
                                 y: (parent.height - self.height) / 2;
@@ -556,30 +918,30 @@ export component AppWindow inherits Window {
                                 horizontal-stretch: 1;
                                 Text {
                                     text: p.name;
-                                    color: root.text-hi; font-size: 13px; font-weight: 600;
+                                    color: root.text-hi; font-size: Theme.t-body; font-weight: Theme.w-med;
                                     overflow: elide;
                                 }
                                 Text {
                                     text: p.subtitle;
-                                    color: root.muted; font-size: 10px; overflow: elide;
+                                    color: root.muted; font-size: Theme.t-micro; overflow: elide;
                                 }
                             }
                             Text {
                                 text: p.active ? "connected" : "connect";
                                 color: p.active ? root.accent : root.muted;
-                                font-size: 11px;
+                                font-size: Theme.t-small;
                                 vertical-alignment: center;
                             }
                             Rectangle {
-                                width: 28px; height: 28px; border-radius: 8px;
+                                width: 28px; height: 28px; border-radius: Theme.r-sm;
                                 y: (parent.height - self.height) / 2;
-                                background: del-touch.pressed ? #3a1a1f : (del-touch.has-hover ? #241a1f : transparent);
-                                animate background { duration: 120ms; }
+                                background: del-touch.pressed ? Theme.danger-sink : (del-touch.has-hover ? Theme.danger-lift : transparent);
+                                animate background { duration: Theme.quick; }
                                 del-touch := TouchArea { clicked => { root.delete-profile(p.name); } }
                                 Text {
                                     text: "x";
                                     color: del-touch.has-hover ? root.coral : root.muted;
-                                    font-size: 14px;
+                                    font-size: Theme.t-lead;
                                 }
                             }
                         }
@@ -588,46 +950,46 @@ export component AppWindow inherits Window {
 
                 // ---- Discovery ----
                 if root.running && root.channels.length > 0: VerticalLayout {
-                    spacing: 8px;
+                    spacing: Theme.s2;
                     Text {
                         text: "DISCOVERY";
-                        color: root.muted; font-size: 10px; font-weight: 700;
+                        color: root.muted; font-size: Theme.t-micro; font-weight: Theme.w-bold;
                     }
                     Rectangle {
-                        border-radius: 12px;
+                        border-radius: Theme.r-md;
                         background: root.surface-2;
                         border-width: 1px;
                         border-color: root.line;
                         VerticalBox {
-                            padding: 15px;
-                            spacing: 12px;
+                            padding: Theme.s4;
+                            spacing: Theme.s3;
                             HorizontalLayout {
                                 Text {
                                     text: "Walking rendezvous";
-                                    color: root.text-hi; font-size: 12px; font-weight: 600;
+                                    color: root.text-hi; font-size: Theme.t-body; font-weight: Theme.w-med;
                                     vertical-alignment: center;
                                 }
                                 Rectangle { horizontal-stretch: 1; }
                                 Text {
                                     text: root.discovery-active ? "searching" : "idle";
                                     color: root.discovery-active ? root.azure : root.muted;
-                                    font-size: 11px;
+                                    font-size: Theme.t-small;
                                     vertical-alignment: center;
                                     opacity: root.discovery-active && root.pulse ? 0.55 : 1.0;
-                                    animate opacity { duration: 700ms; }
+                                    animate opacity { duration: Theme.slow; }
                                 }
                             }
                             HorizontalLayout {
-                                spacing: 16px;
+                                spacing: Theme.s4;
                                 alignment: LayoutAlignment.start;
                                 for c in root.channels: HorizontalLayout {
-                                    spacing: 7px;
+                                    spacing: Theme.s2;
                                     Rectangle {
                                         width: 7px; height: 7px; border-radius: 4px;
                                         y: (parent.height - self.height) / 2;
                                         background: c.healthy ? root.accent : root.amber;
                                     }
-                                    Text { text: c.name; color: root.text-hi; font-size: 11px; vertical-alignment: center; }
+                                    Text { text: c.name; color: root.text-hi; font-size: Theme.t-small; vertical-alignment: center; }
                                 }
                             }
                             Rectangle { height: 1px; background: root.line; }
@@ -635,7 +997,7 @@ export component AppWindow inherits Window {
                                 text: root.discovered-count > 0
                                     ? root.discovered-count + " bridges known - rendezvous rotates hourly, nothing to seize"
                                     : "rendezvous rotates hourly, nothing to seize";
-                                color: root.muted; font-size: 11px; wrap: word-wrap;
+                                color: root.muted; font-size: Theme.t-small; wrap: word-wrap;
                             }
                         }
                     }
@@ -643,38 +1005,38 @@ export component AppWindow inherits Window {
 
                 // ---- This session ----
                 if root.running: VerticalLayout {
-                    spacing: 8px;
-                    Text { text: "THIS SESSION"; color: root.muted; font-size: 10px; font-weight: 700; }
+                    spacing: Theme.s2;
+                    Text { text: "THIS SESSION"; color: Theme.on-bg-muted; font-size: Theme.t-micro; font-weight: Theme.w-bold; }
                     HorizontalLayout {
-                        spacing: 9px;
+                        spacing: Theme.s2;
                         Rectangle {
-                            horizontal-stretch: 1; height: 62px; border-radius: 12px;
+                            horizontal-stretch: 1; height: 62px; border-radius: Theme.r-md;
                             background: root.surface; border-width: 1px; border-color: root.line;
                             VerticalLayout {
-                                padding: 12px; spacing: 5px;
-                                Text { text: "CARRIER"; color: root.muted; font-size: 9px; font-weight: 700; }
+                                padding: Theme.s3; spacing: Theme.s1;
+                                Text { text: "CARRIER"; color: root.muted; font-size: Theme.t-micro; font-weight: Theme.w-bold; }
                                 Text {
                                     text: root.via-carrier != "" ? root.via-carrier : "-";
-                                    color: root.accent; font-size: 16px; font-weight: 700; overflow: elide;
+                                    color: root.accent; font-size: Theme.t-stat; font-weight: Theme.w-bold; overflow: elide;
                                 }
                             }
                         }
                         Rectangle {
-                            horizontal-stretch: 1; height: 62px; border-radius: 12px;
+                            horizontal-stretch: 1; height: 62px; border-radius: Theme.r-md;
                             background: root.surface; border-width: 1px; border-color: root.line;
                             VerticalLayout {
-                                padding: 12px; spacing: 5px;
-                                Text { text: "STREAMS"; color: root.muted; font-size: 9px; font-weight: 700; }
-                                Text { text: root.session-streams; color: root.text-hi; font-size: 16px; font-weight: 700; }
+                                padding: Theme.s3; spacing: Theme.s1;
+                                Text { text: "STREAMS"; color: root.muted; font-size: Theme.t-micro; font-weight: Theme.w-bold; }
+                                Text { text: root.session-streams; color: root.text-hi; font-size: Theme.t-stat; font-weight: Theme.w-bold; }
                             }
                         }
                         Rectangle {
-                            horizontal-stretch: 1; height: 62px; border-radius: 12px;
+                            horizontal-stretch: 1; height: 62px; border-radius: Theme.r-md;
                             background: root.surface; border-width: 1px; border-color: root.line;
                             VerticalLayout {
-                                padding: 12px; spacing: 5px;
-                                Text { text: "UPTIME"; color: root.muted; font-size: 9px; font-weight: 700; }
-                                Text { text: root.uptime; color: root.text-hi; font-size: 16px; font-weight: 700; overflow: elide; }
+                                padding: Theme.s3; spacing: Theme.s1;
+                                Text { text: "UPTIME"; color: root.muted; font-size: Theme.t-micro; font-weight: Theme.w-bold; }
+                                Text { text: root.uptime; color: root.text-hi; font-size: Theme.t-stat; font-weight: Theme.w-bold; overflow: elide; }
                             }
                         }
                     }
@@ -682,22 +1044,22 @@ export component AppWindow inherits Window {
 
                 // ---- Bridges (connected) ----
                 if root.running && root.bridges.length > 0: VerticalLayout {
-                    spacing: 8px;
+                    spacing: Theme.s2;
                     HorizontalLayout {
-                        Text { text: "BRIDGES"; color: root.muted; font-size: 10px; font-weight: 700; vertical-alignment: center; }
+                        Text { text: "BRIDGES"; color: Theme.on-bg-muted; font-size: Theme.t-micro; font-weight: Theme.w-bold; vertical-alignment: center; }
                         Rectangle { horizontal-stretch: 1; }
-                        Text { text: root.sessions + " sessions"; color: root.muted; font-size: 10px; vertical-alignment: center; }
+                        Text { text: root.sessions + " sessions"; color: Theme.on-bg-muted; font-size: Theme.t-micro; vertical-alignment: center; }
                     }
                     for b in root.bridges: Rectangle {
                         height: 42px;
-                        border-radius: 10px;
+                        border-radius: Theme.r-md;
                         background: root.surface;
                         border-width: 1px;
                         border-color: root.line;
                         HorizontalLayout {
                             padding-left: 0px;
-                            padding-right: 12px;
-                            spacing: 10px;
+                            padding-right: Theme.s3;
+                            spacing: Theme.s2;
                             Rectangle {
                                 width: 4px;
                                 background: b.id-color;
@@ -711,58 +1073,58 @@ export component AppWindow inherits Window {
                             }
                             Text {
                                 text: b.addr + (b.port != "" ? ":" + b.port : "");
-                                color: root.text-hi; font-size: 12px;
+                                color: root.text-hi; font-size: Theme.t-body;
                                 overflow: elide; horizontal-stretch: 1;
                                 vertical-alignment: center;
                             }
                             Rectangle {
-                                border-radius: 5px;
+                                border-radius: Theme.r-sm;
                                 background: b.transport-color;
                                 y: (parent.height - self.height) / 2;
                                 height: 18px;
                                 HorizontalLayout {
-                                    padding-left: 8px; padding-right: 8px;
-                                    Text { text: b.transport; color: white; font-size: 10px; vertical-alignment: center; }
+                                    padding-left: Theme.s2; padding-right: Theme.s2;
+                                    Text { text: b.transport; color: white; font-size: Theme.t-micro; vertical-alignment: center; }
                                 }
                             }
-                            Text { text: b.latency; color: b.latency-color; font-size: 11px; vertical-alignment: center; }
+                            Text { text: b.latency; color: b.latency-color; font-size: Theme.t-small; vertical-alignment: center; }
                         }
                     }
                 }
 
                 // ---- Log (collapsible) ----
                 VerticalLayout {
-                    spacing: 8px;
+                    spacing: Theme.s2;
                     HorizontalLayout {
                         Rectangle {
                             width: 60px; height: 22px;
                             lt-touch := TouchArea { clicked => { root.show-log = !root.show-log; } }
                             Text {
                                 text: root.show-log ? "LOG -" : "LOG +";
-                                color: root.muted; font-size: 10px; font-weight: 700;
+                                color: lt-touch.has-hover ? Theme.on-bg : Theme.on-bg-muted; font-size: Theme.t-micro; font-weight: Theme.w-bold;
                                 vertical-alignment: center;
                             }
                         }
                         Rectangle { horizontal-stretch: 1; }
                         if root.show-log: Rectangle {
-                            width: 52px; height: 22px; border-radius: 5px;
-                            background: cl-touch.pressed ? root.surface-2 : #182437;
+                            width: 52px; height: 22px; border-radius: Theme.r-sm;
+                            background: cl-touch.pressed ? root.surface-2 : Theme.surface-lift;
                             cl-touch := TouchArea { clicked => { root.clear-log(); } }
-                            Text { text: "clear"; color: root.muted; font-size: 10px; }
+                            Text { text: "clear"; color: root.muted; font-size: Theme.t-micro; }
                         }
                     }
                     if root.show-log: Rectangle {
                         height: 180px;
-                        border-radius: 12px;
-                        background: #070c15;
+                        border-radius: Theme.r-md;
+                        background: Theme.well;
                         border-width: 1px;
                         border-color: root.line;
                         VerticalBox {
-                            padding: 12px;
+                            padding: Theme.s3;
                             TextEdit {
                                 read-only: true;
                                 wrap: no-wrap;
-                                font-size: 12px;
+                                font-size: Theme.t-body;
                                 text: root.log-text;
                             }
                         }
@@ -772,7 +1134,7 @@ export component AppWindow inherits Window {
                 // ---- Footer ----
                 if root.version != "": Text {
                     text: "mirage-client " + root.version;
-                    color: root.muted; font-size: 10px;
+                    color: Theme.on-bg-muted; font-size: Theme.t-micro;
                     horizontal-alignment: center;
                 }
             }
@@ -781,7 +1143,7 @@ export component AppWindow inherits Window {
 
     // ===== Built-in file browser (modal overlay) =====
     if root.show-browser: Rectangle {
-        background: #000000cc;
+        background: Theme.scrim;
         TouchArea { clicked => { root.browser-cancel(); } }
         // Esc closes the picker (grabs focus when the modal opens).
         FocusScope {
@@ -802,32 +1164,32 @@ export component AppWindow inherits Window {
             width: min(parent.width - 40px, 400px);
             height: min(parent.height - 60px, 460px);
             background: root.surface;
-            border-radius: 14px;
+            border-radius: Theme.r-lg;
             border-width: 1px;
             border-color: root.line;
             TouchArea {}
 
             VerticalBox {
-                padding: 16px;
-                spacing: 10px;
-                Text { text: "Select a client.json"; font-weight: 700; color: root.text-hi; }
+                padding: Theme.s4;
+                spacing: Theme.s2;
+                Text { text: "Select a client.json"; font-weight: Theme.w-bold; color: root.text-hi; }
                 Text {
                     text: root.browser-path;
-                    color: root.muted; font-size: 11px; overflow: elide;
+                    color: root.muted; font-size: Theme.t-small; overflow: elide;
                 }
                 Rectangle {
                     vertical-stretch: 1;
                     background: root.surface-2;
-                    border-radius: 8px;
+                    border-radius: Theme.r-sm;
                     ScrollView {
                         VerticalLayout {
                             alignment: LayoutAlignment.start;
-                            padding: 6px;
-                            spacing: 2px;
+                            padding: Theme.s2;
+                            spacing: Theme.s1;
                             for e in root.browser-entries: Rectangle {
                                 height: 30px;
-                                border-radius: 6px;
-                                background: row-touch.has-hover ? #1b2941 : transparent;
+                                border-radius: Theme.r-sm;
+                                background: row-touch.has-hover ? Theme.surface-lift : transparent;
                                 row-touch := TouchArea {
                                     clicked => {
                                         if (e.is-dir) {
@@ -838,9 +1200,9 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 HorizontalLayout {
-                                    padding-left: 9px;
-                                    padding-right: 9px;
-                                    spacing: 9px;
+                                    padding-left: Theme.s2;
+                                    padding-right: Theme.s2;
+                                    spacing: Theme.s2;
                                     Rectangle {
                                         width: 8px; height: 8px; border-radius: 2px;
                                         y: (parent.height - self.height) / 2;
@@ -848,7 +1210,7 @@ export component AppWindow inherits Window {
                                     }
                                     Text {
                                         text: e.is-dir ? e.name + "/" : e.name;
-                                        color: root.text-hi; font-size: 13px; overflow: elide;
+                                        color: root.text-hi; font-size: Theme.t-body; overflow: elide;
                                         vertical-alignment: center;
                                         horizontal-stretch: 1;
                                     }
@@ -860,8 +1222,8 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     alignment: end;
                     Rectangle {
-                        width: 92px; height: 34px; border-radius: 8px;
-                        background: cancel-touch.pressed ? root.surface-2 : #223247;
+                        width: 92px; height: 34px; border-radius: Theme.r-sm;
+                        background: cancel-touch.pressed ? root.surface-2 : Theme.btn-2;
                         cancel-touch := TouchArea { clicked => { root.browser-cancel(); } }
                         Text { text: "Cancel"; color: root.muted; }
                     }

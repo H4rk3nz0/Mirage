@@ -906,6 +906,8 @@ fn copy_to_clipboard(text: &str) -> bool {
 // main
 
 fn main() -> Result<(), slint::PlatformError> {
+    prefer_xwayland();
+
     // Answer --version / --help WITHOUT opening a window (so the binary is usable
     // and smoke-testable on a headless machine, and behaves like the CLIs).
     if let Some(flag) = std::env::args().nth(1) {
@@ -1186,6 +1188,46 @@ fn main() -> Result<(), slint::PlatformError> {
     // Belt-and-suspenders: ensure the child is reaped even on a clean loop exit.
     stop_client(&shared);
     run
+}
+
+/// Run through XWayland instead of talking Wayland directly, when both are
+/// available.
+///
+/// WHY, because this looks like the wrong thing to do:
+///
+/// Under this Slint (pinned to =1.9.2 for the pure-Rust font stack - see
+/// Cargo.toml) with the software renderer, pointer input is not delivered
+/// reliably to `TouchArea`s on a native Wayland surface. Measured on KDE/KWin:
+/// the same binary, same build, same window - clicks register under X11 and are
+/// silently dropped under Wayland. Verified twice from a real hand and twice
+/// with kernel-level synthetic input through `/dev/uinput`, which the compositor
+/// cannot distinguish from a mouse. Nothing in the UI markup fixes it, because
+/// the events never arrive.
+///
+/// The failure mode is the worst kind: the window draws perfectly and simply
+/// ignores you. No error, no log line, nothing to search for.
+///
+/// XWayland is present on every Wayland desktop that can run this, the renderer
+/// is a CPU framebuffer either way, and the GUI uses no Wayland-specific
+/// feature, so the cost is close to zero. Remove this once Slint is unpinned and
+/// the upstream input path is fixed.
+///
+/// Escape hatch: set `MIRAGE_FORCE_WAYLAND=1` to keep the native surface.
+/// Only acts when `DISPLAY` is also set, i.e. XWayland really is there to fall
+/// back to - unsetting `WAYLAND_DISPLAY` with no X server would leave the app
+/// with no way to open a window at all.
+fn prefer_xwayland() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    if std::env::var_os("MIRAGE_FORCE_WAYLAND").is_some() {
+        return;
+    }
+    let on_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let has_x11 = std::env::var_os("DISPLAY").is_some();
+    if on_wayland && has_x11 {
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
 }
 
 /// Set the window icon directly on winit, since Slint's `Window::icon` is not

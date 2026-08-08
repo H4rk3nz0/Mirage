@@ -81,6 +81,7 @@ pub mod channel;
 pub mod chunk;
 pub mod hickory;
 pub mod resolver;
+pub mod rfc2136;
 
 pub use channel::{info_hash_to_label, DnsTxtChannel, DnsTxtChannelError, MAX_ANNOUNCEMENT_SIZE};
 pub use chunk::{blob_to_chunks, ChunkError};

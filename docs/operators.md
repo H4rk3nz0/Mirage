@@ -133,19 +133,73 @@ compromise - and exactly what you don't want by accident.
 Invites are point-to-point. **Discovery channels** let a client with no invite find bridges
 by looking in a rendezvous location that rotates every epoch.
 
+**An announcement expires every epoch (1 hour).** Publishing once by hand gives you a
+deployment that stops being discoverable within the hour, which is the easiest way to get
+this wrong. So publishing has to repeat, and `mirage-setup` writes you a systemd timer that
+does it:
+
 ```sh
-mirage-publish --daemon --from keygen.json --dht \
-  --relay wss://relay.damus.io
+sudo install -Dm600 keygen.json /etc/mirage/keygen.json
+sudo install -Dm644 mirage-publish.service mirage-publish.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now mirage-publish.timer
+systemctl list-timers mirage-publish.timer      # confirm the next fire time
 ```
+
+The timer fires one minute past every hour **in UTC**, because an epoch is
+`unix_secs / 3600` and boundaries therefore land on the UTC hour. That suffix is not
+decoration: on a host at +05:30 an unqualified `*:01:00` fires at 11:31 UTC - 31 minutes
+into the epoch instead of 1 - and a DST host drifts by an hour twice a year. Each run
+publishes `--epochs 0,1` (current + next), so a late or missed run still leaves a valid
+announcement covering the following hour.
+
+A one-shot on a timer rather than `mirage-publish --daemon`: the operator secret is then
+resident for the seconds a publish takes instead of for the life of a process. The daemon
+mode still exists if you prefer one long-running process.
 
 | Channel | Trade-off |
 |---|---|
 | **DHT** (BEP-44) | No relay list to block; slower, and the DHT is public. |
 | **Nostr** | Fast and reliable; relays can be blocked or can log. |
-| **DNS TXT** | Works wherever DNS works; needs a domain you control. |
+| **DNS TXT** | Works wherever DNS works; needs a domain you control **and** a server that accepts RFC 2136 dynamic updates (BIND, Knot, PowerDNS, deSEC). Rotates like the others once configured. |
 
-Run `mirage-publish` **on your workstation, not the bridge** - the operator signing key
-should never sit on an internet-facing box.
+### Rotating DNS TXT
+
+Give `mirage-publish` a zone and a TSIG key and it writes the epoch's record itself:
+
+```sh
+mirage-publish --from keygen.json \
+  --dns-server ns1.example.org:53 --dns-zone example.org \
+  --tsig-name mirage-key. --tsig-secret-file /etc/mirage/tsig.key
+```
+
+`mirage-setup` asks for these and bakes them into the timer. One protocol rather than a
+per-provider HTTP client: provider APIs change auth and record semantics on their own
+schedule, and each one is a dependency that fails silently at 3am.
+
+Each publish REPLACES the record set at the name rather than appending - without that, a
+republish every hour would pile up stale announcements until the answer no longer fit.
+
+Two things worth knowing:
+
+- **Keep the secret in a file, never on the command line.** `--tsig-secret` exists but warns:
+  `/proc/<pid>/cmdline` is world-readable (mode 444), so any local user can read the key while
+  the process runs - hourly, under the timer. A systemd unit under `/etc/systemd/system` is
+  world-readable too, which is why `mirage-setup` writes `tsig.key` at `0600` and points the
+  unit at it with `--tsig-secret-file`. This is the same reason the operator key has always
+  come from `--from <file>` rather than a flag.
+- The TSIG key is less dangerous than the operator key - announcements stay operator-signed,
+  so a stolen TSIG key cannot forge one that verifies - but it can delete your records and
+  take the channel offline.
+- `--dns-apex` exists for delegating discovery to a subdomain: update zone `example.org` but
+  hang the records off `d.example.org`.
+
+**Where you install the timer is a security decision.** It reads the operator Ed25519
+secret, and whoever holds that key can forge future announcements - redirecting every client
+that discovers this bridge. The bridge daemon deliberately does not hold it, which is why
+this is a separate unit. Installing it on the bridge host is supported and is what a
+single-host deployment will do; it collapses that separation, so a bridge compromise then
+yields the signing key too. A separate operator host with outbound access to the relays and
+no inbound exposure is stronger.
 
 > Discovery is inherently a trade-off: anything that lets users find you also lets a censor
 > enumerate you. Mirage rotates rendezvous locations per epoch to raise that cost, but it

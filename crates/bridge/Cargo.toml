@@ -46,6 +46,8 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 mirage-discovery = { workspace = true }
 mirage-discovery-nostr = { workspace = true }
 mirage-discovery-dht = { workspace = true }
+# RFC 2136 dynamic update, so `mirage-publish` can rotate DNS TXT records too.
+mirage-discovery-dns-txt = { workspace = true }
 mirage-mux = { workspace = true }
 mirage-runtime = { workspace = true }
 mirage-spec = { workspace = true }

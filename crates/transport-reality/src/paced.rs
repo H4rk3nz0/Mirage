@@ -1140,21 +1140,12 @@ fn seeded_order(n: usize, seed: u64) -> Vec<usize> {
 /// name for the per-site profile library. Strips the port, lowercases, and keeps
 /// only hostname characters, so it can never contain a path separator; `.`/`..`
 /// are rejected (no alphanumeric) so it can never traverse out of the library.
+/// The READER half of target-conditioned replay. Delegates to the shared
+/// implementation so it cannot drift from the writer in `mirage-cover`: a
+/// mismatch between the two would produce a library whose per-host traces are
+/// never found, and that failure looks exactly like having none.
 fn sanitize_host(host: &str) -> String {
-    let s: String = host
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
-        .collect();
-    if s.chars().any(|c| c.is_ascii_alphanumeric()) {
-        s
-    } else {
-        String::new()
-    }
+    mirage_common::proteus_switch::sanitize_cover_host(host)
 }
 
 /// Resolve the replay profile path. A plain file is read directly. A DIRECTORY is a
@@ -1224,7 +1215,26 @@ const CHAIN_GAP: f64 = 0.02;
 fn parse_rows(csv: &str) -> Vec<(u32, f64, i64, i32)> {
     let mut out = Vec::new();
     for line in csv.lines() {
-        let f: Vec<&str> = line.trim().split(',').collect();
+        // A data row must LOOK like one, rather than merely failing to look like
+        // a comment. Trace bytes arrive over the network - a client syncs its
+        // library from the bridge - so this parser reads remotely supplied input.
+        //
+        // Relying on "a comment's fields will not parse as numbers" is not enough:
+        // `# source_url=https://x/?a=b,0.5,100,1` splits into four fields whose
+        // last three parse cleanly, injecting a fabricated record into the
+        // replayed envelope, in a file that still looks valid. Skipping `#` lines
+        // is not enough either: U+FEFF is not whitespace, so `trim` leaves a
+        // byte-order mark in place and a BOM-prefixed comment sails past a
+        // `starts_with('#')` check into exactly the same injection.
+        //
+        // So the rule is positive. Strip the BOM, then require the first
+        // character to be one a number can start with. Every real row begins with
+        // a flow id or a timestamp; nothing else is data, whatever it contains.
+        let line = line.trim_start_matches('\u{FEFF}').trim();
+        if !line.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '+' || c == '.') {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
         if f.len() < 3 {
             continue;
         }
@@ -1490,19 +1500,91 @@ fn csv_traces_in(dir: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
         .collect()
 }
 
-fn read_profile(path: &str, seed: u64, cover_host: Option<&str>) -> Option<String> {
-    // Target-conditioned selection: when `path` is a library ROOT that contains a
-    // subdir named after the cover host, wear THAT site's recorded shape so the
-    // flow matches its claimed destination. Measured to reach the size-AUC floor
-    // vs the real site, where a generic class stays separable. Both endpoints
-    // derive the same host from their matching cover config, so up/down stays
-    // coherent; a missing subdir falls back to `path` unchanged (backwards
-    // compatible with a profile that points straight at a class dir).
+/// Which trace set a replay profile resolves to for a given cover host.
+///
+/// Exists so the runtime selection and the startup check share ONE
+/// implementation. When they were separate, the fallback branch was reachable
+/// with nothing reporting it: every measurement taken against this code ran on
+/// [`Generic`](ProfileMatch::Generic) - the mode this file's own comment
+/// describes as "stays separable" - and neither the config, the diagnostics, nor
+/// the logs said so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileMatch {
+    /// The profile names a single trace FILE, not a library. Host-matching does
+    /// not apply and there is nothing to choose.
+    PinnedFile,
+    /// No cover host is configured, so there is nothing to match against.
+    NoCoverHost,
+    /// A subdirectory named for the cover host exists; that site's own recorded
+    /// shape is worn.
+    HostMatched(std::path::PathBuf),
+    /// No subdirectory for the cover host. The generic class is worn instead -
+    /// the flow does not match its claimed destination.
+    Generic {
+        /// The library root actually read.
+        root: std::path::PathBuf,
+        /// The subdirectory that would have been used had it existed.
+        wanted: std::path::PathBuf,
+    },
+}
+
+impl ProfileMatch {
+    /// True when the shaped envelope does not correspond to the cover host the
+    /// carrier claims. A prober sees the real site; a passive observer sees a
+    /// flow shaped like something else, and no single-layer check finds the
+    /// disagreement.
+    #[must_use]
+    pub fn is_generic(&self) -> bool {
+        matches!(self, Self::Generic { .. })
+    }
+
+    /// The directory or file the pacer will actually read.
+    #[must_use]
+    pub fn effective_path(&self, configured: &str) -> std::path::PathBuf {
+        match self {
+            Self::HostMatched(p) => p.clone(),
+            Self::Generic { root, .. } => root.clone(),
+            Self::PinnedFile | Self::NoCoverHost => std::path::PathBuf::from(configured),
+        }
+    }
+}
+
+/// Resolve a replay profile against a cover host WITHOUT reading any traces.
+///
+/// Target-conditioned selection: when `path` is a library ROOT that contains a
+/// subdir named after the cover host, wear THAT site's recorded shape so the
+/// flow matches its claimed destination. Measured to reach the size-AUC floor
+/// vs the real site, where a generic class stays separable. Both endpoints
+/// derive the same host from their matching cover config, so up/down stays
+/// coherent.
+#[must_use]
+pub fn resolve_profile_match(path: &str, cover_host: Option<&str>) -> ProfileMatch {
     let base = std::path::Path::new(path);
-    let effective = match cover_host.map(sanitize_host).filter(|h| !h.is_empty()) {
-        Some(host) if base.join(&host).is_dir() => base.join(host),
-        _ => base.to_path_buf(),
-    };
+    if base.is_file() {
+        return ProfileMatch::PinnedFile;
+    }
+    match cover_host.map(sanitize_host).filter(|h| !h.is_empty()) {
+        Some(host) => {
+            let sub = base.join(&host);
+            if sub.is_dir() {
+                ProfileMatch::HostMatched(sub)
+            } else {
+                ProfileMatch::Generic {
+                    root: base.to_path_buf(),
+                    wanted: sub,
+                }
+            }
+        }
+        None => ProfileMatch::NoCoverHost,
+    }
+}
+
+fn read_profile(path: &str, seed: u64, cover_host: Option<&str>) -> Option<String> {
+    // Falls back to `path` unchanged when no per-host subdir exists (backwards
+    // compatible with a profile that points straight at a class dir). That
+    // fallback is silent HERE by design - it is reported once at startup by
+    // `resolve_profile_match`, not per-session on a hot path.
+    let effective = resolve_profile_match(path, cover_host).effective_path(path);
     let path = &effective;
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_dir() {
@@ -2407,6 +2489,162 @@ mod tests {
             "an upstream-only library must still yield a schedule rather than none"
         );
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Nothing that is not a data row may become one.
+    ///
+    /// A client SYNCS ITS TRACE LIBRARY FROM THE BRIDGE, so these bytes come off
+    /// the network and this parser is remotely reachable. Two boundary cases,
+    /// each one notch past where the previous fix stopped:
+    ///
+    /// - three commas in a comment splits into 3 fields whose first is
+    ///   `# source_url=...` and fails to parse, so the line is skipped BY LUCK;
+    ///   four commas splits into 4, the last three parse, and a record is
+    ///   injected.
+    /// - a `#` check catches both of those and still misses a BOM-prefixed
+    ///   comment, because U+FEFF is not whitespace and survives `trim`.
+    ///
+    /// Hence the positive rule: a row must START like a number. This test pins
+    /// the boundary and one past it in both directions.
+    #[test]
+    fn only_things_that_look_like_records_are_parsed_as_records() {
+        // Real rows, both the bare and the flow-tagged shape.
+        assert_eq!(parse_rows("0.019482,243,-1").len(), 1, "bare row");
+        assert_eq!(parse_rows("3,0.019482,243,-1").len(), 1, "flow-tagged row");
+
+        // Everything a trace file legitimately contains around them.
+        for benign in [
+            "t,size,dir",
+            "flow,t,size,dir",
+            "",
+            "   ",
+            "\t",
+            "# mirage-cover-trace v1",
+            "# recorded_at=2025-08-07T00:00:00Z",
+        ] {
+            assert!(
+                parse_rows(benign).is_empty(),
+                "non-record line must not parse: {benign:?}"
+            );
+        }
+
+        // The injection boundary: 3 commas (skipped by luck) and 4 (the defect).
+        for hostile in [
+            "# source_url=https://x/?a=1,2,3",
+            "# source_url=https://x/?a=b,0.5,100,1",
+            "# source_url=https://x/?a=b,c,0.5,100,1",
+            // ...and the same one past a `#`-only check.
+            "\u{FEFF}# source_url=https://x/?a=b,0.5,100,1",
+            "  \u{FEFF}# source_url=https://x/?a=b,0.5,100,1",
+            "\u{00A0}# source_url=https://x/?a=b,0.5,100,1",
+        ] {
+            assert!(
+                parse_rows(hostile).is_empty(),
+                "must not inject a record from: {hostile:?}"
+            );
+        }
+
+        // And a whole file still parses to exactly its data rows.
+        let file = "\u{FEFF}# mirage-cover-trace v1\n\
+                    # source_url=https://x/?a=b,0.5,100,1\n\
+                    t,size,dir\n\
+                    0.0,517,1\n\
+                    0.25,1200,-1\n";
+        let rows = parse_rows(file);
+        assert_eq!(rows.len(), 2, "exactly the two real rows, got {rows:?}");
+        assert_eq!(rows[0], (0, 0.0, 517, 1));
+        assert_eq!(rows[1], (0, 0.25, 1200, -1));
+    }
+
+    /// The fallback to generic cover must be REPORTABLE, not merely correct.
+    ///
+    /// `read_profile` returned a schedule either way, so a missing per-host
+    /// directory was indistinguishable from a present one at every layer above
+    /// it. Every measurement taken against this code ran on the generic branch -
+    /// the one the selection comment calls separable - and no config, log or
+    /// diagnostic said which branch was live. Resolving the branch as a VALUE is
+    /// what makes the startup warning and the pinned-library refusal possible.
+    #[test]
+    fn profile_match_distinguishes_generic_from_host_matched() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CTR: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "proteus_match_{}_{}",
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("gen.csv"), "t,size,dir\n0.0,1,1\n").expect("write");
+        let root_s = root.to_str().expect("utf8");
+
+        // No per-host subdir: generic, and it names the directory that is missing
+        // so an operator can act on it.
+        let m = resolve_profile_match(root_s, Some("www.example.org:443"));
+        assert!(m.is_generic(), "no per-host dir must resolve as generic");
+        match &m {
+            ProfileMatch::Generic { wanted, .. } => {
+                assert!(wanted.ends_with("www.example.org"), "names what is missing");
+            }
+            other => panic!("expected Generic, got {other:?}"),
+        }
+        // And it still reads the generic traces - reporting the branch must not
+        // change which bytes get worn.
+        assert_eq!(m.effective_path(root_s), root);
+
+        // Per-host subdir present: host-matched.
+        std::fs::create_dir_all(root.join("www.example.org")).expect("mkdir host");
+        let m = resolve_profile_match(root_s, Some("www.example.org:443"));
+        assert!(!m.is_generic());
+        assert_eq!(m, ProfileMatch::HostMatched(root.join("www.example.org")));
+
+        // A pinned FILE has no host to match against, and must not be reported as
+        // a degraded library.
+        assert!(!resolve_profile_match(
+            root.join("gen.csv").to_str().expect("utf8"),
+            Some("www.example.org")
+        )
+        .is_generic());
+        // Neither must a config with no cover host at all.
+        assert!(!resolve_profile_match(root_s, None).is_generic());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The WRITER (`mirage-cover`) and the READER (here) must derive the same
+    /// directory name from the same cover host.
+    ///
+    /// They live in crates that do not depend on each other and the lookup fails
+    /// open, so a divergence would produce a library whose per-host traces are
+    /// never found - identical, from outside, to having recorded none. This
+    /// asserts agreement through the shared implementation on inputs that differ
+    /// in case and port, which is exactly how the two ends receive them: a client
+    /// holds `reality_sni` ("www.example.org") and a bridge holds
+    /// `reality_cover_addr` ("www.example.org:443").
+    #[test]
+    fn writer_and_reader_agree_on_the_per_host_directory_name() {
+        use mirage_common::proteus_switch::sanitize_cover_host;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CTR: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "proteus_agree_{}_{}",
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Record as the bridge would, from `host:port`.
+        let written = root.join(sanitize_cover_host("WWW.Example.ORG:443"));
+        std::fs::create_dir_all(&written).expect("mkdir");
+        std::fs::write(written.join("0.csv"), "t,size,dir\n0.0,555,1\n").expect("write");
+        let root_s = root.to_str().expect("utf8");
+
+        // Look up as the client would, from a bare SNI in different case.
+        for host in ["www.example.org", "WWW.Example.ORG", "www.example.org:443"] {
+            assert_eq!(
+                resolve_profile_match(root_s, Some(host)),
+                ProfileMatch::HostMatched(written.clone()),
+                "reader must find the directory the writer created, given {host:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

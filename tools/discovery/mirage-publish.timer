@@ -1,0 +1,28 @@
+# Fires mirage-publish once per discovery epoch.
+#
+# An epoch is DISCOVERY_EPOCH_SECONDS = 3600 s, and epoch number is
+# `unix_secs / 3600` - so boundaries land exactly on the hour in **UTC**, not in
+# local time. The `UTC` suffix is load-bearing: on a host at +05:30 an unqualified
+# `*:01:00` would fire 31 minutes into each epoch instead of 1, and on a host with
+# DST it would drift by an hour twice a year.
+#
+# One minute past the boundary, matching what `mirage-publish --daemon` does: it
+# publishes a fresh announcement for the new epoch shortly after it opens, before
+# a client's poll is likely to fire.
+#
+# Persistent=true catches up after downtime - a bridge that was off over a
+# boundary publishes as soon as it is back rather than waiting for the next hour.
+[Unit]
+Description=Publish Mirage bridge announcement every discovery epoch (hourly)
+Documentation=https://github.com/H4rk3nz0/Mirage/blob/main/docs/operators.md
+
+[Timer]
+OnCalendar=*-*-* *:01:00 UTC
+Persistent=true
+# Spread load across a fleet so a relay does not see every bridge in a cohort
+# publish in the same second - which is itself a correlatable pattern.
+RandomizedDelaySec=90
+Unit=mirage-publish.service
+
+[Install]
+WantedBy=timers.target

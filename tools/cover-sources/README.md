@@ -117,8 +117,33 @@ with a long dwelled one.
 If the library root contains a subdir named after the Reality cover host (e.g.
 `<lib>/www.wikipedia.org/`), a session whose cover SNI is that host wears THAT site's
 recorded shape instead of a generic class - so the flow matches its claimed destination.
-Record per-site with `--url https://<host>/... --name <host>` and point the profile at
-the root. A host with no subdir falls back to the root, so mixing is safe.
+
+**Auto-sourcing does this for you.** A client with `reality_sni` set, or a bridge with
+`reality_cover_addr`, records that host into `<lib>/<host>/` alongside the class
+directories. You do not have to build the layout by hand.
+
+You still do for a **pinned** library (`proteus_profile` turns auto-sourcing off):
+
+```sh
+mirage-cover-record <lib> --url https://<host>/ --name <host>
+```
+
+A pinned library with no subdir for its cover host is **refused at startup**, because
+that mismatch is permanent and used to be invisible: the carrier announces one site in
+its SNI while wearing an envelope recorded against another, and neither an active prober
+(which sees the real host) nor a passive observer (which sees the wrong shape) can detect
+the disagreement alone. Set `"proteus_generic_cover_ok": true` to accept generic cover
+deliberately.
+
+`mirage-client <config> --check-config` reports which of the two is live:
+
+```
+  cover:       12 traces in /var/lib/mirage/cover (self-sourced)
+  shaping:     TARGET-CONDITIONED - wears /var/lib/mirage/cover/www.wikipedia.org (9 traces)
+```
+
+A bridge with several cover hosts records only the **first**; sessions using the others
+fall back to generic and say so in the log.
 
 ### Self-driving, out of process
 

@@ -1181,13 +1181,45 @@ async fn handle_http_reject(
         }
         // No shadow configured: genuine drop-only mode - probe-score so
         // scanning IPs accumulate toward the soft-block threshold.
-        (_, None) => {
+        //
+        // DRAIN BEFORE DROPPING. Closing a socket that still has unread bytes in
+        // its receive queue makes Linux emit RST instead of FIN, and that is a
+        // single-packet confirmation oracle: measured against www.wikipedia.org,
+        // the real host answers 64 random bytes with a graceful close while an
+        // undrained bridge answered RST, 15 times out of 15. A censor scans a
+        // range, sends garbage, and keeps whatever RSTs.
+        //
+        // Bounded: a prober that keeps sending gets one short read window, not a
+        // free slowloris slot.
+        (ctx, None) => {
+            if let Some((mut stream, _)) = ctx {
+                let mut sink = [0u8; 4096];
+                // Drain only what has ALREADY ARRIVED. Waiting for more turns the
+                // drain itself into a signature: a fixed 500 ms budget made an
+                // HTTP probe take 0.50 s against the real host's 0.03 s - 16x,
+                // constant, and trivially measurable. Each read gets a short
+                // window and the first one that does not deliver ends it, so a
+                // prober that has finished talking is closed on immediately.
+                loop {
+                    match tokio::time::timeout(PROBE_DRAIN_POLL, stream.read(&mut sink)).await {
+                        Ok(Ok(n)) if n > 0 => continue,
+                        _ => break,
+                    }
+                }
+                let _ = stream.shutdown().await;
+            }
             if let Some(gk) = gatekeeper {
                 gk.observe_auth_failure(peer_ip).await;
             }
         }
     }
 }
+/// Per-read window while draining a rejected probe, so the close is a FIN rather
+/// than an RST. Deliberately tiny: the point is to empty a receive queue that is
+/// already full, not to wait for a prober to say more. Anything long enough to
+/// wait on becomes a timing signature of its own.
+const PROBE_DRAIN_POLL: Duration = Duration::from_millis(20);
+
 fn default_pad_cbr_interval_ms() -> u64 {
     10
 }
@@ -1460,10 +1492,31 @@ fn apply_paranoid_bridge(config: &mut BridgeConfig, start_sourcing: bool) {
                 // Pass the RESOLVED ceiling, not the tier's. Computing it for
                 // the log and then handing the recorder the tier default made
                 // "unlimited" a no-op that reported itself as applied.
+                // Record the cover host itself, so `<lib>/<host>/` exists and a
+                // session wears the shape of the site its SNI claims. Without it
+                // the automatic path only ever writes class-keyed dirs and every
+                // session falls back to generic cover.
+                //
+                // ONE host, the primary. A bridge with several cover hosts would
+                // need a per-host library each, at the full recording cost per
+                // host; sessions to the others still fall back to generic, which
+                // is said out loud rather than left to be discovered.
+                let mut cover_hosts: Vec<String> = config.reality_cover_addrs.clone();
+                cover_hosts.extend(config.reality_cover_addr.clone());
+                if cover_hosts.len() > 1 {
+                    tracing::info!(
+                        recording = %cover_hosts[0],
+                        others = cover_hosts.len() - 1,
+                        "proteus: target-conditioned cover is recorded for the FIRST cover host \
+                         only; sessions using the others wear generic cover, whose shape does \
+                         not match the host they claim. Pin a per-host library if that matters."
+                    );
+                }
                 tokio::spawn(mirage_cover::keep_fresh_sourcing(
                     dir.clone(),
                     pack,
                     ceiling,
+                    cover_hosts.first().cloned(),
                 ));
             }
             (
@@ -1613,6 +1666,57 @@ async fn main() {
     // it on a failed HTTP probe - whereas `shadow_target` raw-splices and may be
     // a TLS endpoint. A misconfig silently degrades unobservability rather than
     // breaking function, so surface it loudly at startup.
+    // TRUE MIMICRY BY DEFAULT.
+    //
+    // `shadow_target` and `reality_cover_addr` were separate knobs, and only the
+    // second is one an operator naturally sets - so a Reality bridge configured
+    // the obvious way had NO probe-mimicry target and dropped unknown probes.
+    // Measured, that drop was observably different from the host the bridge
+    // claims to be: www.wikipedia.org answers 64 random bytes with a graceful
+    // close, the bridge answered RST.
+    //
+    // The cover host is exactly the right default: the bridge already announces
+    // itself as that host in the TLS SNI, so sending an unauthenticated prober
+    // to the real thing is the most faithful answer available - the prober's
+    // session IS with the host it asked for.
+    if config.shadow_target.is_none() {
+        if let Some(cover) = config.reality_cover_addr.clone() {
+            info!(
+                cover = %cover,
+                "shadow_target unset; defaulting it to reality_cover_addr so unauthenticated \
+                 probes reach the host this bridge claims to be"
+            );
+            config.shadow_target = Some(cover);
+        }
+    }
+    if config.shadow_target.is_none() && config.http_shadow_target.is_none() {
+        warn!(
+            "no shadow_target and no reality_cover_addr: unauthenticated probes are dropped \
+             rather than mimicked. The close is graceful, but a bridge that answers nothing \
+             still differs from a real web host that answers something. Set reality_cover_addr \
+             (or shadow_target) for active-probe resistance."
+        );
+    }
+    // A fronting transport with nowhere to send failed HTTP probes.
+    //
+    // `ws_enabled` routes HTTP-upgrade connections to the WS/meek handler, and a
+    // failed probe there is DROPPED - measured, a plain `GET / HTTP/1.1` to such
+    // a bridge returns zero bytes and closes. That is correct behaviour for a
+    // TLS port (a real one cannot parse plaintext HTTP either) but wrong for
+    // something claiming to be a web endpoint: a scanner expects a status line.
+    //
+    // The documented deployment fronts this behind nginx or a CDN, where the
+    // scanner meets the front and never reaches Mirage. Nothing enforces that,
+    // so say it out loud rather than let a bare deployment look like a port that
+    // accepts connections and answers nothing.
+    if config.ws_enabled && config.http_shadow_target.is_none() {
+        warn!(
+            "ws_enabled without http_shadow_target: a failed HTTP/WebSocket probe is dropped \
+             with no response, which does not look like the web endpoint this transport \
+             fronts as. Put it behind nginx/a CDN (the documented deployment), or set \
+             http_shadow_target to a plaintext-HTTP decoy so probes get a real answer."
+        );
+    }
     match (&config.http_shadow_target, &config.shadow_target) {
         (Some(http_sh), _) if http_sh.ends_with(":443") || http_sh.ends_with(":8443") => {
             warn!(

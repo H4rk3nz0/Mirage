@@ -70,10 +70,10 @@ pub use error::RealityError;
 pub use paced::{
     fragment_to_mtu, maybe_pace, maybe_pace_stream, min_positive_gap, pace_profile,
     pace_profile_up, pace_schedule, pace_wire_sizes, paced_handshake_budget, pacing_active,
-    set_pace_override, Carrier, MaybePaced, PacedChannel, PACE_ENV, PACE_PROFILE_ENV,
-    PACE_PROFILE_UP_ENV,
+    resolve_profile_match, set_pace_override, Carrier, MaybePaced, PacedChannel, ProfileMatch,
+    PACE_ENV, PACE_PROFILE_ENV, PACE_PROFILE_UP_ENV,
 };
-pub use pacer::{MeasuredProfile, ScheduleStream};
+pub use pacer::{MeasuredProfile, ReplayPosition, ScheduleStream};
 pub use probe::{
     build_probe, derive_probe_root, probe_epoch, verify_probe, BridgeProbeInputs,
     ClientProbeInputs, Probe, NONCE_LEN, PROBE_EPOCH_SECONDS, PROBE_ROOT_DISABLED, SESSION_ID_LEN,

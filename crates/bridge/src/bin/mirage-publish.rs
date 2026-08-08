@@ -54,6 +54,7 @@ use mirage_discovery::pipeline::OperatorPublisher;
 use mirage_discovery::router::{DiscoveryRouter, RouterConfig};
 use mirage_discovery::wire::{transport_caps, Announcement, Endpoint, SIG_LEN};
 use mirage_discovery_dht::{DhtChannel, MainlineDhtClient};
+use mirage_discovery_dns_txt::rfc2136::{Rfc2136Publisher, TsigAlgorithm};
 use mirage_discovery_nostr::relay::{NostrRelayChannel, NostrRelayConfig};
 use mirage_discovery_nostr::signing::NostrSigningKey;
 use mirage_spec::DISCOVERY_EPOCH_SECONDS;
@@ -85,6 +86,29 @@ struct Args {
     /// Override the daemon re-publish interval (seconds).
     /// Default: sleep until 60 s after the next epoch boundary.
     daemon_interval_secs: Option<u64>,
+    /// RFC 2136 dynamic-update target: `host:port` of the AUTHORITATIVE server
+    /// for the zone. Empty disables the DNS channel.
+    dns_server: Option<String>,
+    /// Zone to update, e.g. `example.org`.
+    dns_zone: Option<String>,
+    /// Apex the records hang from. Defaults to the zone; differs when an
+    /// operator delegates a subdomain for discovery.
+    dns_apex: Option<String>,
+    /// TSIG key name, matching the `key "..."` stanza on the server.
+    tsig_name: Option<String>,
+    /// TSIG secret, base64 - the same string as the server's `secret`.
+    ///
+    /// DISCOURAGED. `/proc/<pid>/cmdline` is world-readable (mode 444), so a
+    /// secret in argv is readable by every local user for as long as the process
+    /// runs - hourly, under the timer. `--tsig-secret-file` exists for this
+    /// reason, and is why the OPERATOR key has always come from `--from <file>`
+    /// rather than a flag.
+    tsig_secret: Option<String>,
+    /// Path to a file whose contents are the base64 TSIG secret. Preferred.
+    tsig_secret_file: Option<String>,
+    /// TSIG algorithm. Only hmac-sha256 is offered: it is the modern default
+    /// and every server that speaks RFC 2136 supports it.
+    dns_ttl: u32,
 }
 
 fn parse_args() -> Args {
@@ -94,6 +118,13 @@ fn parse_args() -> Args {
         dht: false,
         dht_bootstrap: Vec::new(),
         epochs: vec![0, 1],
+        dns_server: None,
+        dns_zone: None,
+        dns_apex: None,
+        tsig_name: None,
+        tsig_secret: None,
+        tsig_secret_file: None,
+        dns_ttl: 60,
         bridge_endpoint: None,
         extra_endpoints: Vec::new(),
         ann_ttl_seconds: 7200, // 2h: covers ~ 2 epochs at the
@@ -120,6 +151,61 @@ fn parse_args() -> Args {
                         .cloned()
                         .unwrap_or_else(|| fatal("--relay needs a URL")),
                 );
+            }
+            "--dns-server" => {
+                i += 1;
+                args.dns_server = Some(
+                    argv.get(i)
+                        .cloned()
+                        .unwrap_or_else(|| fatal("--dns-server needs host:port")),
+                );
+            }
+            "--dns-zone" => {
+                i += 1;
+                args.dns_zone = Some(
+                    argv.get(i)
+                        .cloned()
+                        .unwrap_or_else(|| fatal("--dns-zone needs a zone")),
+                );
+            }
+            "--dns-apex" => {
+                i += 1;
+                args.dns_apex = Some(
+                    argv.get(i)
+                        .cloned()
+                        .unwrap_or_else(|| fatal("--dns-apex needs a name")),
+                );
+            }
+            "--tsig-name" => {
+                i += 1;
+                args.tsig_name = Some(
+                    argv.get(i)
+                        .cloned()
+                        .unwrap_or_else(|| fatal("--tsig-name needs a key name")),
+                );
+            }
+            "--tsig-secret-file" => {
+                i += 1;
+                args.tsig_secret_file = Some(
+                    argv.get(i)
+                        .cloned()
+                        .unwrap_or_else(|| fatal("--tsig-secret-file needs a path")),
+                );
+            }
+            "--tsig-secret" => {
+                i += 1;
+                args.tsig_secret = Some(
+                    argv.get(i)
+                        .cloned()
+                        .unwrap_or_else(|| fatal("--tsig-secret needs base64")),
+                );
+            }
+            "--dns-ttl" => {
+                i += 1;
+                args.dns_ttl = argv
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| fatal("--dns-ttl needs an integer"));
             }
             "--dht" => {
                 args.dht = true;
@@ -194,6 +280,9 @@ fn parse_args() -> Args {
                      [--extra-endpoint host:port] [--extra-endpoint ...] \
                      [--ann-ttl-seconds N] \
                      [--daemon [--daemon-interval-secs N]]\n\
+                     [--dns-server <host:port> --dns-zone <zone> \\\n\
+                      --tsig-name <key> --tsig-secret <base64> \\\n\
+                      [--dns-apex <name>] [--dns-ttl N]]\n\
                      \n\
                      At least one channel is required: --relay (Nostr) and/or\n\
                      --dht (BitTorrent mainline DHT, BEP-44 - no relay list to\n\
@@ -226,8 +315,11 @@ fn parse_args() -> Args {
     if args.from_path.is_empty() {
         fatal("--from <keygen.json> is required");
     }
-    if args.relays.is_empty() && !args.dht {
-        fatal("at least one announcement channel is required: --relay <wss://...> and/or --dht");
+    if args.relays.is_empty() && !args.dht && args.dns_server.is_none() {
+        fatal(
+            "at least one announcement channel is required: --relay <wss://...>, --dht, \
+             and/or --dns-server <host:port>",
+        );
     }
     args
 }
@@ -477,6 +569,62 @@ async fn main() {
             "note: publishing to the mainline DHT ({} custom bootstrap node(s))",
             args.dht_bootstrap.len()
         );
+    }
+
+    // DNS TXT via RFC 2136 dynamic update. Until this existed the DNS channel
+    // could only be READ - `DnsTxtChannel::publish` refuses, because pushing a
+    // record needs authority over the zone - so an operator had to hand-edit
+    // records every epoch, which nobody does. The channel was in practice a
+    // static anchor while the others rotated.
+    //
+    // The TSIG key here is strictly less dangerous than the operator Ed25519
+    // key: announcements stay operator-signed, so a stolen TSIG key cannot forge
+    // one that verifies. It can delete records and take the channel offline.
+    if let Some(server) = args.dns_server.as_deref() {
+        let zone = args
+            .dns_zone
+            .as_deref()
+            .unwrap_or_else(|| fatal("--dns-server needs --dns-zone"));
+        let apex = args.dns_apex.as_deref().unwrap_or(zone);
+        let key_name = args
+            .tsig_name
+            .as_deref()
+            .unwrap_or_else(|| fatal("--dns-server needs --tsig-name"));
+        let secret_b64: String = match (&args.tsig_secret_file, &args.tsig_secret) {
+            (Some(path), _) => std::fs::read_to_string(path)
+                .unwrap_or_else(|e| fatal(&format!("--tsig-secret-file {path}: {e}")))
+                .trim()
+                .to_string(),
+            (None, Some(v)) => {
+                eprintln!(
+                    "warning: --tsig-secret puts the key in argv, and /proc/<pid>/cmdline \
+                     is world-readable - any local user can read it while this runs. \
+                     Use --tsig-secret-file instead."
+                );
+                v.clone()
+            }
+            (None, None) => fatal("--dns-server needs --tsig-secret-file (or --tsig-secret)"),
+        };
+        let secret_b64 = secret_b64.as_str();
+        use base64::Engine as _;
+        let secret = base64::engine::general_purpose::STANDARD
+            .decode(secret_b64)
+            .unwrap_or_else(|e| fatal(&format!("--tsig-secret is not valid base64: {e}")));
+        let addr: std::net::SocketAddr = server
+            .parse()
+            .unwrap_or_else(|e| fatal(&format!("--dns-server must be host:port: {e}")));
+        let ch = Rfc2136Publisher::new(
+            addr,
+            zone,
+            apex,
+            key_name,
+            secret,
+            TsigAlgorithm::HmacSha256,
+            args.dns_ttl,
+        )
+        .unwrap_or_else(|e| fatal(&format!("dns: {e}")));
+        channels.push(Arc::new(ch));
+        eprintln!("note: publishing TXT records into {zone} via {server} (RFC 2136)");
     }
 
     let router = DiscoveryRouter::new(channels, RouterConfig::default());

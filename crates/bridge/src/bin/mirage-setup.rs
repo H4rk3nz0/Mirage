@@ -1257,12 +1257,14 @@ fn print_summary(
             .map(|u| format!(" \\\n      --relay {u}"))
             .collect();
         let dht_flag = if dht_enabled { " \\\n      --dht" } else { "" };
-        println!("    mirage-publish --daemon --from keygen.json{relay_flags}{dht_flag}");
+        println!("    mirage-publish --from keygen.json{relay_flags}{dht_flag}");
         if dht_enabled && publish_relay_urls.is_empty() {
             println!(
                 "    (--dht announces on the mainline DHT; add --relay wss://<url> for Nostr too.)"
             );
         }
+        println!("    Announcements expire every epoch (1 h) - install the timer written");
+        println!("    above so this repeats, or a one-off publish goes stale within the hour.");
     } else {
         println!();
         println!("  Announcement publishing (pick at least one channel):");
@@ -1272,7 +1274,9 @@ fn print_summary(
         println!(
             "    mirage-publish --from keygen.json --relay wss://<relay> [--relay ...]  # Nostr"
         );
-        println!("    Add --daemon to keep republishing on every epoch boundary (~1 h).");
+        println!("    Announcements expire every epoch (1 h), so publishing must repeat:");
+        println!("    re-run setup with a channel enabled to get a systemd timer, or add");
+        println!("    --daemon to keep one process republishing on every boundary.");
     }
 
     // A crisp, ordered checklist so the operator knows exactly what to do next.
@@ -1289,9 +1293,10 @@ fn print_summary(
     }
     if !publish_relay_urls.is_empty() || dht_enabled {
         println!(
-            "  {step}. Run the {} command above on your workstation to announce the bridge.",
+            "  {step}. Install the {} timer on whichever host holds keygen.json,",
             paint("mirage-publish", C_AZURE)
         );
+        println!("     so announcements keep rotating every epoch.");
     } else {
         println!(
             "  {step}. Publish an announcement ({} above) so clients can find the bridge.",
@@ -1387,6 +1392,135 @@ fn write_systemd_unit(path: &str, bridge_cfg_path: &str, bind: &str) {
     );
     if let Err(e) = std::fs::write(path, unit) {
         warn_line(&format!("could not write {path}: {e}"));
+    }
+}
+
+/// Write a secret with 0600 from the moment it exists.
+///
+/// `fs::write` then `set_permissions` leaves a window where the file is
+/// world-readable at the process umask, which is exactly long enough for a local
+/// attacker watching the directory. `OpenOptions::mode` applies the bits at
+/// create time instead.
+fn write_secret_file(path: &str, contents: &str) {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    match opts.open(path) {
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{contents}") {
+                warn_line(&format!("could not write {path}: {e}"));
+            }
+        }
+        Err(e) => warn_line(&format!("could not create {path}: {e}")),
+    }
+}
+
+/// What `mirage-publish` needs to push TXT records with RFC 2136.
+struct DnsUpdateCfg {
+    server: String,
+    zone: String,
+    key_name: String,
+    secret_b64: String,
+    /// Where the unit will read the secret from at run time.
+    secret_path: String,
+}
+
+/// Emit the epoch-rotated publishing timer, so announcements keep themselves
+/// fresh instead of depending on an operator remembering to re-run a command.
+///
+/// A one-shot plus a timer rather than `mirage-publish --daemon`: the operator
+/// SECRET key is then resident only for the seconds a publish takes, instead of
+/// for the life of a long-running process. Whoever holds that key can forge
+/// future announcements and redirect every client that discovers this bridge,
+/// which is why the bridge daemon does not hold it and why this is a separate
+/// unit an operator can place on a different host.
+fn write_publish_units(
+    service_path: &str,
+    timer_path: &str,
+    keygen_path: &str,
+    relay_urls: &[String],
+    dht_enabled: bool,
+    dns: Option<&DnsUpdateCfg>,
+) {
+    let relay_flags: String = relay_urls.iter().map(|u| format!(" --relay {u}")).collect();
+    let dht_flag = if dht_enabled { " --dht" } else { "" };
+    // The TSIG secret ends up inside the unit file, so the unit is as sensitive
+    // as the key. Less so than keygen.json - a stolen TSIG key cannot forge an
+    // announcement, only delete one - but it still wants 0600.
+    // The secret goes in a 0600 file, NOT in ExecStart. A unit under
+    // /etc/systemd/system is world-readable, and `--tsig-secret` would also put
+    // the key in argv, where /proc/<pid>/cmdline exposes it (mode 444) to every
+    // local user for the life of the process - hourly, under this timer.
+    let dns_flags = dns.map_or_else(String::new, |d| {
+        format!(
+            " --dns-server {} --dns-zone {} --tsig-name {} --tsig-secret-file {}",
+            d.server, d.zone, d.key_name, d.secret_path
+        )
+    });
+    let service = format!(
+        "[Unit]\n\
+         Description=Publish Mirage bridge announcement for the current epoch\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         # --epochs defaults to 0,1 (current + next), so a late or skipped run\n\
+         # still leaves a valid announcement covering the following hour.\n\
+         ExecStart=/usr/local/bin/mirage-publish --from /etc/mirage/{keygen}{dht}{relays}{dns}\n\
+         DynamicUser=yes\n\
+         NoNewPrivileges=yes\n\
+         PrivateTmp=yes\n\
+         PrivateDevices=yes\n\
+         ProtectSystem=strict\n\
+         ProtectHome=yes\n\
+         ProtectKernelTunables=yes\n\
+         ProtectKernelModules=yes\n\
+         ProtectControlGroups=yes\n\
+         RestrictAddressFamilies=AF_INET AF_INET6\n\
+         RestrictNamespaces=yes\n\
+         RestrictSUIDSGID=yes\n\
+         LockPersonality=yes\n\
+         MemoryDenyWriteExecute=yes\n\
+         SystemCallArchitectures=native\n\
+         SystemCallFilter=@system-service\n\
+         CapabilityBoundingSet=\n",
+        keygen = keygen_path,
+        dht = dht_flag,
+        relays = relay_flags,
+        dns = dns_flags,
+    );
+    // An epoch is unix_secs/3600, so boundaries land on the hour in UTC. The
+    // `UTC` suffix is load-bearing: on a host at +05:30 an unqualified *:01:00
+    // would fire 31 minutes into each epoch, and DST would shift it twice a year.
+    // Built line by line rather than as one indented literal: a multi-line
+    // string literal carries its own source indentation into the file, and
+    // systemd treats a leading-whitespace line as a parse error.
+    let timer = concat!(
+        "[Unit]\n",
+        "Description=Publish Mirage bridge announcement every discovery epoch (hourly)\n",
+        "\n",
+        "[Timer]\n",
+        "OnCalendar=*-*-* *:01:00 UTC\n",
+        "Persistent=true\n",
+        "# Spread a fleet out so a relay does not see every bridge in a cohort\n",
+        "# publish in the same second - itself a correlatable pattern.\n",
+        "RandomizedDelaySec=90\n",
+        "Unit=mirage-publish.service\n",
+        "\n",
+        "[Install]\n",
+        "WantedBy=timers.target\n",
+    );
+    if let Err(e) = std::fs::write(service_path, service) {
+        warn_line(&format!("could not write {service_path}: {e}"));
+        return;
+    }
+    if let Err(e) = std::fs::write(timer_path, timer) {
+        warn_line(&format!("could not write {timer_path}: {e}"));
     }
 }
 
@@ -1659,6 +1793,78 @@ fn setup_bridge_and_client(generate_client: bool) {
         note("  sudo systemctl daemon-reload && sudo systemctl enable --now mirage-bridge");
     }
 
+    // The announcement is epoch-rotated: it expires every hour. Publishing it
+    // once by hand is therefore a deployment that stops being discoverable
+    // within the hour, which is the single easiest way to get this wrong. Offer
+    // the timer here, while the operator's channel choices are still in hand.
+    // DNS TXT can now ROTATE rather than being a hand-maintained static anchor,
+    // but only against a server that accepts RFC 2136 updates - which is a
+    // property of the operator's DNS, not something setup can detect.
+    println!();
+    note("DNS TXT discovery can publish itself if your DNS accepts RFC 2136");
+    note("dynamic updates (BIND, Knot, PowerDNS, deSEC). Needs a TSIG key.");
+    let dns_cfg = if prompt_yn("Publish announcements into a DNS zone you control", false) {
+        let server = prompt_str("  Authoritative server (host:port)", "127.0.0.1:53");
+        let zone = prompt_str("  Zone to update", "example.org");
+        let key_name = prompt_str("  TSIG key name", "mirage-key.");
+        let secret_b64 = prompt_str("  TSIG secret (base64, hmac-sha256)", "");
+        if secret_b64.trim().is_empty() {
+            warn_line("no TSIG secret given - skipping DNS publishing");
+            None
+        } else {
+            Some(DnsUpdateCfg {
+                server,
+                zone,
+                key_name,
+                secret_b64,
+                secret_path: "/etc/mirage/tsig.key".to_string(),
+            })
+        }
+    } else {
+        None
+    };
+
+    if !publish_relay_urls.is_empty() || dht_enabled || dns_cfg.is_some() {
+        println!();
+        note("Announcements expire every epoch (1 h). A timer keeps them fresh.");
+        if prompt_yn(
+            "Also write a systemd timer that republishes every epoch",
+            true,
+        ) {
+            let svc_path = prompt_str("  Write publish unit to", "mirage-publish.service");
+            let tmr_path = prompt_str("  Write publish timer to", "mirage-publish.timer");
+            write_publish_units(
+                &svc_path,
+                &tmr_path,
+                "keygen.json",
+                &publish_relay_urls,
+                dht_enabled,
+                dns_cfg.as_ref(),
+            );
+            ok_line(&format!("{svc_path} + {tmr_path} written"));
+            if let Some(d) = dns_cfg.as_ref() {
+                // 0600 before the bytes land, not after: a world-readable window,
+                // however brief, is all a local attacker needs.
+                write_secret_file("tsig.key", &d.secret_b64);
+                note("tsig.key written (0600). The unit reads the secret from this");
+                note("file rather than its command line, because /proc/<pid>/cmdline");
+                note("is world-readable and a unit file is too. Install with:");
+                note("  sudo install -Dm600 tsig.key /etc/mirage/tsig.key");
+            }
+            note("These read the operator SECRET key. Whoever holds it can forge");
+            note("future announcements, so the bridge daemon deliberately does not.");
+            note("Installing on the bridge host is supported but collapses that");
+            note("separation; a separate operator host is stronger.");
+            note("Install (on whichever host holds keygen.json):");
+            note("  sudo install -Dm600 keygen.json /etc/mirage/keygen.json");
+            note(&format!(
+                "  sudo install -Dm644 {svc_path} {tmr_path} /etc/systemd/system/"
+            ));
+            note("  sudo systemctl daemon-reload && sudo systemctl enable --now mirage-publish.timer");
+            note("  systemctl list-timers mirage-publish.timer   # confirm next fire");
+        }
+    }
+
     // Collect active transport names for summary
     let active = active_transport_names(&transports);
 
@@ -1909,5 +2115,154 @@ fn main() {
         2 => setup_bridge_and_client(false),
         3 => setup_client_from_invite(),
         _ => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The units are the whole automation: if the channel flags or the calendar
+    /// are wrong, announcements silently stop rotating and the bridge quietly
+    /// stops being discoverable an hour later. Nothing else catches that.
+    #[test]
+    fn publish_units_carry_the_operators_channels_and_a_utc_calendar() {
+        let dir = std::env::temp_dir().join(format!("mirage_units_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let svc = dir.join("mirage-publish.service");
+        let tmr = dir.join("mirage-publish.timer");
+        write_publish_units(
+            svc.to_str().expect("utf8"),
+            tmr.to_str().expect("utf8"),
+            "keygen.json",
+            &[
+                "wss://relay.damus.io".to_string(),
+                "wss://nos.lol".to_string(),
+            ],
+            true,
+            None,
+        );
+        let s = std::fs::read_to_string(&svc).expect("service written");
+        let t = std::fs::read_to_string(&tmr).expect("timer written");
+
+        // Every channel the operator chose has to reach the command line, or the
+        // timer runs forever publishing to somewhere they did not ask for.
+        assert!(s.contains("--from /etc/mirage/keygen.json"), "{s}");
+        assert!(s.contains(" --dht"), "DHT flag missing: {s}");
+        assert!(s.contains("--relay wss://relay.damus.io"), "{s}");
+        assert!(
+            s.contains("--relay wss://nos.lol"),
+            "second relay dropped: {s}"
+        );
+
+        // One-shot, not a daemon: the operator secret is then resident for the
+        // seconds a publish takes rather than the life of a process.
+        assert!(s.contains("Type=oneshot"), "{s}");
+        assert!(
+            !s.contains("--daemon"),
+            "a timer must not also daemonise: {s}"
+        );
+
+        // An epoch is unix_secs/3600, so boundaries are on the UTC hour. Without
+        // the suffix a +05:30 host fires 31 minutes into the epoch, and a DST
+        // host drifts by an hour twice a year.
+        assert!(
+            t.contains("OnCalendar=*-*-* *:01:00 UTC"),
+            "calendar must be UTC-qualified: {t}"
+        );
+        assert!(
+            t.contains("Persistent=true"),
+            "must catch up after downtime: {t}"
+        );
+        assert!(t.contains("Unit=mirage-publish.service"), "{t}");
+
+        // STRUCTURE, not just substrings. A multi-line Rust literal drags its own
+        // source indentation into the file, and systemd rejects a line that starts
+        // with whitespace - which a `contains` check waves straight through. This
+        // shipped broken once for exactly that reason.
+        for (label, body) in [("service", &s), ("timer", &t)] {
+            for (n, line) in body.lines().enumerate() {
+                assert!(
+                    line.is_empty() || !line.starts_with(char::is_whitespace),
+                    "{label} line {} starts with whitespace - systemd will not parse it: {line:?}",
+                    n + 1
+                );
+            }
+            assert!(
+                body.starts_with("[Unit]\n"),
+                "{label} must open with a section header: {body}"
+            );
+        }
+
+        // A bridge with no Nostr relays must not get an empty --relay.
+        write_publish_units(
+            svc.to_str().expect("utf8"),
+            tmr.to_str().expect("utf8"),
+            "keygen.json",
+            &[],
+            true,
+            None,
+        );
+        let s = std::fs::read_to_string(&svc).expect("service written");
+        assert!(!s.contains("--relay"), "no relays configured: {s}");
+        assert!(s.contains(" --dht"), "{s}");
+
+        // DNS TXT rotates only if every flag reaches the command line. A missing
+        // --tsig-secret makes mirage-publish exit fatally, so the timer would run
+        // hourly and never publish anything.
+        write_publish_units(
+            svc.to_str().expect("utf8"),
+            tmr.to_str().expect("utf8"),
+            "keygen.json",
+            &[],
+            false,
+            Some(&DnsUpdateCfg {
+                server: "127.0.0.1:53".to_string(),
+                zone: "example.org".to_string(),
+                key_name: "mirage-key.".to_string(),
+                secret_b64: "c2VjcmV0".to_string(),
+                secret_path: "/etc/mirage/tsig.key".to_string(),
+            }),
+        );
+        let s = std::fs::read_to_string(&svc).expect("service written");
+        for want in [
+            "--dns-server 127.0.0.1:53",
+            "--dns-zone example.org",
+            "--tsig-name mirage-key.",
+            "--tsig-secret-file /etc/mirage/tsig.key",
+        ] {
+            assert!(s.contains(want), "missing {want} in: {s}");
+        }
+        // The secret itself must NEVER reach the unit: a unit under
+        // /etc/systemd/system is world-readable, and `--tsig-secret` would also
+        // put it in argv where /proc/<pid>/cmdline (mode 444) exposes it.
+        assert!(
+            !s.contains("c2VjcmV0"),
+            "the TSIG secret leaked into the unit file: {s}"
+        );
+        assert!(
+            !s.contains("--tsig-secret "),
+            "argv form must not be used: {s}"
+        );
+
+        // And the key file itself must be 0600 from the moment it exists - a
+        // write-then-chmod leaves a world-readable window that is all a local
+        // attacker watching the directory needs.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let keyfile = dir.join("tsig.key");
+            write_secret_file(keyfile.to_str().expect("utf8"), "c2VjcmV0");
+            let mode = std::fs::metadata(&keyfile)
+                .expect("key file written")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "TSIG key file must be 0600, got {mode:o}");
+            let body = std::fs::read_to_string(&keyfile).expect("readable");
+            assert_eq!(body.trim(), "c2VjcmV0");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

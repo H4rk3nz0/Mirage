@@ -1932,10 +1932,151 @@ pub fn prune(dir: &Path, keep: usize) {
     }
 }
 
-fn write_csv(dir: &Path, events: &[Event]) -> io::Result<PathBuf> {
+/// What a trace is a recording OF.
+///
+/// A trace used to be `t,size,dir` and nothing else, so "when was this captured,
+/// against what host, speaking what protocol" was unanswerable from the artifact:
+/// the recorder knew the source and printed it to a terminal that scrolled away.
+/// A content hash identifies WHICH bytes a run used; it says nothing about what
+/// they are a recording of, and a library of unlabelled traces cannot be audited
+/// for staleness, for host agreement, or for protocol drift at the site.
+///
+/// Written as `#` comment lines ahead of the CSV header. The pacer's row parser
+/// skips any line whose last three fields are not numeric, so an old trace with
+/// no header and a new trace with one both replay identically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceProvenance {
+    /// Wall clock at capture, seconds since the Unix epoch.
+    pub recorded_at_unix: u64,
+    /// The host this trace is a recording of. This is the SELECTION KEY for
+    /// target-conditioned replay: it lets a trace declare its own host instead
+    /// of the directory layout being the only claim about what it contains.
+    pub cover_host: String,
+    /// The exact URL fetched, so a capture can be reproduced or re-audited.
+    pub source_url: String,
+    /// HTTP version actually spoken. The recorder offers no ALPN and therefore
+    /// speaks HTTP/1.1, while every major cover host serves HTTP/2 to a real
+    /// browser - so an "h1" here against such a host means the envelope has the
+    /// wrong framing, multiplexing and upstream flow-control chatter for the
+    /// site it names, however faithfully it is replayed.
+    pub http_version: String,
+    /// ALPN offered at capture (`none` today), recorded separately from the
+    /// version so the CAUSE of a version mismatch is legible.
+    pub alpn: String,
+    /// Which build produced it.
+    pub recorder_version: String,
+}
+
+/// Days since the Unix epoch to `(year, month, day)`. Civil-from-days, the
+/// standard Howard Hinnant algorithm - a dependency-free date is worth ~15 lines
+/// here because the header is meant to be read by a person deciding whether a
+/// library has gone stale.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+impl TraceProvenance {
+    /// A header value that cannot be mistaken for a data row.
+    ///
+    /// Defence in depth behind the parser's `#` check: a comma in a recorded URL
+    /// is what turns a comment into a parseable record, so the comma never
+    /// reaches the file. Newlines are stripped for the same reason one level up -
+    /// a value containing one would end the comment and start a new line that is
+    /// not a comment at all.
+    fn escape(v: &str) -> String {
+        v.chars()
+            .map(|c| match c {
+                ',' => "%2C".to_string(),
+                '\n' | '\r' => String::new(),
+                _ => c.to_string(),
+            })
+            .collect()
+    }
+
+    /// The `#` header block, including a human-readable UTC timestamp beside the
+    /// machine-readable one.
+    fn header(&self) -> String {
+        let secs = self.recorded_at_unix;
+        let (y, mo, d) = civil_from_days((secs / 86_400) as i64);
+        let (h, mi, s) = (secs % 86_400 / 3600, secs % 3600 / 60, secs % 60);
+        format!(
+            "# mirage-cover-trace v1\n\
+             # recorded_at_unix={}\n\
+             # recorded_at={y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z\n\
+             # cover_host={}\n\
+             # source_url={}\n\
+             # http_version={}\n\
+             # alpn={}\n\
+             # recorder={}\n",
+            self.recorded_at_unix,
+            Self::escape(&self.cover_host),
+            Self::escape(&self.source_url),
+            Self::escape(&self.http_version),
+            Self::escape(&self.alpn),
+            Self::escape(&self.recorder_version),
+        )
+    }
+
+    /// Age in days at `now_unix`, or `None` if the trace is stamped in the future
+    /// (a clock that moved backwards - reported rather than silently clamped).
+    #[must_use]
+    pub fn age_days(&self, now_unix: u64) -> Option<f64> {
+        now_unix
+            .checked_sub(self.recorded_at_unix)
+            .map(|d| d as f64 / 86_400.0)
+    }
+}
+
+/// Beyond this, a trace is describing a site as it was rather than as it is.
+///
+/// A major site's TLS config, HTTP settings, CDN and page weight all move on a
+/// scale of months. Replaying a year-old envelope against today's population of
+/// real visitors is anomalous in a way no per-record check catches, because each
+/// record is individually plausible - it is the aggregate shape that no longer
+/// matches anything. Warn rather than refuse: stale cover still beats none, and
+/// a client that stopped tunnelling because its library aged out is a worse
+/// outcome than one wearing a slightly dated envelope.
+pub const TRACE_STALE_DAYS: f64 = 90.0;
+
+/// Read a trace's `#` provenance header. `None` for a trace written before the
+/// header existed - which is itself the answer to "what is this a recording
+/// of?", and the reason the field is an `Option` rather than a default.
+#[must_use]
+pub fn read_provenance(path: &Path) -> Option<TraceProvenance> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut kv = std::collections::HashMap::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix('#') else {
+            break; // header block ends at the first non-comment line
+        };
+        if let Some((k, v)) = rest.trim().split_once('=') {
+            kv.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    Some(TraceProvenance {
+        recorded_at_unix: kv.get("recorded_at_unix")?.parse().ok()?,
+        cover_host: kv.get("cover_host").cloned().unwrap_or_default(),
+        source_url: kv.get("source_url").cloned().unwrap_or_default(),
+        http_version: kv.get("http_version").cloned().unwrap_or_default(),
+        alpn: kv.get("alpn").cloned().unwrap_or_default(),
+        recorder_version: kv.get("recorder").cloned().unwrap_or_default(),
+    })
+}
+
+fn write_csv(dir: &Path, events: &[Event], prov: Option<&TraceProvenance>) -> io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
     let path = dir.join(format!("{}.csv", next_index(dir)));
-    let mut s = String::from("t,size,dir\n");
+    let mut s = prov.map(TraceProvenance::header).unwrap_or_default();
+    s.push_str("t,size,dir\n");
     for (t, sz, dr) in events {
         s.push_str(&format!("{t:.6},{sz},{dr}\n"));
     }
@@ -2579,7 +2720,13 @@ fn library_size(dir: &Path) -> usize {
 /// and the operator has to be told, because "it looked like it was on" is the
 /// failure this whole design exists to prevent.
 pub async fn keep_fresh(lib: PathBuf) {
-    keep_fresh_sourcing(lib, packs::SourcePack::default(), Some(DEFAULT_MAX_GB_DAY)).await;
+    keep_fresh_sourcing(
+        lib,
+        packs::SourcePack::default(),
+        Some(DEFAULT_MAX_GB_DAY),
+        None,
+    )
+    .await;
 }
 
 /// [`keep_fresh`] with an explicit source pack and daily ceiling.
@@ -2589,8 +2736,22 @@ pub async fn keep_fresh(lib: PathBuf) {
 /// the only thing that was ever being chosen - it decides both what a capture
 /// costs to replay and, through [`classes_for_budget`], whether a fat video
 /// capture is affordable at all.
-pub async fn keep_fresh_sourcing(lib: PathBuf, pack: packs::SourcePack, max_gb_day: Option<f64>) {
-    keep_fresh_inner(lib, pack, max_gb_day, None).await;
+/// `cover_host` is the Reality cover host this endpoint claims (its SNI). When
+/// set, the recorder also captures THAT SITE into `<lib>/<host>/`, which is what
+/// target-conditioned replay looks for. Without it the library is class-keyed
+/// only (`browse/`, `video/`, `upstream/`), the per-host lookup finds nothing,
+/// and every session silently wears a generic class while the carrier claims to
+/// be talking to a specific site. That fallback used to be the only reachable
+/// state on the automatic path: the feature was documented and manually
+/// buildable, but nothing that ran by default ever created the directory it
+/// needs.
+pub async fn keep_fresh_sourcing(
+    lib: PathBuf,
+    pack: packs::SourcePack,
+    max_gb_day: Option<f64>,
+    cover_host: Option<String>,
+) {
+    keep_fresh_inner(lib, pack, max_gb_day, cover_host, None).await;
 }
 
 /// [`keep_fresh_sourcing`] that stops when `stop` is set.
@@ -2604,17 +2765,26 @@ pub async fn keep_fresh_budget(
     lib: PathBuf,
     pack: packs::SourcePack,
     max_gb_day: Option<f64>,
+    cover_host: Option<String>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    keep_fresh_inner(lib, pack, max_gb_day, Some(stop)).await;
+    keep_fresh_inner(lib, pack, max_gb_day, cover_host, Some(stop)).await;
 }
 
 async fn keep_fresh_inner(
     lib: PathBuf,
     pack: packs::SourcePack,
     max_gb_day: Option<f64>,
+    cover_host: Option<String>,
     stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) {
+    // The per-host class, if this endpoint claims a cover host. Sanitised with
+    // the SAME function the pacer uses to look it up, so writer and reader agree
+    // by construction rather than by two matching implementations.
+    let host_class = cover_host
+        .as_deref()
+        .map(mirage_common::proteus_switch::sanitize_cover_host)
+        .filter(|h| !h.is_empty());
     // Browse first, deliberately. A realtime video capture takes minutes by
     // construction (it waits the stream's true segment gaps), while a browse
     // capture is seconds - so recording browse first means Proteus has something
@@ -2706,6 +2876,65 @@ async fn keep_fresh_inner(
                 }
             }
             prune(&dir, AUTO_LIBRARY_TARGET);
+        }
+        // Target-conditioned cover: record the site this endpoint CLAIMS to be
+        // talking to, into the directory the pacer looks for.
+        //
+        // Without this the automatic path can only ever produce class-keyed
+        // directories, so `<lib>/<host>/` never exists, the per-host lookup falls
+        // through, and the session wears a generic browse envelope while the SNI
+        // and the probe fallback both say a specific site. Two layers telling
+        // different stories is not something either layer can detect on its own -
+        // a prober gets the real host, a passive observer gets a shape recorded
+        // somewhere else - and it was the default for every deployment.
+        //
+        // Browse mode with dwell: a cover host is a page a person reads, and this
+        // trace is worn DOWNSTREAM where realistic reading gaps are the point.
+        if let Some(host) = host_class.as_deref() {
+            let dir = lib.join(host);
+            if fs::create_dir_all(&dir).is_ok() {
+                let mut args =
+                    Args::auto_budget(lib.clone(), Mode::Browse, max_gb_day, pack.clone());
+                args.name = host.to_string();
+                // The host itself is the source, not the pack's browse set. A
+                // pack URL here would record the wrong site into a directory
+                // named for this one - worse than no per-host trace, because the
+                // lookup would then succeed and wear a confidently wrong shape.
+                args.url = Some(format!("https://{host}/"));
+                let want = AUTO_LIBRARY_TARGET
+                    .saturating_sub(library_size(&dir))
+                    .min(2);
+                for _ in 0..want {
+                    match record_one(&args, &dir).await {
+                        Ok(cost) => {
+                            recorded += 1;
+                            tracing::info!(
+                                cover_host = host,
+                                envelope = %cost,
+                                "proteus: recorded target-conditioned cover - sessions to this \
+                                 host will wear its own shape"
+                            );
+                            was_usable = true;
+                        }
+                        Err(e) => {
+                            // The cover host is reachable by definition (the
+                            // carrier connects to it), so a failure here is worth
+                            // seeing: it leaves the session on generic cover.
+                            tracing::info!(
+                                cover_host = host,
+                                error = %e,
+                                "proteus: could not record the cover host itself - sessions stay \
+                                 on GENERIC cover, whose shape does not match the host the \
+                                 carrier claims"
+                            );
+                            break;
+                        }
+                    }
+                }
+                prune(&dir, AUTO_LIBRARY_TARGET);
+            } else {
+                tracing::warn!(dir = %dir.display(), "proteus: cannot create per-host cover dir");
+            }
         }
         let (video, browse) = (
             library_size(&lib.join("video")),
@@ -3176,7 +3405,22 @@ pub async fn record_one(args: &Args, dir: &Path) -> io::Result<Cost> {
                         }
                     }
                 }
-                let path = write_csv(dir, &events)?;
+                // Stamp what this is a recording OF, at the moment it is known.
+                // `http_version` is hard-coded because the recorder speaks
+                // HTTP/1.1 by construction: it offers no ALPN and writes request
+                // lines itself. That is not a detail - see `TraceProvenance`.
+                let prov = TraceProvenance {
+                    recorded_at_unix: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    cover_host: src.host().to_string(),
+                    source_url: src.as_url().to_string(),
+                    http_version: "1.1".into(),
+                    alpn: "none".into(),
+                    recorder_version: env!("CARGO_PKG_VERSION").to_string(),
+                };
+                let path = write_csv(dir, &events, Some(&prov))?;
                 if args.verbose {
                     println!(
                         "recorded {} ({} records, {} KiB {}) from {}",
@@ -3202,6 +3446,116 @@ pub async fn record_one(args: &Args, dir: &Path) -> io::Result<Cost> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CTR: AtomicU32 = AtomicU32::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "cover_{tag}_{}_{}",
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::create_dir_all(&d);
+        d
+    }
+
+    /// A trace must say what it is a recording OF, and survive a round trip.
+    ///
+    /// Without this the library is a pile of unlabelled number columns: staleness
+    /// cannot be checked, host agreement cannot be verified, and "which site is
+    /// this?" is answerable only from a terminal line that already scrolled away.
+    #[test]
+    fn a_trace_records_what_it_is_a_recording_of() {
+        let dir = tmpdir("prov");
+        let prov = TraceProvenance {
+            recorded_at_unix: 1_754_524_800, // 2025-08-07T00:00:00Z
+            cover_host: "www.wikipedia.org".into(),
+            source_url: "https://www.wikipedia.org/".into(),
+            http_version: "1.1".into(),
+            alpn: "none".into(),
+            recorder_version: "0.1.6-alpha.1".into(),
+        };
+        let events: Vec<Event> = vec![(0.0, 517, 1), (0.25, 1200, -1)];
+        let p = write_csv(&dir, &events, Some(&prov)).expect("write");
+
+        let back = read_provenance(&p).expect("header round-trips");
+        assert_eq!(back, prov);
+        // The human-readable stamp must agree with the machine-readable one -
+        // they are written from the same value, and a reader trusts the one that
+        // is easier to read.
+        let text = fs::read_to_string(&p).expect("read");
+        assert!(
+            text.contains("# recorded_at=2025-08-07T00:00:00Z"),
+            "civil date must match the unix stamp, got:\n{text}"
+        );
+        // Age is reported, and a backwards clock is reported as unknown rather
+        // than silently clamped to zero.
+        let age = back.age_days(1_754_524_800 + 86_400 * 30).expect("age");
+        assert!((age - 30.0).abs() < 0.01, "age was {age}");
+        assert_eq!(back.age_days(1_754_524_800 - 1), None, "future stamp");
+
+        // A trace written before headers existed reads as unknown provenance,
+        // not as a default that would look like a real answer.
+        let bare = write_csv(&dir, &events, None).expect("write bare");
+        assert_eq!(read_provenance(&bare), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The header must not change what replays.
+    ///
+    /// The pacer's row parser skips lines whose last three fields are not
+    /// numeric, so a `#` block is inert - but that is a property of a parser in
+    /// ANOTHER crate, which is exactly the kind of cross-crate assumption that
+    /// has broken twice in this file's history. Pin the data rows here so a
+    /// header change cannot silently alter the replayed envelope.
+    #[test]
+    fn the_provenance_header_does_not_change_the_replayed_rows() {
+        let dir = tmpdir("hdr");
+        let events: Vec<Event> = vec![(0.0, 517, 1), (0.25, 1200, -1), (1.5, 64, 1)];
+        let prov = TraceProvenance {
+            recorded_at_unix: 1_754_524_800,
+            cover_host: "www.wikipedia.org".into(),
+            // FOUR commas, not three. With three the line splits into exactly 3
+            // fields whose first is `# source_url=...` and fails to parse, so the
+            // comment is skipped by luck. With four it splits into 4, the last
+            // three parse cleanly as (t, size, dir), and a fabricated record is
+            // injected into the replayed envelope. The first version of this test
+            // used three commas and passed against the defect.
+            source_url: "https://www.wikipedia.org/w/index.php?a=b,0.5,100,1".into(),
+            http_version: "1.1".into(),
+            alpn: "none".into(),
+            recorder_version: "test".into(),
+        };
+        let with = write_csv(&dir, &events, Some(&prov)).expect("write");
+        let without = write_csv(&dir, &events, None).expect("write");
+
+        let rows = |p: &Path| -> Vec<String> {
+            fs::read_to_string(p)
+                .expect("read")
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(
+            rows(&with),
+            rows(&without),
+            "the header must be additive - identical data rows either way"
+        );
+        // And no header line may be parseable as a data row even by a parser that
+        // does not check for `#` - the comma is escaped out at the writer, so the
+        // fabricated-record path is closed on both sides independently.
+        let text = fs::read_to_string(&with).expect("read");
+        for line in text.lines().filter(|l| l.starts_with('#')) {
+            let f: Vec<&str> = line.split(',').collect();
+            assert!(
+                f.len() < 3,
+                "header line splits into {} comma fields and could be read as a record: {line}",
+                f.len()
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_recorder_only_rejects_when_a_ceiling_actually_reached_it() {

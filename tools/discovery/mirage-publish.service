@@ -1,0 +1,56 @@
+# Publishes this bridge's epoch-rotated announcement to the discovery channels.
+#
+# Paired with mirage-publish.timer, which fires it once an hour. Do not enable
+# this unit directly - `systemctl enable --now mirage-publish.timer` instead.
+#
+# WHERE THIS RUNS MATTERS. It reads the operator Ed25519 SECRET key, and whoever
+# holds that key can forge future announcements - which means redirecting every
+# client that discovers this bridge. The bridge daemon deliberately does not hold
+# it. Running this unit on the bridge host is a supported deployment, but it
+# collapses that separation: a bridge compromise then yields the signing key too.
+# The stronger pattern is a separate operator host with outbound access to the
+# relays and no inbound exposure.
+#
+# Type=oneshot is the point: the key is resident for the seconds a publish takes,
+# not for the life of a daemon. `mirage-publish --daemon` exists and would work
+# here, but it holds the key in memory permanently for no benefit the timer does
+# not already give.
+#
+# Install: edit the paths, User and channel flags below, then
+#   sudo cp mirage-publish.service mirage-publish.timer /etc/systemd/system/
+#   sudo systemctl enable --now mirage-publish.timer
+#   systemctl list-timers mirage-publish.timer      # confirm the next fire time
+# `mirage-setup` writes a copy of these two files with your channels already
+# filled in.
+[Unit]
+Description=Publish Mirage bridge announcement for the current epoch
+Documentation=https://github.com/H4rk3nz0/Mirage/blob/main/docs/operators.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mirage
+# --epochs defaults to 0,1 (current + next), so a run that is late or skipped
+# still leaves a valid announcement covering the following hour.
+ExecStart=/usr/local/bin/mirage-publish --from /etc/mirage/keygen.json --dht
+
+# The keyfile is the whole threat surface; give the unit as little else as
+# possible. ProtectSystem=strict makes the filesystem read-only, and the key is
+# supplied read-only through the one path that needs it.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# Outbound only: Nostr relays over TCP/TLS, DHT over UDP.
+RestrictAddressFamilies=AF_INET AF_INET6
+CapabilityBoundingSet=

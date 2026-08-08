@@ -913,6 +913,44 @@ be bought for a tenth of what the cheap fix already delivered. Not built, delibe
 
 ## What is measured, and what is not
 
+> ### Results predating the host-aware cover library do not transfer
+>
+> Every separability number recorded in this document and in the repository's history
+> was captured with the pacer resolving to **generic** cover, not target-conditioned
+> cover. `read_profile` prefers `<library>/<cover-host>/` and silently fell back to the
+> generic class when that directory was absent — and the automatic sourcing path could
+> never create it, because it only ever wrote class-keyed directories (`browse/`,
+> `video/`, `upstream/`). The mode was reachable only by hand-building the layout from a
+> tools README, and nothing in the config, the logs or the diagnostics distinguished the
+> two. So every measurement described the mode this file's own selection comment calls
+> separable, and none described the shippable one.
+>
+> Auto-sourcing now records the cover host, `--check-config` reports which branch is
+> live, a pinned library missing its host directory is refused at startup, and the
+> capture manifest records the resolved branch. **Re-measure before quoting any number
+> below.** The `0.57` podman residual in particular is a generic-fallback figure.
+>
+> ### The envelope is an HTTP/1.1 approximation of an HTTP/2 site
+>
+> The recorder offers **no ALPN** and writes HTTP/1.1 request lines by hand, while every
+> major cover host — `www.wikipedia.org`, `www.microsoft.com`, `www.cloudflare.com` —
+> serves HTTP/2 to any real browser. The recorded envelope therefore has the wrong
+> framing (no HEADERS/DATA frames, no HPACK'd header sizes), the wrong multiplexing (h1
+> keep-alive serialises subresources where h2 interleaves them on one connection) and
+> the wrong upstream cadence (no SETTINGS, no WINDOW_UPDATE flow-control chatter).
+> Replay fidelity does not help: the trace is faithful to a protocol the site does not
+> speak to browsers.
+>
+> The carrier's own ClientHello advertises `h2, http/1.1`. TLS 1.3 encrypts the ALPN
+> response, so this is not a single readable field — it is a population comparison: a
+> client that offered h2 and then produced an envelope with no h2 characteristics.
+>
+> **This residual is known and unmeasured.** It cannot be found by the harnesses below,
+> for a structural reason worth stating plainly: they compare Mirage against Mirage, so
+> any defect that is a property of the DESIGN appears identically in both arms and
+> cancels. Finding it needs a different negative class — real browser traffic to the
+> same host from the same network position — which has never been run.
+
 Grounded, with numbers in the repository's history: **size and direction**. The
 `cover-traffic.sh` harness runs a real cluster, captures the carrier from the censor's
 vantage point across idle and active windows, and runs the project's own learned

@@ -7,6 +7,215 @@ then, pre-releases may make breaking changes between versions.
 
 ## [Unreleased]
 
+## [0.1.7-alpha.1] - 2026-08-08
+
+### Added
+- **Target-conditioned cover is reachable from the automatic path.** Proteus has
+  always preferred `<library>/<cover-host>/` so the shaped envelope matches the
+  site the SNI announces, and fell back to a generic class when that directory
+  was missing. Nothing that ran by default ever created it: auto-sourcing wrote
+  class-keyed directories (`browse/`, `video/`, `upstream/`) only, so the good
+  mode was reachable solely by an operator who had read a tools README and built
+  the layout by hand. `keep_fresh_*` now takes the endpoint's cover host and
+  records that site into `<lib>/<host>/`.
+  - Writer (`mirage-cover`) and reader (`mirage-transport-reality`) now share one
+    `sanitize_cover_host`. They live in crates that do not depend on each other
+    and the lookup fails open, so a divergence would produce a library whose
+    per-host traces are never found - indistinguishable from having recorded
+    none. A test asserts they agree on case- and port-varying inputs.
+  - A bridge with several cover hosts records only the first and says so;
+    sessions using the others still wear generic cover.
+- **Traces record what they are a recording of.** A trace was `t,size,dir` and
+  nothing else, so "when was this captured, against what host, speaking what
+  protocol" was unanswerable from the artifact - the recorder knew and printed it
+  to a terminal that scrolled away. A `#` header now carries capture time, cover
+  host, source URL, HTTP version, ALPN and recorder version, with
+  `TRACE_STALE_DAYS = 90`. The header is inert to the pacer's row parser.
+- **TLS fingerprint templates carry provenance and a staleness budget.**
+  `TemplateProvenance` records which browser build a template imitates, when that
+  was last checked, and whether it was hand-transcribed or captured. A ClientHello
+  that has drifted does not look like nothing - it looks like exactly one thing,
+  which is worse. `FINGERPRINT_STALE_DAYS = 180` (~four Chrome releases) warns at
+  startup. All three shipped templates are `HandTranscribed`, i.e. not
+  re-derivable; `CapturedFromBrowser` exists as the unused variant marking that gap.
+- **Replay position is reportable.** `ScheduleStream::replay_position()` returns
+  `(trace, pass, token, token_in_trace)` from the pacer rather than being inferred
+  from elapsed time - the two agree only while nothing stalls. Chain wraps are
+  logged as they happen, which makes the chain-boundary question answerable from
+  data already collected. `MeasuredProfile` keeps `flow_starts`, so which chained
+  trace is being worn survives parsing.
+- **The capture harness survives, and refuses.** `scripts/wire-auc/` no longer
+  aborts on carrier state: outages are timestamped with cause, reconnect uses
+  bounded backoff (in attempts *and* wall clock), and windows spanning a gap are
+  tagged rather than dropped. Phase duration is set by the clock and the load
+  generator is hard-killed at the boundary, so it cannot depend on payload.
+  Offered load is recorded per window rather than assumed.
+  - `check_capture.py` refuses a capture that cannot mean what it appears to
+    mean: implausible record rate, an active window that offered zero bytes, a
+    missing end-of-run clock sample, an unattributable shaping branch.
+  - `selftest.sh` exercises the whole path against a synthetic fixture with no
+    network, including negative cases and a positive control.
+  - Run directories are refused on ephemeral storage unless
+    `ALLOW_EPHEMERAL_RUNS=1`.
+- **Client GUI design tokens.** Every colour, spacing, radius, type size and
+  duration resolves through one `Theme` global. Replaces 15 one-off hex colours,
+  13 border radii and 9 font sizes with a palette, a 4px scale, three radii and a
+  six-step ramp.
+- **Windows 98 easter egg in the client GUI.** Five clicks on the connection orb
+  re-skins the app; five more restore it. 98.css is a stylesheet and Slint has no
+  CSS, so its values are hand-ported - including the 2px bevel, drawn as eight
+  1px edge rectangles since Slint has no inset shadow. See
+  [`docs/gui-retro-easter-egg.md`](docs/gui-retro-easter-egg.md). Not persisted:
+  an easter egg you cannot escape is a bug.
+- **DNS TXT discovery can now rotate itself, via RFC 2136 dynamic update.**
+  `DnsTxtChannel::publish` refuses - pushing a record needs authority over the
+  zone, which a resolver does not have - so the channel could only be maintained
+  by hand, hourly, which in practice meant it degraded to a static anchor while
+  DHT and Nostr rotated. `Rfc2136Publisher` closes that: `mirage-publish` takes
+  `--dns-server/--dns-zone/--tsig-name/--tsig-secret`, and `mirage-setup` bakes
+  them into the timer.
+  - One protocol against every compliant server (BIND, Knot, PowerDNS, deSEC)
+    rather than a bespoke HTTP client per DNS provider - the same reasoning that
+    keeps yt-dlp out of the cover recorder: prefer the stable protocol to the
+    convenient integration that rots.
+  - Writes ONE TXT RR whose character-strings are the ordered chunks. That is
+    forced, not chosen: the fetcher groups `txt_data()` per record and
+    reassembles each independently, and RR order within an RRset is not preserved
+    by DNS while character-string order within one RR is.
+  - Deletes the RRset and adds in a single message, so a republish replaces
+    instead of appending - otherwise the name accumulates a stale announcement
+    per epoch until the answer stops fitting.
+  - Verified against a live BIND server with a real TSIG key, not just in unit
+    tests: UPDATE accepted and signer approved, the record landed at the derived
+    name, `DnsTxtChannel` fetched and reassembled it byte-identically, and four
+    consecutive publishes left exactly one RR. `examples/rfc2136_smoke` reruns
+    that end to end.
+  - The secret is read from a FILE (`--tsig-secret-file`), and `mirage-setup`
+    writes it `0600` at create time. `--tsig-secret` still works but warns:
+    `/proc/<pid>/cmdline` is world-readable, and a systemd unit is too, so a key
+    on the command line is readable by every local user - which is why the
+    operator key has always come from `--from <file>` rather than a flag.
+  - TSIG's HMAC comes from `hickory-proto`'s `dnssec-ring`; `ring` was already in
+    the tree via rustls, so no new crypto stack. Compiled unconditionally, per
+    the crate's rule that capabilities are runtime choices and never features.
+- **Epoch-rotated announcement publishing is now automated.** An announcement
+  expires every epoch (`DISCOVERY_EPOCH_SECONDS` = 1 h), and nothing in the repo
+  kept re-publishing it: `mirage-setup` printed a `mirage-publish` command and
+  left the operator to build their own timer, so a deployment that followed setup
+  exactly stopped being discoverable within the hour. `mirage-setup` now offers to
+  write `mirage-publish.service` + `.timer` with the operator's chosen channels
+  already filled in, and `tools/discovery/` ships a hand-editable copy.
+  - A one-shot on a timer rather than `--daemon`, so the operator SECRET key is
+    resident for the seconds a publish takes instead of the life of a process.
+  - `OnCalendar=*-*-* *:01:00 UTC`. An epoch is `unix_secs / 3600`, so boundaries
+    land on the UTC hour; verified with `systemd-analyze` that an unqualified
+    `*:01:00` on a +05:30 host fires at 11:31 UTC - 31 minutes into the epoch
+    instead of 1 - and that the UTC form fires at 12:01.
+  - `Persistent=true` catches up after downtime, and each run publishes
+    `--epochs 0,1` (current + next), so a late or missed run still leaves a valid
+    announcement covering the following hour.
+  - The bridge daemon still does NOT publish and still does not hold the operator
+    signing key. Auto-publishing from the daemon was considered and rejected:
+    whoever holds that key can forge future announcements and redirect every
+    client that discovers the bridge, so the operator/bridge separation is worth
+    more than the one saved process. Setup and the operator guide now say plainly
+    that installing the timer on the bridge host is supported but collapses that
+    separation.
+
+### Changed
+- **Client GUI restyle.** Text inputs are built from primitives instead of
+  `std-widgets` `LineEdit`, which carried Slint's own theme and read as pasted in
+  from another application. Unavailable actions are quiet controls rather than
+  faded bright ones - dimming a saturated accent to 45% reads as broken, not as
+  "fill something in first". The connection orb has its own state palette instead
+  of borrowing three accents and a text colour.
+- **`--check-config` reports resolved state, not configured state.** It now
+  prints `stream_mux_enabled` and which shaping branch is live
+  (target-conditioned vs generic, and which directory is missing). A dump that
+  omits a defaulted value is a faithful record of an ambiguous one.
+
+### Fixed
+- **Proteus silently wore generic cover, and nothing could tell you.** The
+  fallback from target-conditioned to generic selection was unreported at every
+  layer: no config, log, or diagnostic distinguished them, and the automatic path
+  could not produce the good mode at all. A prober saw the real cover host while
+  a passive observer saw a flow recorded elsewhere, and neither layer can detect
+  the disagreement alone. `resolve_profile_match` now returns the branch as a
+  value consumed by the runtime, the diagnostic and the refusal alike. A *pinned*
+  library missing its host directory is refused at startup - that mismatch is
+  permanent - unless `proteus_generic_cover_ok` is set.
+  - **Every separability number recorded before this release was measured in the
+    generic-fallback mode**, which this codebase's own selection comment
+    describes as separable. They describe a configuration that no longer starts
+    and do not transfer. See the note at the top of "What is measured, and what
+    is not" in [`docs/proteus.md`](docs/proteus.md).
+- **The client GUI ignored clicks under native Wayland.** Same binary, same
+  window: pointer events reached `TouchArea`s under X11 and were silently dropped
+  on a Wayland surface, with the window drawing perfectly and simply not
+  responding. Confirmed with kernel-level synthetic input through `/dev/uinput`,
+  which a compositor cannot distinguish from a mouse. Not fixable in UI markup -
+  the events never arrived. `prefer_xwayland()` routes through XWayland when both
+  are available; `MIRAGE_FORCE_WAYLAND=1` opts out. A workaround for an upstream
+  issue under the pinned Slint 1.9.2, to be removed when that pin lifts.
+- **A bridge answered active probes differently from the host it claims to be.**
+  Reality mimicry (`shadow_target`) was a SEPARATE setting from
+  `reality_cover_addr`, and only the latter is one an operator naturally sets -
+  so a Reality bridge configured the obvious way had no mimicry target and
+  dropped unknown probes, which surfaced as a TCP RST (Linux emits RST when a
+  socket closes with unread data queued). Measured against `www.wikipedia.org`
+  with identical probes: the real host answers 64 random bytes with a graceful
+  close, the bridge answered RST - 15 times out of 15, across five payload sizes.
+  One packet, no statistics, no false positives: a censor scans a range and keeps
+  whatever RSTs.
+  - `shadow_target` now defaults to `reality_cover_addr`. The bridge already
+    announces itself as that host in the TLS SNI, so an unauthenticated prober
+    reaching the real thing is the most faithful answer available.
+  - The drop-only path drains its receive queue before closing, so even with no
+    cover configured the close is a FIN.
+  - The config sanity check had a case for every shadow-target combination
+    EXCEPT "neither set" - the one that produced this. Now warned.
+  - After the fix all five probes match the real host in class and timing,
+    including a byte-identical TLS alert. `mirage-setup` was already safe (it
+    prompts for a decoy, defaulting yes); `mirage-keygen` configs were not.
+- `ws_enabled` without `http_shadow_target` now warns: a failed HTTP/WebSocket
+  probe is dropped with no response, which is not what the web endpoint that
+  transport fronts as would do. The documented deployment puts it behind
+  nginx/a CDN, where a scanner never reaches Mirage; nothing enforced that.
+- **obfs-tcp presented a fixed cleartext signature at a fixed offset.** The
+  transport handed back the raw socket after its 64-byte knock, so the Mirage
+  session header went out verbatim. Captured off a real socket:
+  `bytes[64..67] = 4D 49 01` - `"MI"`, `MSG_TYPE_1` - on every connection, with a
+  fixed 1285-byte first flight. A censor blocks that with a `memcmp`, no
+  statistics needed. The crate's own threat-model table claimed
+  "T1 (signature DPI): ok - no protocol-specific signature"; that claim was
+  false and is corrected.
+  - Everything after the knock is now XORed with a per-connection keystream
+    (BLAKE3 XOF keyed on the knock tag and the client nonce, separate streams per
+    direction so a capture never yields `c2s XOR s2c`). Re-captured: the bytes at
+    offset 64 differ on every connection.
+  - **Obfuscation, not encryption.** In legacy mode the knock key derives from
+    the bridge's PUBLIC key, so anyone can regenerate the keystream and strip it.
+    Confidentiality is the Noise session inside; this only stops the carrier
+    presenting identical plaintext every time.
+  - **Wire-breaking for obfs-tcp**: both ends must be >= this version. No other
+    carrier is affected.
+  - Found by red-teaming for censorship-adversary fingerprints, and the
+    client/bridge asymmetry it introduced was caught by an existing end-to-end
+    roundtrip test, not by review.
+
+### Documented
+- **The cover envelope is an HTTP/1.1 approximation of HTTP/2 sites.** The
+  recorder offers no ALPN and hand-writes HTTP/1.1 request lines, while every
+  major cover host serves HTTP/2 to a real browser - so the recorded envelope has
+  the wrong framing, multiplexing and upstream flow-control cadence for the site
+  it names, however faithfully it is replayed. The carrier's own ClientHello
+  advertises `h2`. Recorded as a known, unmeasured residual rather than left
+  implicit, along with why the existing harnesses cannot see it: they compare
+  Mirage against Mirage, so a defect belonging to the design appears in both arms
+  and cancels.
+
+## [0.1.6-alpha.3] - 2026-08-05
+
 ### Added
 - **Regional VIDEO cover for every pack, and a container format to carry it.**
   Video sourcing was PeerTube-only, so on a censored network the video class
@@ -55,6 +264,102 @@ then, pre-releases may make breaking changes between versions.
   `adversary/tests/cover_class_mixing.rs` (a session must wear one cover class)
   and `paced::tests::an_active_tunnel_emits_the_same_wire_as_an_idle_one` (the
   emitted record sequence must not depend on whether the app has bytes queued).
+- TCP segment merging was ruled out as a source of apparent activity signal. The
+  classifier keys on sizes only, so any separability it reports is a size-sequence
+  difference and cannot be a timing artifact; the pacer's frames are
+  token-determined and identical idle or busy, so a difference would have to enter
+  below it. Refuted for this carrier: runs longer than one frame measured 0.3%
+  idle against 0.4% active, with an unchanged histogram.
+
+### Changed
+- **A session now wears ONE cover class, chosen from the shared seed, instead of
+  a pooled mixture.** `read_profile` chained traces from every downstream class at
+  once, so a session's rate stepped phase-to-phase with whichever trace the
+  shuffle drew. Measured with the project's own 14-feature distinguisher over real
+  captures, that was decisively separable - it resembles neither a browsing
+  session nor a streaming one, because it is a chimera of the two:
+
+  | session construction | size axis | timing axis | pooled 16 windows |
+  |---|---|---|---|
+  | pooled vs real browse | **0.807** | **0.808** | **1.000** |
+  | pooled vs real video | **0.759** | - | **1.000** |
+  | one class vs its own reference | 0.511 / 0.517 | 0.506 / 0.510 | 0.532-0.599 |
+
+  Floor 0.552. Both endpoints sort the same directory names and derive the same
+  seed, so they choose alike and replay stays joint; coverage is unchanged, every
+  class is still worn, just whole-session. That is also closer to what a real user
+  does - watch a video OR read pages, not both in alternating four-second phases.
+  The earlier fix that excluded the UPSTREAM class was right but incomplete: the
+  defect is pooling classes of different rates at all.
+- **Tiers are gone.** `Tier` was a two-variant enum threaded through five
+  `keep_fresh_*` wrappers into a function that did nothing with it
+  (`let _ = tier;`); its only live use was supplying a default budget. Replaced by
+  `DEFAULT_MAX_GB_DAY` and `legacy_tier_budget`, with the `keep_fresh_*` family
+  collapsed from five entry points to three. Old configs keep working -
+  `lean`/`cheap`/`metered` resolve to 2.5 GB/day, `balanced`/`aggressive`/`max` to
+  6.0. Note `aggressive` was UNCAPPED and deliberately does not resolve to "no
+  limit": it measured no less detectable than lean and was the only setting that
+  produced a tunnel which would not come up.
+- Documentation now separates what the budget buys. Raising it lowers worst-case
+  latency for BROWSE cover; it does nothing for video, where the stall is one
+  segment long and a bigger budget only buys a fatter variant of the same stream.
+  README, the operator guide and `docs/proteus.md` all said otherwise.
+
+### Fixed
+- **The ranged recorder's chunk size was a fixed 512 KiB, which is 26.5 seconds of
+  Bilibili's low-bitrate rendition against a 2 s latency ceiling.** Since
+  `Args::auto` sets `real_time`, this was the default in-daemon path: China's
+  video class could not produce an acceptable trace at all. A request now carries
+  one latency budget's worth of media (at 60% of the ceiling, leaving headroom for
+  the request's own time to first byte), derived from the bitrate rather than
+  fixed in bytes. Realtime Bilibili went from never completing to 1.9 s worst
+  stall, accepted first attempt.
+- **The recorder retried realtime video captures for a stall it could never
+  avoid.** Segment duration is a publisher property, so redrawing yields another
+  stream that stalls identically - measured on Aparat at 10.2 s, 13.3 s, 10.1 s
+  across three full 360 s recording budgets, about 18 minutes, before keeping the
+  trace anyway. Realtime video stalls now skip straight to keeping, and the
+  warning no longer advises raising the bandwidth budget, which would not have
+  helped. Turkey went from ~18 minutes per capture to 3:03.
+- **Aparat's progressive fallback was unreachable in the case it exists for.** The
+  HLS link was returned whenever it merely parsed, so the fallback only fired if
+  the field was absent - never when that signed redirector answered 400, which it
+  does. The candidate is now validated before use.
+- `telewebion.com` in the Iran browse pack answered NXDOMAIN from public DNS, so
+  the recorder lost a source every time it drew that entry. Replaced with
+  `divar.ir` and `zoomit.ir`.
+- **Two `mirage-cover-record` binaries were built, and which one shipped depended
+  on build order.** Cargo auto-discovered a stale 980-line standalone copy in
+  `crates/bridge/src/bin/` that had not been touched since v0.1.4-alpha.2 and knew
+  nothing about source packs, budgets or the upstream class; `cargo build` emitted
+  an output-filename collision warning that had gone unread.
+- `resolve_source` shuffled the whole video source list, so a custom `--sources`
+  list could lose to the global PeerTube fallback on a coin flip, contradicting
+  "an explicit list always wins over any preset". Sources are now grouped by
+  preference and shuffled only within a group.
+
+### Removed
+- `crates/bridge/src/bin/mirage-cover-record.rs` - a stale standalone duplicate of
+  the recorder that Cargo auto-discovered as a second binary of the same name.
+- `mirage_cover::Tier`, `Args::auto_tier`, `keep_fresh_tier`,
+  `keep_fresh_tier_budget` and `keep_fresh_until`. Configuration is unaffected;
+  the legacy tier NAMES still parse via `legacy_tier_budget`.
+- `SourcePack::peertube_hosts` - superseded by `video_sources`, which returns
+  preference-ordered groups of `VideoSource` rather than a flat host list.
+
+## [0.1.6-alpha.2] - 2026-08-03
+
+### Security
+- `event-listener` 5.4.1 -> 5.4.2, clearing RUSTSEC-2026-0221 (`StackSlot<'_, T>`
+  unconditionally implemented `Send`/`Sync`, allowing `!Send` tags to cross
+  thread boundaries). Reached only through the Slint desktop client's
+  zbus/ashpd portal stack, so it was eligible for a GUI-only ignore on the same
+  reasoning as the existing entries; a patched release existed, so it was
+  upgraded rather than ignored.
+
+## [0.1.6-alpha.1] - 2026-08-03
+
+### Added
 - **A permutation-derived null for the flow distinguisher**
   (`flow_classifier::null_model` / `NullModel::verdict`, used by
   `examples/flow_auc`). The old verdict compared the best of 14 features against
@@ -82,12 +387,70 @@ then, pre-releases may make breaking changes between versions.
   margin over each pooling level's OWN floor, because pooling shrinks the sample
   and the floor rises as samples fall - so raw accuracy climbs for two unrelated
   reasons and only the margin separates them.
-- TCP segment merging was ruled out as a source of apparent activity signal. The
-  classifier keys on sizes only, so any separability it reports is a size-sequence
-  difference and cannot be a timing artifact; the pacer's frames are
-  token-determined and identical idle or busy, so a difference would have to enter
-  below it. Refuted for this carrier: runs longer than one frame measured 0.3%
-  idle against 0.4% active, with an unchanged histogram.
+
+### Changed
+- **Proteus cover is selected for smoothness, not just cost.** `min(capacity,
+  demand)` is concave in capacity, so for a given budget the smoothest cover
+  delivers strictly the most - burstiness is pure loss rather than a trade
+  against detectability. The browse recorder's inter-page dwell is now bounded by
+  the tunnel's own latency ceiling (`max_gap_secs`, at 60% of it, leaving
+  headroom for the next page's time to first byte) and session length is governed
+  by target SPAN rather than page count, so the replay loop's period is preserved
+  while real pages replace artificial waiting. Measured on the chained timeline:
+  sustained 41.5 -> 124.7 KB/s, worst stall 14.28 -> 1.75 s, a 120 KB fetch's p90
+  10.64 -> 2.87 s. On a live cluster the same change took a 300-second window from
+  52 transfers with 12 failures to 123 with none, and the startup probe from 21 s
+  to 4 s.
+- Documentation now states plainly that throughput and cover cost are the same
+  quantity, 1:1, and that the low default speed is the BUDGET rather than the
+  design - browse cover sustains about 1 Mbit/s because web pages are small, while
+  real video cover reaches 5-25 Mbit/s at proportional cost. `proteus_max_gb_day`
+  is documented for the first time.
+
+### Fixed
+- **Cover acceptance measured gaps in one direction only.** `Cost` computed its
+  worst gap over downstream records while `paced_handshake_budget` correctly took
+  the worst over both, so nothing stopped a capture that supplies upstream from
+  being accepted with a minute-long upstream silence and then stalling every
+  handshake round trip. Captures now also report worst upstream gap and
+  time-to-first-token per direction, and are rejected on both. The asymmetry is
+  sharp in practice: this repo's video captures all have workable downstream gaps
+  (1.46-1.99 s) and mostly unusable upstream ones (2.45-5.37 s).
+- **Degenerate captures failed open.** A capture with no usable span yields an
+  all-zero `Cost`, and every acceptance ceiling is an upper bound, so it passed
+  the cost, latency and opening checks vacuously and was written to the library as
+  valid cover. Now rejected explicitly.
+- **Upstream-class captures were being worn as downstream cover.** Pointing the
+  downstream profile at a library root pooled every class subdir, including the
+  `upstream` class - which is recorded dense and gap-free to carry flow control,
+  making it a 2-3 second burst rather than a browsing session. It also made a
+  session's cover rate a lottery between classes (the same library produced
+  88.7 KiB/s of idle cover in one session and 125.3 KiB/s in another), which was
+  measured as a real activity signal: 0.663/0.683 separability against a matched
+  0.520/0.525 control. Excluding the class closes it: across four replicates each
+  the active-minus-control difference is +0.014 up and +0.008 down, which at these
+  variances is not significant. An upstream-only library still paces, since an
+  empty schedule hangs a session rather than degrading to unpaced.
+- **The censor-vantage harness could report a confident false positive.**
+  Randomised window assignment decorrelates the label from replay-loop position
+  across runs but not within one - each run still draws its own imbalance, about
+  `1/sqrt(15)` at 15 windows per class, and it is systematic within that run.
+  Measured with NO user traffic: one control scored 0.623 per window and grew to
+  an excess of +0.194 when 64 windows were pooled, while another stayed clean.
+  Windows are now emitted as matched PAIRS (one idle, one active, random order
+  within the pair) so adjacent windows sit at the same loop phase and it cancels.
+- Cover captures now also report worst upstream gap and time-to-first-token per
+  direction, so an operator reading a log can tell which ceiling a rejected
+  capture missed.
+
+### Security
+- The desktop client writes its saved-profiles file (`gui-profiles.json`, which
+  holds bearer invites) owner-only (`0600`, no symlink follow), matching the
+  temp-config write instead of the default umask.
+
+## [0.1.5-alpha.1] - 2026-07-23
+
+### Added
 - **Proteus - replay-based traffic shaping, the flagship Reality upgrade.**
   Reality makes the *connection* look real; Proteus makes the *flow* look real,
   replaying the exact wire envelope (record sizes, direction, timing) of a
@@ -141,143 +504,10 @@ then, pre-releases may make breaking changes between versions.
   invite).
 
 ### Changed
-- **A session now wears ONE cover class, chosen from the shared seed, instead of
-  a pooled mixture.** `read_profile` chained traces from every downstream class at
-  once, so a session's rate stepped phase-to-phase with whichever trace the
-  shuffle drew. Measured with the project's own 14-feature distinguisher over real
-  captures, that was decisively separable - it resembles neither a browsing
-  session nor a streaming one, because it is a chimera of the two:
-
-  | session construction | size axis | timing axis | pooled 16 windows |
-  |---|---|---|---|
-  | pooled vs real browse | **0.807** | **0.808** | **1.000** |
-  | pooled vs real video | **0.759** | - | **1.000** |
-  | one class vs its own reference | 0.511 / 0.517 | 0.506 / 0.510 | 0.532-0.599 |
-
-  Floor 0.552. Both endpoints sort the same directory names and derive the same
-  seed, so they choose alike and replay stays joint; coverage is unchanged, every
-  class is still worn, just whole-session. That is also closer to what a real user
-  does - watch a video OR read pages, not both in alternating four-second phases.
-  The earlier fix that excluded the UPSTREAM class was right but incomplete: the
-  defect is pooling classes of different rates at all.
-- **Tiers are gone.** `Tier` was a two-variant enum threaded through five
-  `keep_fresh_*` wrappers into a function that did nothing with it
-  (`let _ = tier;`); its only live use was supplying a default budget. Replaced by
-  `DEFAULT_MAX_GB_DAY` and `legacy_tier_budget`, with the `keep_fresh_*` family
-  collapsed from five entry points to three. Old configs keep working -
-  `lean`/`cheap`/`metered` resolve to 2.5 GB/day, `balanced`/`aggressive`/`max` to
-  6.0. Note `aggressive` was UNCAPPED and deliberately does not resolve to "no
-  limit": it measured no less detectable than lean and was the only setting that
-  produced a tunnel which would not come up.
-- Documentation now separates what the budget buys. Raising it lowers worst-case
-  latency for BROWSE cover; it does nothing for video, where the stall is one
-  segment long and a bigger budget only buys a fatter variant of the same stream.
-  README, the operator guide and `docs/proteus.md` all said otherwise.
-
 - The README now headlines Proteus as the flagship Reality upgrade; the feature
   and operator docs cover cover classes, paranoid mode, and the cover recorder.
-- **Proteus cover is selected for smoothness, not just cost.** `min(capacity,
-  demand)` is concave in capacity, so for a given budget the smoothest cover
-  delivers strictly the most - burstiness is pure loss rather than a trade
-  against detectability. The browse recorder's inter-page dwell is now bounded by
-  the tunnel's own latency ceiling (`max_gap_secs`, at 60% of it, leaving
-  headroom for the next page's time to first byte) and session length is governed
-  by target SPAN rather than page count, so the replay loop's period is preserved
-  while real pages replace artificial waiting. Measured on the chained timeline:
-  sustained 41.5 -> 124.7 KB/s, worst stall 14.28 -> 1.75 s, a 120 KB fetch's p90
-  10.64 -> 2.87 s. On a live cluster the same change took a 300-second window from
-  52 transfers with 12 failures to 123 with none, and the startup probe from 21 s
-  to 4 s.
-- Documentation now states plainly that throughput and cover cost are the same
-  quantity, 1:1, and that the low default speed is the BUDGET rather than the
-  design - browse cover sustains about 1 Mbit/s because web pages are small, while
-  real video cover reaches 5-25 Mbit/s at proportional cost. `proteus_max_gb_day`
-  is documented for the first time.
-
-### Fixed
-- **The ranged recorder's chunk size was a fixed 512 KiB, which is 26.5 seconds of
-  Bilibili's low-bitrate rendition against a 2 s latency ceiling.** Since
-  `Args::auto` sets `real_time`, this was the default in-daemon path: China's
-  video class could not produce an acceptable trace at all. A request now carries
-  one latency budget's worth of media (at 60% of the ceiling, leaving headroom for
-  the request's own time to first byte), derived from the bitrate rather than
-  fixed in bytes. Realtime Bilibili went from never completing to 1.9 s worst
-  stall, accepted first attempt.
-- **The recorder retried realtime video captures for a stall it could never
-  avoid.** Segment duration is a publisher property, so redrawing yields another
-  stream that stalls identically - measured on Aparat at 10.2 s, 13.3 s, 10.1 s
-  across three full 360 s recording budgets, about 18 minutes, before keeping the
-  trace anyway. Realtime video stalls now skip straight to keeping, and the
-  warning no longer advises raising the bandwidth budget, which would not have
-  helped. Turkey went from ~18 minutes per capture to 3:03.
-- **Aparat's progressive fallback was unreachable in the case it exists for.** The
-  HLS link was returned whenever it merely parsed, so the fallback only fired if
-  the field was absent - never when that signed redirector answered 400, which it
-  does. The candidate is now validated before use.
-- `telewebion.com` in the Iran browse pack answered NXDOMAIN from public DNS, so
-  the recorder lost a source every time it drew that entry. Replaced with
-  `divar.ir` and `zoomit.ir`.
-- **Two `mirage-cover-record` binaries were built, and which one shipped depended
-  on build order.** Cargo auto-discovered a stale 980-line standalone copy in
-  `crates/bridge/src/bin/` that had not been touched since v0.1.4-alpha.2 and knew
-  nothing about source packs, budgets or the upstream class; `cargo build` emitted
-  an output-filename collision warning that had gone unread.
-- `resolve_source` shuffled the whole video source list, so a custom `--sources`
-  list could lose to the global PeerTube fallback on a coin flip, contradicting
-  "an explicit list always wins over any preset". Sources are now grouped by
-  preference and shuffled only within a group.
-
-- **Cover acceptance measured gaps in one direction only.** `Cost` computed its
-  worst gap over downstream records while `paced_handshake_budget` correctly took
-  the worst over both, so nothing stopped a capture that supplies upstream from
-  being accepted with a minute-long upstream silence and then stalling every
-  handshake round trip. Captures now also report worst upstream gap and
-  time-to-first-token per direction, and are rejected on both. The asymmetry is
-  sharp in practice: this repo's video captures all have workable downstream gaps
-  (1.46-1.99 s) and mostly unusable upstream ones (2.45-5.37 s).
-- **Degenerate captures failed open.** A capture with no usable span yields an
-  all-zero `Cost`, and every acceptance ceiling is an upper bound, so it passed
-  the cost, latency and opening checks vacuously and was written to the library as
-  valid cover. Now rejected explicitly.
-- **Upstream-class captures were being worn as downstream cover.** Pointing the
-  downstream profile at a library root pooled every class subdir, including the
-  `upstream` class - which is recorded dense and gap-free to carry flow control,
-  making it a 2-3 second burst rather than a browsing session. It also made a
-  session's cover rate a lottery between classes (the same library produced
-  88.7 KiB/s of idle cover in one session and 125.3 KiB/s in another), which was
-  measured as a real activity signal: 0.663/0.683 separability against a matched
-  0.520/0.525 control. Excluding the class closes it: across four replicates each
-  the active-minus-control difference is +0.014 up and +0.008 down, which at these
-  variances is not significant. An upstream-only library still paces, since an
-  empty schedule hangs a session rather than degrading to unpaced.
-- **The censor-vantage harness could report a confident false positive.**
-  Randomised window assignment decorrelates the label from replay-loop position
-  across runs but not within one - each run still draws its own imbalance, about
-  `1/sqrt(15)` at 15 windows per class, and it is systematic within that run.
-  Measured with NO user traffic: one control scored 0.623 per window and grew to
-  an excess of +0.194 when 64 windows were pooled, while another stayed clean.
-  Windows are now emitted as matched PAIRS (one idle, one active, random order
-  within the pair) so adjacent windows sit at the same loop phase and it cancels.
-- Cover captures now also report worst upstream gap and time-to-first-token per
-  direction, so an operator reading a log can tell which ceiling a rejected
-  capture missed.
-
-### Removed
-- `crates/bridge/src/bin/mirage-cover-record.rs` - a stale standalone duplicate of
-  the recorder that Cargo auto-discovered as a second binary of the same name.
-- `mirage_cover::Tier`, `Args::auto_tier`, `keep_fresh_tier`,
-  `keep_fresh_tier_budget` and `keep_fresh_until`. Configuration is unaffected;
-  the legacy tier NAMES still parse via `legacy_tier_budget`.
-- `SourcePack::peertube_hosts` - superseded by `video_sources`, which returns
-  preference-ordered groups of `VideoSource` rather than a flat host list.
 
 ### Security
-- `event-listener` 5.4.1 -> 5.4.2, clearing RUSTSEC-2026-0221 (`StackSlot<'_, T>`
-  unconditionally implemented `Send`/`Sync`, allowing `!Send` tags to cross
-  thread boundaries). Reached only through the Slint desktop client's
-  zbus/ashpd portal stack, so it was eligible for a GUI-only ignore on the same
-  reasoning as the existing entries; a patched release existed, so it was
-  upgraded rather than ignored.
 - Admin web UI: the access token is no longer written to the structured log
   (console-only), so a log shipper cannot carry off a live credential; added
   anti-clickjacking headers (`X-Frame-Options: DENY`,
@@ -289,9 +519,28 @@ then, pre-releases may make breaking changes between versions.
   loopback-`Host` / DNS-rebinding check. It is additionally rate-limited
   server-side (one manual walk per 5s, `429` when throttled) so a local caller
   cannot spin the discovery loop into a rendezvous-query flood.
-- The desktop client writes its saved-profiles file (`gui-profiles.json`, which
-  holds bearer invites) owner-only (`0600`, no symlink follow), matching the
-  temp-config write instead of the default umask.
+
+## [0.1.4-alpha.2] - 2026-07-23
+
+*Reconstructed from the commit contents: this release was tagged without a
+changelog entry at the time.*
+
+### Added
+- Cover bandit (`crates/transport/src/cover_bandit.rs`) and `examples/flow_auc`
+  for scoring a captured pair.
+
+### Changed
+- Proteus engine development across `paced.rs`, `mirage-cover-record`, the mux
+  and the Shadowsocks transport.
+
+## [0.1.4-alpha.1] - 2026-07-22
+
+*Reconstructed: the initial public tree, which created this changelog. Entries
+for releases before it are below.*
+
+### Added
+- First release of the Proteus replay traffic shaper, alongside the initial
+  repository layout, CI, packaging and release workflows.
 
 ## [0.1.3-alpha.1] - 2026-07-21
 

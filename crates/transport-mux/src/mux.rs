@@ -64,7 +64,7 @@ pub enum MuxResult {
     /// Authenticated as `obfs-tcp`. The 64 auth bytes have been
     /// consumed from the stream. Caller hands directly to
     /// `session::accept`.
-    AuthenticatedObfsTcp(TcpStream),
+    AuthenticatedObfsTcp(mirage_transport_obfs::ObfsStream<TcpStream>),
 
     /// Authenticated as Shadowsocks-2022. Returns a [`DuplexStream`]
     /// wrapping the SS-2022 AEAD framing, plus the per-session Proteus pace seed
@@ -321,7 +321,16 @@ impl ProtocolMux {
                     // application data at byte 0.
                     let mut consume_buf = [0u8; 64];
                     stream.read_exact(&mut consume_buf).await?;
-                    return Ok(MuxResult::AuthenticatedObfsTcp(stream));
+                    // Everything after the knock is keystreamed. Without this
+                    // the session layer's cleartext header sat at a fixed
+                    // offset on every connection - measured `4D 49 01` ("MI",
+                    // MSG_TYPE_1) at byte 64 - which is a DPI memcmp, not a
+                    // statistical classifier. The tag doubles as the keystream
+                    // key: both ends already have it and it is per-connection
+                    // (it is keyed on the client's random nonce).
+                    return Ok(MuxResult::AuthenticatedObfsTcp(
+                        mirage_transport_obfs::obfs_wrap_server(stream, presented_tag, nonce),
+                    ));
                 }
                 trace!("mux: obfs-tcp nonce replay - falling through to next transport");
             } else {

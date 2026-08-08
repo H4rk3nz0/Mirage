@@ -22,6 +22,38 @@ use serde::{Deserialize, Serialize};
 /// separability floor for every measurement taken over it.
 pub const UPSTREAM_COVER_CLASS: &str = "upstream";
 
+/// Reduce a cover host (possibly `host:port`) to the single-component directory
+/// name used for target-conditioned replay: `<library-root>/<cover-host>/`.
+///
+/// Lives here for the same reason as [`UPSTREAM_COVER_CLASS`], and more urgently.
+/// `mirage-cover` WRITES that directory and `mirage-transport-reality` LOOKS FOR
+/// it; the two crates do not depend on each other, and the lookup fails open. A
+/// writer that sanitised even slightly differently from the reader would produce
+/// a library that silently never matches - which is indistinguishable, from the
+/// outside, from having no per-host traces at all, and degrades to the generic
+/// class with the flow no longer matching the host the carrier claims.
+///
+/// Strips the port, lowercases, and keeps only hostname characters, so the
+/// result can never contain a path separator. Inputs with no alphanumeric at all
+/// (`.`, `..`) yield an empty string rather than a traversal.
+#[must_use]
+pub fn sanitize_cover_host(host: &str) -> String {
+    let s: String = host
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+        .collect();
+    if s.chars().any(|c| c.is_ascii_alphanumeric()) {
+        s
+    } else {
+        String::new()
+    }
+}
+
 /// `proteus = true` | `proteus = "replay"` | `proteus = "browse"` | `proteus = false`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]

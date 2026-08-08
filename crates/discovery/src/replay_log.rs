@@ -91,15 +91,23 @@ impl PersistentReplayLog {
     pub fn open<P: AsRef<Path>>(path: P, fsync_every_write: bool) -> Result<Self, ReplayLogError> {
         let path = path.as_ref().to_path_buf();
         let already_exists = path.exists();
-        let mut f = OpenOptions::new()
-            .read(true)
+        // 0600 at create time. The replay log records session nonces - a plain
+        // record of connection activity, which a shared or seized bridge host
+        // should not expose to another local account. Measured before: 0644.
+        let mut opts = OpenOptions::new();
+        opts.read(true)
             .write(true)
             .create(true)
             // Preserve an existing log: when the file is already there we read
             // and verify its header + replay its entries below, so we must NOT
             // truncate on open. (Explicit per clippy::suspicious_open_options.)
-            .truncate(false)
-            .open(&path)?;
+            .truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&path)?;
         if already_exists {
             // Read and verify the header.
             let mut hdr = [0u8; MRRL_HEADER_LEN];
@@ -252,11 +260,17 @@ impl PersistentReplayLog {
         compact_path.set_file_name(file_name);
 
         {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&compact_path)?;
+            // Compaction rewrites the log through a fresh file, so it needs the
+            // same 0600 as `open` - otherwise the first compaction silently
+            // restores the default-umask 0644 that `open` was fixed to avoid.
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&compact_path)?;
             write_header(&mut f)?;
             let mut bw = BufWriter::new(&mut f);
             for (tid, exp) in entries {
