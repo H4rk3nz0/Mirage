@@ -40,6 +40,86 @@ use crate::target::{MuxTarget, TargetError};
 use std::collections::{HashMap, VecDeque};
 use thiserror::Error;
 
+/// Interleave queued frames fairly across streams, deficit round-robin.
+///
+/// WHY
+///
+/// The outbound queue is a single FIFO, so a bulk transfer that enqueues a run of
+/// full-size frames puts every other stream behind all of them. On an ordinary
+/// link the delay is absorbed; under a PACED carrier the service rate is fixed by
+/// the cover envelope, so head-of-line blocking is the difference between a
+/// usable tunnel and one where a page load stalls behind a download.
+///
+/// This is one of the very few changes that costs **exactly zero divergence**:
+/// which stream's bytes fill a frame is inside the AEAD, so the emitted record
+/// sizes and timings are byte-identical either way. Only the choice of which
+/// queued byte fills a given token changes.
+///
+/// INVARIANT: order WITHIN a stream is preserved exactly. Reordering across
+/// streams is free, but `Begin` must precede that stream's `Data` and `EndLocal`
+/// must follow it - so frames are grouped per stream, each group stays in queue
+/// order, and only the interleaving of groups changes.
+///
+/// Control frames (empty body) are charged 1 byte rather than 0 so a stream
+/// cannot emit an unbounded run of them within one round.
+fn deficit_round_robin(frames: Vec<MuxFrame>, quantum: usize) -> Vec<MuxFrame> {
+    // quantum 0 restores strict FIFO; <2 frames has no ordering to change.
+    if quantum == 0 || frames.len() < 2 {
+        return frames;
+    }
+    let mut order: Vec<u32> = Vec::new();
+    let mut queues: HashMap<u32, VecDeque<MuxFrame>> = HashMap::new();
+    for f in frames {
+        let q = queues.entry(f.stream_id).or_default();
+        if q.is_empty() {
+            order.push(f.stream_id);
+        }
+        q.push_back(f);
+    }
+    // A single stream has nothing to interleave; return it untouched rather than
+    // paying the round-robin walk.
+    if order.len() < 2 {
+        return order
+            .first()
+            .and_then(|s| queues.remove(s))
+            .map(Vec::from)
+            .unwrap_or_default();
+    }
+
+    let mut deficit: HashMap<u32, usize> = order.iter().map(|&s| (s, 0usize)).collect();
+    let mut active: VecDeque<u32> = order.into_iter().collect();
+    let mut out: Vec<MuxFrame> = Vec::new();
+
+    while let Some(sid) = active.pop_front() {
+        let Some(q) = queues.get_mut(&sid) else {
+            continue;
+        };
+        if q.is_empty() {
+            continue;
+        }
+        let d = deficit.entry(sid).or_insert(0);
+        *d += quantum;
+        while let Some(front) = q.front() {
+            let cost = front.body.len().max(1);
+            if cost > *d {
+                break;
+            }
+            *d -= cost;
+            if let Some(f) = q.pop_front() {
+                out.push(f);
+            }
+        }
+        if q.is_empty() {
+            *d = 0;
+        } else {
+            // Still owed: requeue. A frame larger than one quantum accumulates
+            // credit over successive rounds, so this always terminates.
+            active.push_back(sid);
+        }
+    }
+    out
+}
+
 /// Per-stream state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamState {
@@ -526,7 +606,8 @@ impl MuxState {
     /// Drain the queued outbound frames. Caller writes each to the
     /// inner session.
     pub fn pending_outbound(&mut self) -> Vec<MuxFrame> {
-        self.outbound.drain(..).collect()
+        let drained: Vec<MuxFrame> = self.outbound.drain(..).collect();
+        deficit_round_robin(drained, self.policy.drr_quantum_bytes)
     }
 
     /// Number of frames currently waiting in the outbound queue.
@@ -580,6 +661,100 @@ pub enum MuxEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::{MAX_MUX_FRAME_LEN, MUX_HEADER_LEN};
+
+    fn data(stream_id: u32, n: usize) -> MuxFrame {
+        MuxFrame::new(stream_id, MuxCmd::Data, vec![0u8; n]).expect("frame")
+    }
+
+    /// A bulk stream must not push an interactive stream to the back of the queue.
+    ///
+    /// This is the head-of-line problem the single FIFO created. It matters far
+    /// more under a paced carrier than on an ordinary link: the service rate is
+    /// fixed by the cover envelope, so a delayed frame is not caught up later - a
+    /// page load simply stalls behind a download for as long as the download runs.
+    #[test]
+    fn a_bulk_stream_does_not_starve_an_interactive_one() {
+        // Stream 1 dumps 20 full frames; stream 3 has 2 small ones enqueued after.
+        let mut frames: Vec<MuxFrame> = (0..20).map(|_| data(1, 4096)).collect();
+        frames.push(data(3, 40));
+        frames.push(data(3, 40));
+
+        // FIFO (quantum 0): stream 3 waits behind every bulk frame.
+        let fifo = deficit_round_robin(frames.clone(), 0);
+        let fifo_first_3 = fifo.iter().position(|f| f.stream_id == 3).expect("present");
+        assert_eq!(
+            fifo_first_3, 20,
+            "FIFO puts the interactive stream dead last"
+        );
+
+        // DRR: it is served within the first couple of frames.
+        let drr = deficit_round_robin(frames, 4096);
+        let drr_first_3 = drr.iter().position(|f| f.stream_id == 3).expect("present");
+        assert!(
+            drr_first_3 <= 2,
+            "interactive stream must be served promptly, got position {drr_first_3}"
+        );
+        assert_eq!(drr.len(), 22, "no frame may be dropped or duplicated");
+    }
+
+    /// Reordering across streams is free; reordering WITHIN a stream is a
+    /// protocol violation - `Begin` must precede that stream's `Data`, and
+    /// `EndLocal` must follow it.
+    #[test]
+    fn intra_stream_order_is_preserved_exactly() {
+        let mut frames = vec![
+            MuxFrame::new(1, MuxCmd::Begin, ipv4_target().encode().unwrap()).unwrap(),
+            data(1, 4096),
+            data(1, 4096),
+            MuxFrame::new(1, MuxCmd::EndLocal, vec![]).unwrap(),
+        ];
+        frames.insert(
+            1,
+            MuxFrame::new(3, MuxCmd::Begin, ipv4_target().encode().unwrap()).unwrap(),
+        );
+        frames.push(data(3, 100));
+
+        let out = deficit_round_robin(frames, 4096);
+        for sid in [1u32, 3] {
+            let got: Vec<MuxCmd> = out
+                .iter()
+                .filter(|f| f.stream_id == sid)
+                .map(|f| f.command)
+                .collect();
+            let want: Vec<MuxCmd> = match sid {
+                1 => vec![MuxCmd::Begin, MuxCmd::Data, MuxCmd::Data, MuxCmd::EndLocal],
+                _ => vec![MuxCmd::Begin, MuxCmd::Data],
+            };
+            assert_eq!(got, want, "stream {sid} order changed");
+        }
+    }
+
+    /// A frame larger than one quantum must still be emitted, not spin forever.
+    ///
+    /// Bounded by construction: `MuxFrame::new` refuses a body over
+    /// `MAX_MUX_FRAME_LEN`, so the worst case is one frame of ~16 KiB needing
+    /// ceil(16384/quantum) rounds to accumulate enough credit.
+    #[test]
+    fn an_oversized_frame_accumulates_credit_and_terminates() {
+        let big = MAX_MUX_FRAME_LEN - MUX_HEADER_LEN;
+        let frames = vec![data(1, big), data(3, 10)];
+        let out = deficit_round_robin(frames, 1024);
+        assert_eq!(out.len(), 2, "both frames emitted");
+        // The small stream goes first - it fits inside one quantum while the
+        // large one is still accumulating.
+        assert_eq!(out[0].stream_id, 3);
+    }
+
+    /// A single stream must come back untouched - no cost, no reordering.
+    #[test]
+    fn a_single_stream_is_returned_unchanged() {
+        let frames: Vec<MuxFrame> = (0..8).map(|i| data(1, 100 + i)).collect();
+        let out = deficit_round_robin(frames.clone(), 4096);
+        let sizes: Vec<usize> = out.iter().map(|f| f.body.len()).collect();
+        let want: Vec<usize> = frames.iter().map(|f| f.body.len()).collect();
+        assert_eq!(sizes, want);
+    }
 
     fn ipv4_target() -> MuxTarget {
         MuxTarget::Ipv4 {

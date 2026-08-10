@@ -68,12 +68,16 @@ pub use carrier::{
 pub use cover_probe::{probe_cover_flight, CoverFlightProfile, DEFAULT_COVER_FLIGHT_WIRE_LEN};
 pub use error::RealityError;
 pub use paced::{
-    fragment_to_mtu, maybe_pace, maybe_pace_stream, min_positive_gap, pace_profile,
-    pace_profile_up, pace_schedule, pace_wire_sizes, paced_handshake_budget, pacing_active,
-    resolve_profile_match, set_pace_override, Carrier, MaybePaced, PacedChannel, ProfileMatch,
-    PACE_ENV, PACE_PROFILE_ENV, PACE_PROFILE_UP_ENV,
+    configured_schedule_is_tiled, cover_gap_secs, cover_upstream_bps, fragment_to_mtu, maybe_pace,
+    maybe_pace_stream, min_positive_gap, pace_profile, pace_profile_up, pace_schedule,
+    pace_wire_sizes, paced_handshake_budget, pacing_active, resolve_profile_match,
+    schedule_is_tiled, set_pace_override, tiled_direction, Carrier, MaybePaced, PacedChannel,
+    ProfileMatch, PACE_ENV, PACE_PROFILE_ENV, PACE_PROFILE_UP_ENV,
 };
-pub use pacer::{MeasuredProfile, ReplayPosition, ScheduleStream};
+pub use pacer::{
+    CarrierEmit, CarrierEmitter, CarrierSchedule, CarrierSet, ClassifiedStream, DeficitPermuter,
+    HeteroCarrierSet, MeasuredProfile, ReplayPosition, ScheduleStream, StreamClass,
+};
 pub use probe::{
     build_probe, derive_probe_root, probe_epoch, verify_probe, BridgeProbeInputs,
     ClientProbeInputs, Probe, NONCE_LEN, PROBE_EPOCH_SECONDS, PROBE_ROOT_DISABLED, SESSION_ID_LEN,

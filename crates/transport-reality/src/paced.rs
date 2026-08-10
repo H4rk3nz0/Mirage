@@ -650,6 +650,48 @@ impl PacedChannel {
     /// generative or replay [`ScheduleStream`]). `dir` is this side's write direction
     /// (client -> `Up`, bridge -> `Down`). `carrier` names the framing `inner` adds
     /// per record, which is what the pump sizes its frames against.
+    /// Wrap `inner` and drive it from ONE carrier of a heterogeneous set.
+    ///
+    /// This is the live-path entry point for the multi-carrier work. The caller
+    /// holds the [`HeteroCarrierSet`](crate::pacer::HeteroCarrierSet) for the
+    /// session, asks it for the carriers serving a stream's class, and spawns one
+    /// `PacedChannel` per carrier.
+    ///
+    /// Every contract the carrier model pins survives this call, because the
+    /// schedule is passed as DATA and the channel adds no inputs of its own:
+    ///
+    /// - no ambient clock enters here - the write pump paces off the schedule's
+    ///   own instants, exactly as it does for any other `ScheduleStream`;
+    /// - backpressure on `inner` cannot reach the schedule, because the schedule
+    ///   is fully determined before the first byte moves;
+    /// - the carrier is chosen by the stream's class, which
+    ///   [`ClassifiedStream`](crate::pacer::ClassifiedStream) fixes at accept and
+    ///   offers no way to change.
+    pub fn spawn_for_carrier<S>(
+        inner: S,
+        schedule: &crate::pacer::CarrierSchedule,
+        seed: u64,
+        dir: Dir,
+        carrier: Carrier,
+    ) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        Self::spawn(
+            inner,
+            ScheduleStream::for_carrier(schedule, seed),
+            dir,
+            carrier,
+        )
+    }
+
+    /// Wrap `inner` (the carrier stream, with record passthrough enabled so one
+    /// frame maps to one record) and spawn the write pump driven by `stream`.
+    ///
+    /// `dir` is this side's write direction (client -> `Up`, bridge -> `Down`).
+    /// `carrier` names the framing `inner` adds per record, which is what the pump
+    /// sizes its frames against. For the multi-carrier path use
+    /// [`Self::spawn_for_carrier`], which supplies the stream from a capture.
     pub fn spawn<S>(inner: S, stream: ScheduleStream, dir: Dir, carrier: Carrier) -> Self
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -1346,6 +1388,163 @@ fn merge_directional(down_csv: &str, up_csv: &str) -> String {
         out.push_str(&format!("0,{t},{sz},{d}\n"));
     }
     out
+}
+
+/// Smallest exact period of a sequence, if it is built from a repeated block.
+///
+/// KMP failure function: the shortest period is `n - failure[n-1]`, and it is a
+/// TRUE period only when it divides `n` evenly. Exact equality is deliberate -
+/// this is looking for a block that was literally copied, not for approximate
+/// self-similarity, so it cannot fire on real traffic that merely looks regular.
+fn smallest_exact_period<T: PartialEq>(xs: &[T]) -> Option<usize> {
+    let n = xs.len();
+    if n < 4 {
+        return None;
+    }
+    let mut fail = vec![0usize; n];
+    let mut k = 0usize;
+    for i in 1..n {
+        while k > 0 && xs[i] != xs[k] {
+            k = fail[k - 1];
+        }
+        if xs[i] == xs[k] {
+            k += 1;
+        }
+        fail[i] = k;
+    }
+    let p = n - fail[n - 1];
+    (p < n && n % p == 0).then_some(p)
+}
+
+/// Does this schedule contain a periodically TILED direction?
+///
+/// `merge_directional` builds an upstream schedule by repeating a whole capture
+/// end to end across the downstream span. That leaves the upstream record-size
+/// sequence exactly periodic, which is a **deterministic single-flow signature**:
+/// one FFT of upstream inter-record gaps, or one period check like this, finds it
+/// with no reference class, no population statistics and no threshold to tune. It
+/// is the kind of detector a censor can run at line rate on every flow.
+///
+/// That makes it a different class of defect from everything else in the shaping
+/// design, which are statistical-accumulation problems where the adversary needs
+/// N observations and the argument is about the constant. Here N = 1.
+///
+/// Returns the repeated block length, per direction, when found.
+#[must_use]
+pub fn tiled_direction(csv: &str) -> Option<(bool, usize)> {
+    let rows = concat_flows(parse_rows(csv));
+    for want_down in [false, true] {
+        let sizes: Vec<i64> = rows
+            .iter()
+            .filter(|(_, _, d)| if want_down { *d > 0 } else { *d < 0 })
+            .map(|(_, sz, _)| *sz)
+            .collect();
+        if let Some(p) = smallest_exact_period(&sizes) {
+            // A block repeated only twice can occur by chance in a short capture;
+            // three or more repeats of an identical multi-record block does not.
+            if sizes.len() / p >= 3 && p >= 2 {
+                return Some((want_down, p));
+            }
+        }
+    }
+    None
+}
+
+/// The configured cover's sustainable UPSTREAM rate, bytes/sec.
+///
+/// This is `μ` — the service rate the tunnel actually has, fixed by the envelope
+/// rather than by the link. Exposed as a value for the same reason
+/// [`crate::pacer::ScheduleStream::replay_position`] is: a caller that needs the
+/// rate must read the schedule's real one, not a config constant. The two agree
+/// right up until the trace varies, which is exactly when the number matters.
+///
+/// Callers should throttle to `ρ_max · μ`, not `μ`. Queue delay is `ρ/(μ(1−ρ))`:
+/// at ρ=0.85 that is ~5.7/μ, at ρ=0.95 it is ~19/μ and climbing. The last 15% of
+/// nominal capacity costs roughly 3× the latency and cannot be sustained anyway.
+#[must_use]
+pub fn cover_upstream_bps() -> Option<f64> {
+    let (mode, profile, profile_up) = pace_settings();
+    mode.as_deref()?;
+    let down = read_profile(&profile?, 0, None)?;
+    let csv = match profile_up.as_deref().and_then(|u| read_profile(u, 0, None)) {
+        Some(up) => merge_directional(&down, &up),
+        None => down,
+    };
+    let (_tokens, bps) = upstream_capacity(&csv);
+    (bps > 0.0).then_some(bps)
+}
+
+/// The configured cover's UPSTREAM inter-record gap at a quantile, in seconds.
+///
+/// This is the statistic that actually bounds a tunnel's queue delay, and it is
+/// the only one of five candidates that survived measurement. Record-size CV,
+/// mean rate, duty cycle and idle fraction were each measured across four real
+/// cover classes and each ranked them differently - see
+/// `docs/proteus-2.0.md`. They are all statements about the cover's
+/// DISTRIBUTION; the gap bound is a statement about the tunnel's QUEUE, which is
+/// what a user experiences. Buffered video and segmented HLS have similar idle
+/// fractions (94% vs 81%) and worst gaps of 15 s versus 0.9 s.
+///
+/// Quantile rather than max: the maximum is one observation and would size every
+/// buffer for an outlier.
+#[must_use]
+pub fn cover_gap_secs(quantile: f64) -> Option<f64> {
+    let (mode, profile, profile_up) = pace_settings();
+    mode.as_deref()?;
+    let down = read_profile(&profile?, 0, None)?;
+    let csv = match profile_up.as_deref().and_then(|u| read_profile(u, 0, None)) {
+        Some(up) => merge_directional(&down, &up),
+        None => down,
+    };
+    // Concatenated: the raw chain restarts t at every trace boundary, so a seam
+    // would read as a negative gap and the whole chain as one trace's span.
+    let rows = concat_flows(parse_rows(&csv));
+    let mut gaps: Vec<f64> = Vec::new();
+    let mut prev: Option<f64> = None;
+    for &(t, _, _) in rows.iter().filter(|(_, _, d)| *d < 0) {
+        if let Some(p) = prev {
+            let g = t - p;
+            if g > 0.0 {
+                gaps.push(g);
+            }
+        }
+        prev = Some(t);
+    }
+    if gaps.is_empty() {
+        return None;
+    }
+    gaps.sort_by(f64::total_cmp);
+    let idx = ((quantile.clamp(0.0, 1.0) * gaps.len() as f64) as usize).min(gaps.len() - 1);
+    Some(gaps[idx])
+}
+
+/// Run [`tiled_direction`] over the schedule a given profile PAIR would produce.
+///
+/// Pure in its inputs on purpose. The obvious spelling reads the process-global
+/// pacing state, and a test against that state is flaky by construction - this
+/// file already lost one test that way. The global-reading wrapper is
+/// [`configured_schedule_is_tiled`]; the logic under test is here.
+#[must_use]
+pub fn schedule_is_tiled(down_csv: &str, up_csv: Option<&str>) -> Option<(bool, usize)> {
+    let csv = match up_csv {
+        Some(up) => merge_directional(down_csv, up),
+        None => down_csv.to_string(),
+    };
+    tiled_direction(&csv)
+}
+
+/// [`schedule_is_tiled`] against whatever profile is currently configured.
+///
+/// Checks the bytes that will actually be replayed, not the config that was
+/// requested - the two differ whenever `merge_directional` is involved, which is
+/// exactly the case this exists to catch.
+#[must_use]
+pub fn configured_schedule_is_tiled() -> Option<(bool, usize)> {
+    let (mode, profile, profile_up) = pace_settings();
+    mode.as_deref()?;
+    let down = read_profile(&profile?, 0, None)?;
+    let up = profile_up.as_deref().and_then(|u| read_profile(u, 0, None));
+    schedule_is_tiled(&down, up.as_deref())
 }
 
 /// The replay profile's on-wire record sizes and typical gap for ONE direction.
@@ -2554,6 +2753,107 @@ mod tests {
         assert_eq!(rows.len(), 2, "exactly the two real rows, got {rows:?}");
         assert_eq!(rows[0], (0, 0.0, 517, 1));
         assert_eq!(rows[1], (0, 0.25, 1200, -1));
+    }
+
+    /// A tiled direction must be detected, and ordinary cover must not trip it.
+    ///
+    /// This is the one defect in the shaping design that is NOT a statistical
+    /// accumulation problem. Every other divergence argument is about how many
+    /// observations a censor needs and what the constant is. An exactly repeated
+    /// upstream block is a single-flow deterministic signature - one period check
+    /// or one FFT, no reference class, no threshold - and it shipped inside the
+    /// configuration the operator docs recommended.
+    #[test]
+    fn a_periodically_tiled_direction_is_detected() {
+        // Ordinary two-way cover: no repeated block. Must NOT fire.
+        let mut natural = String::from("t,size,dir\n");
+        for i in 0..60 {
+            natural.push_str(&format!(
+                "{:.3},{},1\n",
+                i as f64 * 0.05,
+                900 + (i * 37) % 400
+            ));
+            natural.push_str(&format!(
+                "{:.3},{},-1\n",
+                i as f64 * 0.05 + 0.01,
+                60 + (i * 17) % 90
+            ));
+        }
+        assert_eq!(
+            tiled_direction(&natural),
+            None,
+            "natural cover must not be flagged - a false positive here would refuse good profiles"
+        );
+
+        // What `merge_directional` produces: one upstream block, repeated.
+        let block: [i64; 5] = [120, 88, 143, 99, 210];
+        let mut tiled = String::from("t,size,dir\n");
+        for i in 0..60 {
+            tiled.push_str(&format!(
+                "{:.3},{},1\n",
+                i as f64 * 0.05,
+                900 + (i * 37) % 400
+            ));
+        }
+        for rep in 0..8 {
+            for (j, sz) in block.iter().enumerate() {
+                let t = rep as f64 * 0.37 + j as f64 * 0.01;
+                tiled.push_str(&format!("{t:.3},{sz},-1\n"));
+            }
+        }
+        let hit = tiled_direction(&tiled).expect("a tiled upstream must be detected");
+        assert!(!hit.0, "the UPSTREAM is the tiled direction here");
+        assert_eq!(hit.1, block.len(), "reports the repeated block length");
+
+        // The period finder itself, at its boundary: two repeats is not enough
+        // evidence, three is.
+        assert_eq!(smallest_exact_period(&[1, 2, 3, 1, 2, 3]), Some(3));
+        assert_eq!(smallest_exact_period(&[1, 2, 3, 4, 5, 6]), None);
+        // A period that does not divide the length evenly is not a true period.
+        assert_eq!(smallest_exact_period(&[1, 2, 1, 2, 1]), None);
+    }
+
+    /// The check must catch what `merge_directional` ACTUALLY builds.
+    ///
+    /// `a_periodically_tiled_direction_is_detected` tests the detector against a
+    /// hand-written tiled sequence - which passes even if `merge_directional`
+    /// stops tiling, or tiles differently, or the two are wired together wrongly.
+    /// This drives the real merge path, so it fails if the plumbing breaks rather
+    /// than only if the mathematics does.
+    #[test]
+    fn the_real_merge_path_produces_a_schedule_the_check_catches() {
+        // A downstream capture with no internal repetition.
+        let mut down = String::from("t,size,dir\n");
+        for i in 0..80 {
+            down.push_str(&format!(
+                "{:.3},{},1\n",
+                i as f64 * 0.05,
+                800 + (i * 53) % 500
+            ));
+        }
+        // A SHORT upstream capture from a different flow - the configuration the
+        // operator docs used to recommend. `merge_directional` tiles this across
+        // the downstream span.
+        let mut up = String::from("t,size,dir\n");
+        for (j, sz) in [110i64, 74, 156, 92].iter().enumerate() {
+            up.push_str(&format!("{:.3},{sz},-1\n", j as f64 * 0.02));
+        }
+
+        // One profile: nothing to tile, must stay clean.
+        assert_eq!(
+            schedule_is_tiled(&down, None),
+            None,
+            "a single joint capture must never be flagged"
+        );
+
+        // Split profiles: the merge tiles, and the check must see it.
+        let hit = schedule_is_tiled(&down, Some(&up))
+            .expect("merge_directional tiles the upstream; the check must catch it");
+        assert!(!hit.0, "the tiled direction is UPSTREAM");
+        assert_eq!(
+            hit.1, 4,
+            "block length is the upstream capture's record count"
+        );
     }
 
     /// The fallback to generic cover must be REPORTABLE, not merely correct.

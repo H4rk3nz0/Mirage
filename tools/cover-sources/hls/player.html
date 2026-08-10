@@ -1,0 +1,133 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>cover-source: segmented video at library defaults</title>
+<!--
+  Plays one HLS stream with one of two players, AT LIBRARY DEFAULTS, and reports
+  what it actually did.
+
+    player.html?player=hlsjs&secs=60
+    player.html?player=shaka&secs=60
+
+  WHY TWO PLAYERS. The gap structure of segmented video is a PLAYER-IMPLEMENTATION
+  property, not a protocol one. Some players fetch aggressively to fill a large
+  buffer then idle - which is the buffered-video structure returning, a different
+  cover class - while others fetch on segment cadence regardless of buffer depth.
+  The cover story is "a browser playing video", so the population includes whichever
+  players are actually deployed. One player is an anecdote.
+
+  WHY DEFAULTS. The earlier capture set hls.js `maxBufferLength: 10`; the library
+  default is 30. That capture therefore measured a configuration nobody runs, and
+  its 877 ms worst gap was a property of that setting. This page sets NO buffer
+  knobs at all and reports the values the library chose, read back from the
+  instance rather than asserted here - an asserted default is just another
+  hand-written constant.
+
+  THE GUARD. A headless video capture fails silently in several ways that all look
+  like success: autoplay blocked, stream 404, player falling back to a single
+  low-bitrate rendition, or the page loading and never playing. Each produces a
+  clean-looking capture of nothing, which is this project's recurring defect. So
+  this page ends in either VERDICT:OK with the observed numbers, or VERDICT:FAIL
+  with the reason, and the runner treats anything else as a failed run.
+-->
+<style>
+  body { font: 13px/1.5 monospace; margin: 1rem; }
+  video { width: 320px; background: #000; }
+  #log { white-space: pre-wrap; }
+</style>
+<video id="v" muted playsinline></video>
+<div id="log"></div>
+<script src="hls.min.js"></script>
+<script src="shaka-player.compiled.js"></script>
+<script>
+const q = new URLSearchParams(location.search);
+const WHICH = q.get("player") || "hlsjs";
+const SECS = parseInt(q.get("secs") || "60", 10);
+const STREAM = q.get("stream") || "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8";
+
+const out = [];
+function say(s) {
+  out.push(s);
+  document.getElementById("log").textContent = out.join("\n");
+  console.log(s);
+}
+
+// Segment fetches, observed rather than inferred. PerformanceObserver sees every
+// network request the player makes, including the ones the player's own event
+// callbacks would miss on error paths.
+const fetches = [];
+try {
+  new PerformanceObserver((list) => {
+    for (const e of list.getEntries()) {
+      if (/\.(ts|m4s|mp4|aac|m3u8|mpd)(\?|$)/.test(e.name)) {
+        fetches.push({ t: e.startTime / 1000, dur: e.duration / 1000, name: e.name });
+      }
+    }
+  }).observe({ entryTypes: ["resource"] });
+} catch (e) { say("WARN: PerformanceObserver unavailable: " + e); }
+
+const v = document.getElementById("v");
+
+function finish(ok, reason) {
+  // Gaps BETWEEN segment fetch starts - the quantity the cover-class work needs.
+  const starts = fetches.filter(f => !/\.(m3u8|mpd)(\?|$)/.test(f.name))
+                        .map(f => f.t).sort((a, b) => a - b);
+  const gaps = [];
+  for (let i = 1; i < starts.length; i++) gaps.push(starts[i] - starts[i - 1]);
+  gaps.sort((a, b) => a - b);
+  const q99 = gaps.length ? gaps[Math.min(gaps.length - 1, Math.floor(gaps.length * 0.99))] : null;
+  const summary = {
+    player: WHICH,
+    config_readback: window.__cfg || null,   // what the LIBRARY chose, not what we set
+    played_s: +v.currentTime.toFixed(2),
+    segment_fetches: starts.length,
+    manifest_fetches: fetches.length - starts.length,
+    gap_max_s: gaps.length ? +gaps[gaps.length - 1].toFixed(3) : null,
+    gap_p99_s: q99 === null ? null : +q99.toFixed(3),
+    gap_median_s: gaps.length ? +gaps[Math.floor(gaps.length / 2)].toFixed(3) : null,
+    buffered_end_s: v.buffered.length ? +v.buffered.end(v.buffered.length - 1).toFixed(2) : 0,
+  };
+  say("SUMMARY:" + JSON.stringify(summary));
+  say(ok ? "VERDICT:OK" : "VERDICT:FAIL " + reason);
+  document.title = ok ? "DONE-OK" : "DONE-FAIL";
+}
+
+// The guard: playback must genuinely advance and segments must genuinely be
+// fetched. Either alone can be satisfied by a broken run.
+function check() {
+  if (v.currentTime < SECS * 0.5) return finish(false, `playback advanced only ${v.currentTime.toFixed(1)}s of ${SECS}s`);
+  const segs = fetches.filter(f => !/\.(m3u8|mpd)(\?|$)/.test(f.name)).length;
+  if (segs < 3) return finish(false, `only ${segs} segment fetches observed`);
+  finish(true, "");
+}
+
+if (WHICH === "hlsjs") {
+  if (!window.Hls || !Hls.isSupported()) { finish(false, "hls.js unsupported"); }
+  else {
+    // NO configuration object. Defaults are the point of this capture.
+    const hls = new Hls();
+    window.__cfg = { maxBufferLength: hls.config.maxBufferLength,
+                     maxMaxBufferLength: hls.config.maxMaxBufferLength,
+                     maxBufferSize: hls.config.maxBufferSize };
+    say("hls.js defaults: " + JSON.stringify(window.__cfg));
+    hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) finish(false, "hls.js fatal: " + d.details); });
+    hls.loadSource(STREAM);
+    hls.attachMedia(v);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(e => finish(false, "play() rejected: " + e)));
+  }
+} else {
+  shaka.polyfill.installAll();
+  if (!shaka.Player.isBrowserSupported()) { finish(false, "shaka unsupported"); }
+  else {
+    const p = new shaka.Player(v);
+    const c = p.getConfiguration().streaming;
+    window.__cfg = { bufferingGoal: c.bufferingGoal, rebufferingGoal: c.rebufferingGoal,
+                     bufferBehind: c.bufferBehind };
+    say("shaka defaults: " + JSON.stringify(window.__cfg));
+    p.addEventListener("error", e => finish(false, "shaka error: " + (e.detail && e.detail.code)));
+    p.load(STREAM).then(() => v.play().catch(e => finish(false, "play() rejected: " + e)))
+                  .catch(e => finish(false, "shaka load failed: " + (e && e.code)));
+  }
+}
+
+setTimeout(check, (SECS + 12) * 1000);
+</script>

@@ -1556,6 +1556,22 @@ fn apply_paranoid_bridge(config: &mut BridgeConfig, start_sourcing: bool) {
     mirage_transport_reality::set_pace_override(mode, Some(profile), profile_up);
 }
 
+/// Host part of a `host:port` string, tolerating a bare host and bracketed IPv6.
+///
+/// Splits on the LAST colon so `[::1]:443` yields `[::1]`, and returns the whole
+/// input unchanged when there is no port to strip.
+fn host_of(addr: &str) -> &str {
+    match addr.rsplit_once(':') {
+        Some((h, _)) if !h.is_empty() => h,
+        _ => addr,
+    }
+}
+
+/// Do two `host:port` strings name the same host, ignoring port and case?
+fn same_host(a: &str, b: &str) -> bool {
+    host_of(a).eq_ignore_ascii_case(host_of(b))
+}
+
 #[tokio::main]
 async fn main() {
     match harden_process() {
@@ -1689,6 +1705,94 @@ async fn main() {
             config.shadow_target = Some(cover);
         }
     }
+    // The SAME argument, for the HTTP decoy - and here it is measured rather than
+    // reasoned. Probing a bridge with 17 TLS/HTTP classes and comparing its own
+    // per-class latencies TO EACH OTHER (scripts/probe-suite/partition.py) splits
+    // them into two clusters whenever some class is answered locally:
+    //
+    //   http_shadow_target      http11 bytes   http11 timing   gap stat G
+    //   unset                     0 vs 0        21.3 / 33.4    10.74  p=0.0002
+    //   example.com:80          406 vs 0        13.5 / 32.4    10.90  p=0.0002
+    //   <cover host>:80         173 vs 0        32.0 / 31.9     0.23  p=1.0
+    //   <cover host>:443          0 vs 0        32.0 / 31.9     0.47  p=0.9993
+    //
+    // Row 2 is why "point it at a plaintext-HTTP server", which is all the old
+    // warning asked for, is not the fix: it moves the outlier from 21.3 ms to
+    // 13.5 ms and leaves the partition exactly as detectable. The observable was
+    // never "does this answer HTTP plausibly"; it is "does this cost what the
+    // cover host costs", and only a decoy at the cover host's own distance pays
+    // the right price.
+    //
+    // Row 3 is why the port matters too, and it is a tell this project INTRODUCED
+    // by fixing the timing one. The cover's :443 returns nothing to a plaintext
+    // GET - it is a TLS port. Its :80 returns a real 301. So forwarding to :80
+    // closed the timing partition and opened a 173-vs-0 BYTE channel, which is
+    // the worse of the two: bytes are categorical, so they need no timing
+    // resolution and no repeated sampling.
+    //
+    // Row 4 is the answer, and it is the same principle as the rest of the probe
+    // design: FORWARD, DO NOT EMULATE. Send failed HTTP probes to the cover host's
+    // own TLS port and the genuine host produces both the silence and the round
+    // trip, because it is the genuine host doing it. Measured 0-vs-0 bytes,
+    // 32.0-vs-31.9 ms, partition still collapsed.
+    //
+    // So the default is the cover address VERBATIM - not the cover host on :80.
+    if config.http_shadow_target.is_none() {
+        if let Some(cover) = config.reality_cover_addr.clone() {
+            info!(
+                decoy = %cover,
+                "http_shadow_target unset; defaulting it to reality_cover_addr so failed \
+                 HTTP probes are answered by the host this bridge claims to be, at that \
+                 host's own distance. Forwarding them to the cover's port 80 instead \
+                 closes the timing tell but opens a byte one (measured 173 vs 0 bytes), \
+                 because a TLS port returns nothing to a plaintext GET."
+            );
+            config.http_shadow_target = Some(cover);
+        }
+    }
+    // Set, but pointed somewhere other than the host this bridge claims to be.
+    // This is the measured failure in row 2 and it produces NO other warning: the
+    // checks below fire on absence and on protocol mismatch, never on distance.
+    if let (Some(http_sh), Some(cover)) = (
+        config.http_shadow_target.as_deref(),
+        config.reality_cover_addr.as_deref(),
+    ) {
+        let cover_host = host_of(cover);
+        if !same_host(http_sh, cover) {
+            warn!(
+                http_shadow_target = %http_sh,
+                cover_host = %cover_host,
+                "http_shadow_target is a different host from reality_cover_addr. Failed HTTP \
+                 probes will then pay THAT host's round trip while TLS probes pay the cover \
+                 host's, and the difference partitions this bridge's probe classes without \
+                 the prober needing any reference capture (measured G=10.9, p=0.0002; using \
+                 the cover host gave G=0.23, p=1.0). Use reality_cover_addr itself."
+            );
+        } else if http_sh != cover {
+            // RIGHT HOST, WRONG PORT - and this is the one that would otherwise
+            // pass every check in this file while still leaking.
+            //
+            // `<cover>:80` matches on host, so the distance check above is happy,
+            // and it closes the timing partition exactly as well as `<cover>:443`
+            // does. It also returns a real 301 where the cover's TLS port returns
+            // nothing, so it separates on BYTES: measured 173 vs 0 on `http11`.
+            //
+            // Not warning here would repeat the defect this whole check exists to
+            // fix: firing on absence and on the obvious wrongness, but staying
+            // silent on the config that is subtly wrong.
+            warn!(
+                http_shadow_target = %http_sh,
+                cover = %cover,
+                "http_shadow_target is the cover HOST but a different PORT. Failed HTTP \
+                 probes then get that port's response rather than the one the cover \
+                 endpoint actually gives - the cover's :80 answers a plaintext GET with \
+                 a 301 where its :443 answers with silence and a FIN. Measured, that is \
+                 a 173-vs-0 byte difference on an otherwise timing-matched bridge, and \
+                 bytes are categorical so they cost a prober one probe. Use \
+                 reality_cover_addr verbatim."
+            );
+        }
+    }
     if config.shadow_target.is_none() && config.http_shadow_target.is_none() {
         warn!(
             "no shadow_target and no reality_cover_addr: unauthenticated probes are dropped \
@@ -1718,19 +1822,51 @@ async fn main() {
         );
     }
     match (&config.http_shadow_target, &config.shadow_target) {
-        (Some(http_sh), _) if http_sh.ends_with(":443") || http_sh.ends_with(":8443") => {
+        // A TLS port is the RIGHT target when it is the cover host's own, and the
+        // warning that used to fire here had it backwards.
+        //
+        // The reasoning was: the bridge replays a plaintext HTTP request, so the
+        // target must speak plaintext HTTP or the prober gets TLS garbage. What a
+        // TLS port actually returns to a plaintext GET is NOTHING, followed by
+        // FIN - which is exactly what the cover host returns, because it IS the
+        // cover host. Measured: 0-vs-0 bytes and 32.0-vs-31.9 ms against
+        // `<cover>:443`, versus 173-vs-0 bytes against `<cover>:80`.
+        //
+        // So only warn when the TLS endpoint is somewhere OTHER than the cover.
+        (Some(http_sh), _)
+            if (http_sh.ends_with(":443") || http_sh.ends_with(":8443"))
+                && config
+                    .reality_cover_addr
+                    .as_deref()
+                    .is_none_or(|c| !same_host(http_sh, c)) =>
+        {
             warn!(
                 target = %http_sh,
-                "http_shadow_target looks like a TLS endpoint; it MUST speak plaintext \
-                 HTTP (the bridge replays a plaintext HTTP request to it). Failed HTTP \
-                 probes would receive TLS garbage instead of a genuine response."
+                "http_shadow_target is a TLS endpoint on a host that is NOT the cover. \
+                 Pointing it at the cover host's own TLS port is correct - that host \
+                 answers a plaintext GET with silence and a FIN, which is what a prober \
+                 should see. Pointing it at some other TLS endpoint gives a response \
+                 from the wrong host at the wrong distance."
             );
         }
-        (Some(http_sh), Some(raw_sh)) if http_sh == raw_sh => {
+        // `http_shadow_target == shadow_target` is now the CORRECT configuration,
+        // not a footgun, and it is what both defaults produce. The old warning
+        // asked for a dedicated plaintext-HTTP decoy; measurement says a dedicated
+        // decoy is the failure mode, because it answers from the wrong host.
+        // Only flag the case where they agree on something that is not the cover.
+        (Some(http_sh), Some(raw_sh))
+            if http_sh == raw_sh
+                && config
+                    .reality_cover_addr
+                    .as_deref()
+                    .is_none_or(|c| !same_host(http_sh, c)) =>
+        {
             warn!(
-                "http_shadow_target == shadow_target; the latter raw-splices and is often \
-                 a TLS endpoint. Use a dedicated plaintext-HTTP decoy for http_shadow_target \
-                 so failed WebSocket/meek/DoH probes receive a real HTTP response."
+                target = %http_sh,
+                "http_shadow_target == shadow_target, and neither is the cover host. \
+                 Both probe paths then lead to the same wrong endpoint, so every \
+                 unauthenticated probe is answered by a host this bridge does not claim \
+                 to be."
             );
         }
         (None, Some(_)) => {
@@ -6440,6 +6576,45 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The distance check compares HOSTS, so a port difference is not a mismatch
+    /// but a host difference always is.
+    #[test]
+    fn decoy_host_mismatch_is_detected_regardless_of_port_or_case() {
+        assert!(same_host("www.wikipedia.org:80", "www.wikipedia.org:443"));
+        assert!(same_host("WWW.Wikipedia.ORG:80", "www.wikipedia.org:443"));
+        assert!(same_host("example.org", "example.org:443"));
+        // The measured failure: plausible HTTP decoy, wrong distance.
+        assert!(!same_host("example.com:80", "www.wikipedia.org:443"));
+        // A subdomain is a different host and generally a different distance.
+        assert!(!same_host("en.wikipedia.org:80", "www.wikipedia.org:443"));
+    }
+
+    /// Defaulting must be idempotent: applying it to a config that already names
+    /// the cover host on :80 changes nothing and raises no mismatch.
+    #[test]
+    fn both_decoys_default_to_the_cover_verbatim() {
+        // Verbatim, and specifically NOT the cover host on :80. That variant was
+        // tried: it collapsed the timing partition (G 10.74 -> 0.23) and opened a
+        // byte channel, because the cover's :443 returns nothing to a plaintext
+        // GET while its :80 returns a 301. Measured `http11` response bytes,
+        // bridge vs the real host:
+        //
+        //   <cover host>:80    173 vs 0   <- timing fixed, bytes broken
+        //   <cover host>:443     0 vs 0   <- both matched
+        //
+        // A byte difference is the worse of the two: categorical, so it needs no
+        // timing resolution and no repeated sampling to exploit.
+        for cover in ["www.wikipedia.org:443", "example.org", "[2001:db8::1]:443"] {
+            assert!(
+                same_host(cover, cover),
+                "the default must not trip its own mismatch warning"
+            );
+        }
+        // The :80 variant passes every check in this file and is still wrong,
+        // which is why the port is enforced by defaulting rather than by a check.
+        assert!(same_host("www.wikipedia.org:80", "www.wikipedia.org:443"));
+    }
 
     /// M4: the bridge binds the SAME epoch-derived UDP port the client dials
     /// (both call `derive_port` with `NAMESPACE_CLIENT_TO_BRIDGE`), so hysteria2

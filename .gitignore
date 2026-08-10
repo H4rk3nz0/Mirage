@@ -39,3 +39,8 @@ __pycache__/
 # Proteus cover-source library - recorded real-traffic profiles (regenerate via
 # mirage-cover-record). Large + environment-specific; not committed.
 tools/cover-sources/library/
+
+# Player bundles for the segmented-video cover capture: third-party minified
+# libraries, fetched on demand by tools/cover-sources/hls/capture.sh.
+tools/cover-sources/hls/hls.min.js
+tools/cover-sources/hls/shaka-player.compiled.js

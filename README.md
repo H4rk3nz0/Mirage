@@ -14,7 +14,7 @@
   <a href="docs/security-model.md">Security model</a>
 </p>
 
-> **Status:** `0.1.7-alpha.1`. Deployable today. Wire formats and config may still change
+> **Status:** `0.1.8-alpha.1`. Deployable today. Wire formats and config may still change
 > before a stable release.
 
 Mirage is not a single protocol. It is a **stack of interchangeable layers** - you pick
@@ -47,6 +47,39 @@ timing. A proxy shuttling data doesn't breathe like someone streaming a video, a
 traffic-analysis classifiers key on exactly that. Proteus closes it: it records a
 **genuine** video stream or web page load and replays its exact wire envelope - sizes,
 direction, timing - with your data hidden inside the encrypted record bodies.
+
+> **What we have actually measured, as of 0.1.8-alpha.1.** Cover class matters more
+> than shaping quality, and the statistic that predicts usable capacity is the
+> high-quantile inter-record **gap** - not mean rate, duty cycle, or record-size
+> variance, three of which rank the cover classes backwards. That follows from
+> Little's law and holds independently of the numbers below.
+>
+> Across a 60-cell capture matrix (5 repetitions per cell, two players, three buffer
+> settings), worst-case gap by cover class:
+>
+> | class | worst gap | throughput |
+> |---|---|---|
+> | browse page load | **95.6 ms** | fails the floor |
+> | live audio | 338.8 ms | 139 kbps, fails the floor |
+> | segmented video (HLS) | **~10 s** | clears easily |
+>
+> **No single cover class clears both constraints.** An earlier claim that segmented
+> video did was wrong twice over: its sub-second gap was a property of a non-default
+> player buffer, and the capture tap that produced it silently dropped every
+> long-lived connection. Mirage's answer is to stop using one class - interactive
+> streams ride browse-class carriers, bulk streams ride video-class carriers, which
+> is what a host running a browser and a video player looks like anyway. See
+> [cover-scheduling.md](docs/cover-scheduling.md) (numbers marked provisional pending
+> a re-take) and [measurement-methodology.md](docs/measurement-methodology.md) for how
+> each of those errors was found.
+
+> **Where 2.0 stands.** Shipped and verified: replay envelope, displacement,
+> multi-carrier replay with capture-derived carrier count and ramp, heterogeneous
+> carriers, probe-decoy defaults, and a Firefox ClientHello matched to a real capture.
+> Provisional: the cover-class numbers, pending a re-take. Off pending measurement:
+> deficit permutation. Blocked on inputs this machine does not have: probe-suite
+> figures at real network distance, and a Chrome ClientHello capture. Full board in
+> [proteus-2.0.md](docs/proteus-2.0.md).
 
 The point is *replay, not fake*. A generated "video-like" pattern is always subtly wrong,
 and subtly-wrong is detectable; a real recorded envelope carries no invented structure to

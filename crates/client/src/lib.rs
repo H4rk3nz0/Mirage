@@ -217,6 +217,25 @@ struct ClientConfig {
     /// consequence of a directory that happens not to exist.
     #[serde(default)]
     proteus_generic_cover_ok: bool,
+    /// Permit a replay schedule with a periodically tiled direction.
+    ///
+    /// Setting `proteus_profile_up` makes `merge_directional` repeat a short
+    /// upstream capture end to end across the downstream span. The upstream
+    /// record sequence is then exactly periodic - a comb that one FFT, or one
+    /// period check, finds in a SINGLE flow.
+    ///
+    /// That is a different class of defect from everything else in the shaping
+    /// design. The rest are statistical-accumulation problems: the adversary
+    /// needs N observations and the argument is about the constant. This one is
+    /// deterministic at N=1, needs no reference class and no threshold, and is
+    /// cheap enough to run at line rate on every flow.
+    ///
+    /// So it is refused rather than warned about, on the same reasoning as
+    /// [`Self::proteus_generic_cover_ok`]: a config that ships a deterministic
+    /// single-flow signature should be a deliberate choice, not a default
+    /// inherited from a documentation recommendation.
+    #[serde(default)]
+    proteus_tiled_schedule_ok: bool,
     /// Where the client records its own cover FROM, when it is self-sourcing:
     /// `global` (default), a region (`cn`, `ir`, `ru`, `tr`), or a
     /// comma-separated list of your own URLs.
@@ -2614,6 +2633,38 @@ fn apply_paranoid(config: &mut ClientConfig, start_sourcing: bool) {
         mirage_transport_reality::ProfileMatch::PinnedFile
         | mirage_transport_reality::ProfileMatch::NoCoverHost => {}
     }
+    // A SEPARATE upstream profile buys capacity and breaks the flow's causal
+    // structure. Both directions must come from ONE capture.
+    //
+    // `merge_directional` takes downstream records from one capture and TILES
+    // upstream records from a different one across the downstream span. Two
+    // consequences, either of which is decisive on its own:
+    //
+    //  1. The directions become independent. Real HTTP has near-deterministic
+    //     causality - a downstream burst follows an upstream request by one RTT -
+    //     so independent replay emits flows the real distribution assigns zero
+    //     probability to (downstream data with no request). In divergence terms
+    //     the joint penalty is D(P_up (x) P_down || P_joint), which is INFINITE
+    //     wherever the product measure has mass the joint does not. That is a
+    //     single-observation distinguisher, not a statistical edge.
+    //
+    //  2. The tiling is PERIODIC, with period equal to the upstream capture's
+    //     span, repeated end to end for the whole session. Real browsing has no
+    //     such period. An FFT of upstream inter-record gaps shows a comb.
+    //
+    // Neither is visible to any per-direction test, which is why twelve rounds of
+    // marginal measurement never saw it.
+    if profile_up.is_some() {
+        tracing::warn!(
+            "proteus: proteus_profile_up sources the UPSTREAM schedule from a different \
+             capture than the downstream one. The two directions then have no \
+             request-response causality, so the replay emits flows real traffic never \
+             produces, and the upstream is tiled periodically at the capture's span - a \
+             comb an observer can find in one flow without any statistics. Prefer a single \
+             profile whose capture contains both directions; use a separate upstream \
+             profile only when the alternative is no pacing at all."
+        );
+    }
     mirage_transport_reality::set_pace_override(mode, Some(profile), profile_up);
 }
 
@@ -3604,6 +3655,48 @@ pub async fn cli_main() {
         }
     }
 
+    // Refuse a schedule with a periodically tiled direction.
+    //
+    // Checked against the bytes that will actually be replayed, not the config
+    // that was requested - `merge_directional` is what introduces the tiling, so
+    // inspecting the config alone cannot see it.
+    //
+    // Every other divergence in this design is a statistical-accumulation problem
+    // where the adversary needs N observations. An exactly repeated upstream block
+    // is deterministic at N=1: one period check, no reference class, no threshold,
+    // cheap enough to run at line rate on every flow. It is refused for the same
+    // reason a pinned library with no host-matched traces is refused.
+    if let Some((down, block)) = mirage_transport_reality::configured_schedule_is_tiled() {
+        if !config.proteus_tiled_schedule_ok {
+            let dir = if down { "downstream" } else { "upstream" };
+            eprintln!(
+                "fatal: the configured replay schedule repeats a {block}-record block \
+                 end to end in the {dir} direction.\n\
+                 \n\
+                 This happens when proteus_profile_up names a SEPARATE capture: the \
+                 upstream is tiled across the downstream span, leaving its record \
+                 sequence exactly periodic. That is a deterministic signature in one \
+                 flow - a single FFT of {dir} inter-record gaps shows a comb - and it \
+                 needs no reference class, no population statistics and no threshold.\n\
+                 \n\
+                 It also destroys the request-response causality between directions, so \
+                 the replay emits shapes real traffic does not produce.\n\
+                 \n\
+                 Fix: use ONE capture containing both directions (drop \
+                 proteus_profile_up).\n\
+                 Or, if a periodic upstream is genuinely preferable to no pacing at \
+                 all, set \"proteus_tiled_schedule_ok\": true."
+            );
+            std::process::exit(2);
+        }
+        tracing::warn!(
+            direction = if down { "downstream" } else { "upstream" },
+            block_records = block,
+            "proteus: replaying a periodically tiled schedule (opted in). This is a \
+             single-flow deterministic signature."
+        );
+    }
+
     // Windows: TUN mode needs Administrator (Wintun adapter + route changes).
     // If requested and we're not elevated, relaunch elevated via a UAC prompt
     // and exit this instance. No-op on other platforms / when TUN is off.
@@ -3613,6 +3706,140 @@ pub async fn cli_main() {
     }
 
     run_daemon(config, management_bind).await;
+}
+
+/// Fraction of the cover's sustainable rate we let applications drive.
+///
+/// Queue delay in an M/M/1 approximation is `ρ/(μ(1−ρ))`. At ρ=0.85 that is
+/// ~5.7/μ; at ρ=0.95 it is ~19/μ and rising steeply. The last 15% of nominal
+/// capacity costs roughly a 3x latency increase and cannot be sustained anyway,
+/// because the service rate is fixed by the envelope and does not stretch.
+const RHO_MAX: f64 = 0.85;
+
+/// Gap quantile the local buffer is sized to absorb.
+///
+/// p99 rather than max: the maximum is a single observation and would size every
+/// buffer for an outlier.
+///
+/// # KNOWN WRONG for bimodal cover classes
+///
+/// A fixed quantile encodes an assumption that the gap distribution is unimodal.
+/// Segmented video is not: intra-burst gaps sit near zero, inter-segment gaps near
+/// the segment duration, and the long ones are only 0.08-0.11% of the sample - so
+/// p99 lands inside the fast mode and cannot see them at all.
+///
+/// Measured, two independent players at library defaults:
+///
+/// | player | p99 | p99.9 | max | p99 underestimates by |
+/// |---|---|---|---|---|
+/// | hls.js | 1.3 ms | 141.6 ms | 10007 ms | **7507x** |
+/// | Shaka | 2.8 ms | 9654 ms | 10213 ms | **3657x** |
+///
+/// A buffer sized from this for segmented video is provisioned for a 1.3 ms stall
+/// against a real 10 s one. This is the same defect as the fixed 0.5 s constant it
+/// replaced - one summary that cannot span the classes it is applied to - and it
+/// survived because every class measured until then happened to be unimodal.
+///
+/// **Not yet fixed.** The statistic needs to be mode-aware (the upper mode's
+/// location, or the largest gap) or per-class. Until then, treat any buffer sizing
+/// for a segmented-video profile as unvalidated. Browse and live-audio profiles are
+/// unimodal and this quantile is sound for them.
+const GAP_QUANTILE: f64 = 0.99;
+
+/// Fallback gap when the profile cannot supply one, in seconds.
+///
+/// Only used when the cover has no measurable upstream gap distribution. A
+/// measured value always wins - see [`local_recv_buffer_bytes`] for why a
+/// constant here was the wrong shape to begin with.
+const FALLBACK_GAP_SECS: f64 = 0.5;
+
+/// Below this per-session rate a tunnelled session is not worth having: page
+/// loads time out and the user retries, which is the loop admission control
+/// exists to break. 8 kB/s is roughly "a small page in a few seconds".
+const MIN_USEFUL_SESSION_BPS: f64 = 8_000.0;
+
+/// How many concurrent local sessions this cover profile can actually serve.
+///
+/// `None` when not pacing - then the link is the limit and the kernel's own
+/// backpressure is the right mechanism.
+///
+/// This is a COARSE proxy for ρ. The exact quantity is `λ/μ`, and λ is not
+/// directly observable here; what is observable is how many sessions are live and
+/// what rate each would need to be useful. Dividing `ρ_max·μ` by a minimum useful
+/// per-session rate gives an admission cap that is conservative in the right
+/// direction - it refuses before the queue diverges rather than after.
+///
+/// A finer version would feed back on actual queue depth (`pending_outbound_len`
+/// against the policy cap). That is worth doing once there is a measurement to
+/// tune it against; this is the version that closes the retry-storm loop today.
+fn admission_cap() -> Option<usize> {
+    let mu = mirage_transport_reality::cover_upstream_bps()?;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let cap = (mu * RHO_MAX / MIN_USEFUL_SESSION_BPS) as usize;
+    // Always admit at least one: refusing every session is worse than a slow one,
+    // and a profile too sparse for even one session is a configuration problem
+    // that the starvation guard already reports.
+    Some(cap.max(1))
+}
+
+/// Receive-buffer size, in BYTES, for a cover of rate `mu` and gap `gap_secs`.
+///
+/// The buffer must hold what accumulates while the cover is silent. During a gap
+/// the tunnel cannot send but the application keeps pushing, so bytes pile up at
+/// the offered rate: `gap x rate`. That product - not a time constant - is the
+/// quantity, and it is why the same gap means very different things at different
+/// rates. A 900 ms gap absorbs 11 kB at 100 kbps offered and 340 kB at 3 Mbps.
+///
+/// Both inputs are MEASURED from the profile (`cover_upstream_bps`,
+/// `cover_gap_secs`) rather than assumed. The previous version used a fixed
+/// 0.5 s, which measurement showed was generous for browse cover (worst gap
+/// 122 ms) and hopeless for buffered video (worst gap 15 s) - one constant
+/// spanning a 120x range of real gap structures.
+///
+/// Note what this does NOT prove: that the limit actually binds under load. That
+/// needs the e2e harness offering 2*mu and observing bounded queue depth with no
+/// egress failure - the regression test for the collapse mode itself, rather than
+/// for the mechanism.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn local_recv_buffer_bytes(mu: f64, gap_secs: f64) -> usize {
+    let want = (mu * RHO_MAX * gap_secs.max(0.0)).max(0.0) as usize;
+    // Floor so a handshake still fits in one window; ceiling so a fat video
+    // profile does not re-create the unbounded queue this exists to prevent.
+    want.clamp(8 * 1024, 256 * 1024)
+}
+
+/// Bound how fast a local application can push into a paced tunnel.
+///
+/// WHY THIS EXISTS
+///
+/// Under Proteus the service rate `μ` is fixed by the cover envelope, not by the
+/// link. An application that offers `λ > μ` drives `ρ = λ/μ` past 1, queue delay
+/// diverges, something times out, the user retries - which raises `λ` again. That
+/// positive feedback is the "egress DOWN under load, never idle" collapse: a
+/// queueing failure that looks like a transport fault.
+///
+/// Shrinking the LOCAL socket's receive buffer makes the application's own
+/// congestion control do the work: it fills the window, stops, and never learns
+/// there was a cliff. No new protocol, no explicit signalling.
+///
+/// WHERE THE LEVER GOES, and why it must not go on the carrier.
+///
+/// This adjusts the SOCKS-side socket only. TCP window sizes are in the CLEAR -
+/// applying the same trick to the carrier's socket would publish an unusual
+/// window to anyone watching, which is a fingerprint. The tunnelled flow's
+/// windows are inside the AEAD and invisible; the carrier's are not.
+fn clamp_local_recv_buffer(local: &TcpStream) {
+    let Some(mu) = mirage_transport_reality::cover_upstream_bps() else {
+        return; // not pacing: the link is the limit, leave the socket alone
+    };
+    // Gap from the profile when it has one; the fallback only covers cover with
+    // no measurable upstream gap distribution at all.
+    let gap = mirage_transport_reality::cover_gap_secs(GAP_QUANTILE).unwrap_or(FALLBACK_GAP_SECS);
+    let bytes = local_recv_buffer_bytes(mu, gap);
+    let sock = socket2::SockRef::from(local);
+    if let Err(e) = sock.set_recv_buffer_size(bytes) {
+        debug!(error = %e, "could not clamp local recv buffer; app may overshoot cover rate");
+    }
 }
 
 /// Windows self-elevation for TUN mode. When `tun_enabled` and the process is
@@ -4313,13 +4540,14 @@ async fn run_daemon(config: ClientConfig, management_bind: Option<String>) {
             }
         };
         local.set_nodelay(true).ok();
+        clamp_local_recv_buffer(&local);
         let pool = Arc::clone(&pool);
         let active_sessions_clone = Arc::clone(&active_sessions);
         let total_sessions_clone = Arc::clone(&total_sessions);
         tokio::spawn(async move {
             total_sessions_clone.fetch_add(1, Ordering::Relaxed);
-            active_sessions_clone.fetch_add(1, Ordering::Relaxed);
-            if let Err(e) = tunnel_one(local, peer, pool).await {
+            let live = active_sessions_clone.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Err(e) = tunnel_one(local, peer, pool, live).await {
                 debug!(peer = %peer, error = %e, "tunnel ended with error");
             }
             active_sessions_clone.fetch_sub(1, Ordering::Relaxed);
@@ -4983,6 +5211,7 @@ async fn tunnel_one(
     mut local: TcpStream,
     peer: std::net::SocketAddr,
     pool: Arc<EntryPool>,
+    live_sessions: usize,
 ) -> Result<(), String> {
     // Terminate the local SOCKS5 negotiation so we can branch CONNECT vs UDP
     // ASSOCIATE. For CONNECT the consumed greeting+request are replayed to the
@@ -5001,6 +5230,34 @@ async fn tunnel_one(
         Ok(Err(e)) => return Err(format!("local socks5 (peer={peer}): {e}")),
         Err(_) => return Err(format!("local socks5 (peer={peer}): negotiation timed out")),
     };
+
+    // Admission control. Refuse promptly rather than accept and stall.
+    //
+    // The check sits AFTER negotiation on purpose: only here can we answer with a
+    // real SOCKS reply. A refusal that returns immediately lets the application's
+    // own retry logic behave sanely; a connection that is accepted and then hangs
+    // produces exactly the retry amplification this exists to prevent - the user
+    // retries, offered load rises, and the queue that was already over capacity
+    // gets worse.
+    if let Some(cap) = admission_cap() {
+        if live_sessions > cap {
+            // Log it: refusal RATE is the operational signal that the cover
+            // profile is undersized for the workload, and there is currently no
+            // other way to see that.
+            tracing::warn!(
+                live_sessions,
+                cap,
+                "socks: refusing new session - offered load exceeds what this cover \
+                 profile can serve. Sustained refusals mean the profile is too sparse \
+                 for the workload; use a denser cover class."
+            );
+            let _ = local_socks::send_connect_reply(&mut local, REP_GENERAL_FAILURE).await;
+            return Err(format!(
+                "admission control (peer={peer}): {live_sessions} live > cap {cap}"
+            ));
+        }
+    }
+
     if lreq.command == local_socks::LocalCommand::UdpAssociate {
         return udp_associate(local, peer, pool).await;
     }
@@ -10239,6 +10496,50 @@ mod cover_fetch_tests {
 #[cfg(test)]
 mod embeddable_api_tests {
     use super::*;
+
+    /// The buffer is sized in BYTES from measured gap x rate, not from a time
+    /// constant.
+    ///
+    /// The same gap means different things at different rates - that product is
+    /// what accumulates while the cover is silent. A single time constant cannot
+    /// express it, which is why the previous 0.5 s default was simultaneously
+    /// generous for browse cover (122 ms worst gap) and hopeless for buffered
+    /// video (15 s worst gap), a 120x span of real structures.
+    #[test]
+    fn local_recv_buffer_is_gap_times_rate_not_a_time_constant() {
+        // Same gap, 30x the rate -> 30x the bytes. A time constant cannot do this.
+        let gap = 0.877; // measured p-max for segmented HLS
+        let small = local_recv_buffer_bytes(100_000.0 / 8.0, gap);
+        let large = local_recv_buffer_bytes(3_000_000.0 / 8.0, gap);
+        assert!(
+            large > small,
+            "higher offered rate must buy a bigger buffer"
+        );
+
+        // Same rate, the measured spread of gaps across real cover classes.
+        let mu = 400_000.0; // 3.2 Mbps
+        let browse = local_recv_buffer_bytes(mu, 0.122); // browse worst gap
+        let hls = local_recv_buffer_bytes(mu, 0.877); // segmented HLS worst gap
+        assert!(
+            hls > browse,
+            "a cover class with longer gaps needs a deeper buffer at the same rate"
+        );
+
+        // Proportionality holds inside the clamps.
+        let a = local_recv_buffer_bytes(200_000.0, 0.2);
+        let b = local_recv_buffer_bytes(200_000.0, 0.4);
+        assert!(
+            (b as f64 - 2.0 * a as f64).abs() < 2.0,
+            "buffer must be linear in gap between floor and ceiling"
+        );
+
+        // Floors and ceilings still bound it, and degenerate inputs do not wrap.
+        assert_eq!(local_recv_buffer_bytes(1_000.0, 0.05), 8 * 1024);
+        assert_eq!(local_recv_buffer_bytes(50_000_000.0, 15.0), 256 * 1024);
+        assert_eq!(local_recv_buffer_bytes(0.0, 0.5), 8 * 1024);
+        assert_eq!(local_recv_buffer_bytes(-5.0, 0.5), 8 * 1024);
+        assert_eq!(local_recv_buffer_bytes(200_000.0, -1.0), 8 * 1024);
+    }
 
     // The mobile FFI parses the same JSON schema the desktop client reads.
     #[test]

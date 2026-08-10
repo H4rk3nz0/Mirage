@@ -1,0 +1,1 @@
+{\"player\":\"hlsjs\",\"config_readback\":{\"maxBufferLength\":30,\"maxMaxBufferLength\":600,\"maxBufferSize\":60000000},\"played_s\":56.38,\"segment_fetches\":14,\"manifest_fetches\":3,\"gap_max_s\":10.04,\"gap_p99_s\":10.04,\"gap_median_s\":0.348,\"buffered_end_s\":139.99}

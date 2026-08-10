@@ -21,6 +21,8 @@ These docs come in two layers. Start at the top; go down as far as you need.
 
 | Doc | For |
 |---|---|
+| **[Proteus 2.0](proteus-2.0.md)** | What the traffic shaper is, each mechanism, and the measurement that justifies it. Start here. |
+| **[Measurement methodology](measurement-methodology.md)** | The failure modes that recurred across unrelated subsystems, and how each was caught. Read before measuring anything. |
 | **[Proteus](proteus.md)** | Why the traffic shaper replays real captures instead of generating plausible ones, and what that costs. |
 | **[Internals](internals.md)** | Architecture, wire format, and what Mirage changes vs. existing protocols. |
 | **[Security model](security-model.md)** | The threat model, what is defended, and what is *not*. |

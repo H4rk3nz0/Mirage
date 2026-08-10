@@ -67,6 +67,16 @@ pub struct TemplateProvenance {
     /// How the bytes were obtained. This decides whether the template can be
     /// RE-DERIVED when the browser moves, or only re-transcribed by hand.
     pub source: TemplateSource,
+    /// Has this template been compared, field by field, against a ClientHello
+    /// captured from the browser it claims to be?
+    ///
+    /// AGE AND CORRECTNESS ARE INDEPENDENT AXES, and only one had an instrument.
+    /// `checked_days` says when someone last looked; it cannot say whether what
+    /// they wrote was ever right. It was not: a capture of Firefox 153 shows 17
+    /// extensions and NO GREASE against this template's 12 with GREASE in the
+    /// first and last slots - differing in count, order and GREASE presence at
+    /// once. See docs/proteus-2.0.md.
+    pub validated_against_capture: bool,
 }
 
 /// Where a template's bytes came from.
@@ -228,6 +238,23 @@ pub const EXT_APPLICATION_SETTINGS: u16 = 0x4469;
 /// the Chrome/Firefox templates MUST carry it.
 pub const EXT_ENCRYPTED_CLIENT_HELLO: u16 = 0xfe0d;
 
+/// `delegated_credentials` (RFC 9345), codepoint 0x0022.
+///
+/// A FIREFOX extension: Chrome does not send it, so it belongs in the Firefox
+/// template only. Observed in 33 of 45 real Firefox 153 ClientHellos captured on
+/// the wire (every one that negotiated TLS 1.3), with a byte-identical body in
+/// all of them.
+pub const EXT_DELEGATED_CREDENTIALS: u16 = 0x0022;
+
+/// Named groups Firefox offers beyond P-384, observed in every captured
+/// Firefox 153 TLS 1.3 ClientHello. Chrome does not offer the finite-field
+/// groups, so these belong to the Firefox template only.
+pub const GROUP_SECP521R1: u16 = 25;
+/// `ffdhe2048` (RFC 7919), offered by Firefox and not by Chrome.
+pub const GROUP_FFDHE2048: u16 = 256;
+/// `ffdhe3072` (RFC 7919), offered by Firefox and not by Chrome.
+pub const GROUP_FFDHE3072: u16 = 257;
+
 // Named group + sig alg constants (the ones built-in templates use)
 
 /// `x25519`.
@@ -355,6 +382,7 @@ pub const CHROME_DESKTOP: TlsFingerprintTemplate = TlsFingerprintTemplate {
         // the staleness check assert its own freshness.
         checked_days: 20468,
         source: TemplateSource::HandTranscribed,
+        validated_against_capture: false,
     },
     legacy_version: [0x03, 0x03],
     cipher_suites: &[
@@ -442,27 +470,46 @@ pub const FIREFOX_DESKTOP: TlsFingerprintTemplate = TlsFingerprintTemplate {
         // the staleness check assert its own freshness.
         checked_days: 20468,
         source: TemplateSource::HandTranscribed,
+        validated_against_capture: false,
     },
     legacy_version: [0x03, 0x03],
     cipher_suites: &[
         0x1301, // TLS_AES_128_GCM_SHA256
         0x1303, // TLS_CHACHA20_POLY1305_SHA256
         0x1302, // TLS_AES_256_GCM_SHA384
-        0xC02B, 0xC02F, 0xCCA9, 0xCCA8, 0xC02C, 0xC030, 0xC013, 0xC014, 0x009C, 0x009D, 0x002F,
-        0x0035,
+        // 0xC00A sits between 0xC030 and 0xC013 in every captured Firefox 153
+        // hello and was absent here; a missing cipher changes the JA3 as surely
+        // as a missing extension does.
+        0xC02B, 0xC02F, 0xCCA9, 0xCCA8, 0xC02C, 0xC030, 0xC00A, 0xC013, 0xC014, 0x009C, 0x009D,
+        0x002F, 0x0035,
     ],
+    // DERIVED FROM A REAL CAPTURE, not transcribed from documentation.
+    //
+    // 45 Firefox 153 ClientHellos were captured on the wire (the CONNECT tap in
+    // tools/cover-sources). All 33 that negotiated TLS 1.3 carried this exact
+    // membership and this exact order. The previous list was a strict SUBSET -
+    // 12 of the real 17 - missing session_ticket, status_request,
+    // delegated_credentials, SCT and compress_certificate, and ordering
+    // key_share/supported_versions/signature_algorithms differently from the
+    // browser it claimed to be. A fingerprint that is a subset of its target is
+    // not a near-miss; it is a distinct fingerprint matching nothing.
     extension_order: &[
         EXT_SERVER_NAME,
         EXT_EXTENDED_MASTER_SECRET,
         EXT_RENEGOTIATION_INFO,
         EXT_SUPPORTED_GROUPS,
         EXT_EC_POINT_FORMATS,
+        EXT_SESSION_TICKET,
         EXT_ALPN,
-        EXT_SIGNATURE_ALGORITHMS,
+        EXT_STATUS_REQUEST,
+        EXT_DELEGATED_CREDENTIALS,
+        EXT_SIGNED_CERT_TIMESTAMP,
+        EXT_KEY_SHARE,
         EXT_SUPPORTED_VERSIONS,
+        EXT_SIGNATURE_ALGORITHMS,
         EXT_PSK_KEY_EXCHANGE_MODES,
         EXT_RECORD_SIZE_LIMIT,
-        EXT_KEY_SHARE,
+        EXT_COMPRESS_CERTIFICATE,
         // GREASE ECH - Firefox (>=132) sends it alongside the ML-KEM group
         // (red-team HIGH #1).
         EXT_ENCRYPTED_CLIENT_HELLO,
@@ -472,6 +519,11 @@ pub const FIREFOX_DESKTOP: TlsFingerprintTemplate = TlsFingerprintTemplate {
         GROUP_X25519,
         GROUP_SECP256R1,
         GROUP_SECP384R1,
+        // Captured Firefox continues past secp384r1: secp521r1 and the two
+        // finite-field groups. Truncating the list was another subset.
+        GROUP_SECP521R1,
+        GROUP_FFDHE2048,
+        GROUP_FFDHE3072,
     ],
     sig_algs: &[
         SIG_ECDSA_SECP256R1_SHA256,
@@ -508,6 +560,7 @@ pub const SAFARI_DESKTOP: TlsFingerprintTemplate = TlsFingerprintTemplate {
         // the staleness check assert its own freshness.
         checked_days: 20468,
         source: TemplateSource::HandTranscribed,
+        validated_against_capture: false,
     },
     legacy_version: [0x03, 0x03],
     cipher_suites: &[
@@ -724,6 +777,24 @@ fn write_u8_list(out: &mut String, xs: &[u8]) {
 /// ClientHello still beats a client that will not start. Callers wanting a hard
 /// stop can check [`TemplateProvenance::is_stale`] directly.
 pub fn warn_if_fingerprints_stale(now_days: u32) {
+    // UNVALIDATED first, and independently of age. A template can be freshly
+    // dated and still never have been right.
+    let unvalidated: Vec<&str> = ALL_TEMPLATES
+        .iter()
+        .filter(|t| !t.provenance.validated_against_capture)
+        .map(|t| t.name)
+        .collect();
+    if !unvalidated.is_empty() {
+        tracing::warn!(
+            templates = %unvalidated.join(", "),
+            "TLS ClientHello templates have NOT been validated against a capture of the \
+             browser they claim to be. A measured comparison against Firefox 153 found the \
+             firefox template emitting 12 extensions with GREASE against a real 17 with \
+             none. A ClientHello matching nothing in the population is an exact-match \
+             first-packet block, and it defeats every downstream defence because none of \
+             them are reached. Treat the TLS fingerprint as KNOWN-WRONG."
+        );
+    }
     for t in ALL_TEMPLATES {
         let p = &t.provenance;
         if p.is_stale(now_days) {
@@ -789,6 +860,7 @@ mod tests {
             claims_to_be: "Chrome 133",
             checked_days: 20_000,
             source: TemplateSource::HandTranscribed,
+            validated_against_capture: false,
         };
         assert_eq!(p.age_days(20_000), Some(0));
         assert!(!p.is_stale(20_000), "same day is not stale");
@@ -831,16 +903,35 @@ mod tests {
     }
 
     #[test]
+    /// The pinned value is MEASURED, not transcribed.
+    ///
+    /// It is the JA3 string of real Firefox 153 ClientHellos captured on the wire
+    /// (tools/cover-sources CONNECT tap, 33 TLS 1.3 hellos, all identical). The
+    /// generator reproduces it exactly - cipher list, extension list and order,
+    /// supported groups, EC point formats.
+    ///
+    /// The previous pin was a strict subset of it: 12 of 17 extensions, one
+    /// cipher short, three groups short. It passed because it was pinning the
+    /// generator against itself. A fingerprint test whose expected value comes
+    /// from the same reasoning as the code cannot detect that the reasoning is
+    /// wrong; only a capture can.
     fn firefox_ja3_string_pinned() {
-        // Firefox 132+ also advertises X25519MLKEM768 (4588) ahead of
-        // x25519. See chrome pin above for context.
+        // MEASURED, not transcribed. This is the JA3 string of real Firefox 153
+        // ClientHellos captured on the wire (the CONNECT tap in
+        // tools/cover-sources): 45 hellos, the 33 that negotiated TLS 1.3 all
+        // identical, and the generator now reproduces it field for field.
+        //
+        // The previous pin was a strict SUBSET of the real thing - 12 of 17
+        // extensions, one cipher short (0xC00A), three groups short (25, 256,
+        // 257) - and it passed, because it pinned the generator against the same
+        // reasoning that produced the generator. A fingerprint test whose
+        // expected value is derived the same way as the code cannot tell that the
+        // derivation is wrong. Only a capture can.
         let got = ja3_string(&FIREFOX_DESKTOP);
-        // 65037 = 0xfe0d encrypted_client_hello (GREASE ECH); Firefox >=132
-        // sends it too (red-team HIGH #1).
         let want = "771,\
-                    4865-4867-4866-49195-49199-52393-52392-49196-49200-49171-49172-156-157-47-53,\
-                    0-23-65281-10-11-16-13-43-45-28-51-65037,\
-                    4588-29-23-24,\
+                    4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49171-49172-156-157-47-53,\
+                    0-23-65281-10-11-35-16-5-34-18-51-43-13-45-28-27-65037,\
+                    4588-29-23-24-25-256-257,\
                     0";
         assert_eq!(got, want, "Firefox JA3 string drift");
     }

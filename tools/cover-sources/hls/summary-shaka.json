@@ -1,0 +1,15 @@
+{
+  "player": "shaka",
+  "config_readback": {
+    "bufferingGoal": 10,
+    "rebufferingGoal": 2,
+    "bufferBehind": 30
+  },
+  "played_s": 55.99,
+  "segment_fetches": 8,
+  "manifest_fetches": 3,
+  "gap_max_s": 10.404,
+  "gap_p99_s": 10.404,
+  "gap_median_s": 9.715,
+  "buffered_end_s": 70
+}

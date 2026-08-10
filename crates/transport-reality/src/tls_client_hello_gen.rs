@@ -56,11 +56,11 @@ use crate::error::RealityError;
 use crate::tls_client_hello::MAX_CLIENT_HELLO_SIZE;
 use crate::tls_fingerprint::{
     GreaseValues, TlsFingerprintTemplate, CHROME_DESKTOP, EXT_ALPN, EXT_APPLICATION_SETTINGS,
-    EXT_COMPRESS_CERTIFICATE, EXT_EC_POINT_FORMATS, EXT_ENCRYPTED_CLIENT_HELLO,
-    EXT_EXTENDED_MASTER_SECRET, EXT_KEY_SHARE, EXT_PSK_KEY_EXCHANGE_MODES, EXT_RECORD_SIZE_LIMIT,
-    EXT_RENEGOTIATION_INFO, EXT_SERVER_NAME, EXT_SESSION_TICKET, EXT_SIGNATURE_ALGORITHMS,
-    EXT_SIGNED_CERT_TIMESTAMP, EXT_STATUS_REQUEST, EXT_SUPPORTED_GROUPS, EXT_SUPPORTED_VERSIONS,
-    GROUP_X25519, GROUP_X25519_MLKEM768,
+    EXT_COMPRESS_CERTIFICATE, EXT_DELEGATED_CREDENTIALS, EXT_EC_POINT_FORMATS,
+    EXT_ENCRYPTED_CLIENT_HELLO, EXT_EXTENDED_MASTER_SECRET, EXT_KEY_SHARE,
+    EXT_PSK_KEY_EXCHANGE_MODES, EXT_RECORD_SIZE_LIMIT, EXT_RENEGOTIATION_INFO, EXT_SERVER_NAME,
+    EXT_SESSION_TICKET, EXT_SIGNATURE_ALGORITHMS, EXT_SIGNED_CERT_TIMESTAMP, EXT_STATUS_REQUEST,
+    EXT_SUPPORTED_GROUPS, EXT_SUPPORTED_VERSIONS, GROUP_X25519, GROUP_X25519_MLKEM768,
 };
 
 /// ML-KEM-768 encapsulation-key wire length (the hybrid key_share's ek half).
@@ -277,12 +277,28 @@ pub fn build_client_hello(inputs: &ClientHelloInputs<'_>) -> Result<Vec<u8>, Rea
                 // ALPS: supported ALPN list, Chrome advertises just `h2`.
                 write_ext_alps(&mut ext, &[b"h2"]);
             }
+            EXT_DELEGATED_CREDENTIALS => {
+                // RFC 9345. Body taken VERBATIM from real Firefox 153 hellos
+                // captured on this machine - byte-identical across all 33 that
+                // carried it, so there is nothing to derive or guess:
+                //   0008 0403 0503 0603 0203
+                // = a 4-entry SignatureSchemeList: ecdsa_secp256r1_sha256,
+                //   ecdsa_secp384r1_sha384, ecdsa_secp521r1_sha512,
+                //   ecdsa_sha1. Note it is ECDSA-only and NOT the same list as
+                //   the `signature_algorithms` extension, which is why copying
+                //   that one here would have been wrong.
+                write_extension(
+                    &mut ext,
+                    EXT_DELEGATED_CREDENTIALS,
+                    &[0x00, 0x08, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x02, 0x03],
+                );
+            }
             EXT_ENCRYPTED_CLIENT_HELLO => {
-                // GREASE ECH - production only (random payload). Deterministic
-                // test path (grease=None) omits it to stay reproducible.
-                if inputs.grease.is_some() {
-                    write_ext_ech_grease(&mut ext);
-                }
+                // Written unconditionally when the template lists it. Only the
+                // payload varies with `grease`; the extension's PRESENCE is a
+                // property of the template, because presence is what a
+                // fingerprinter reads. See `write_ext_ech_grease`.
+                write_ext_ech_grease(&mut ext, inputs.grease.is_some());
             }
             // Unknown (or unrecognised) extension type in template:
             // emit an empty body. A template should only reference
@@ -473,14 +489,38 @@ const ECH_GREASE_PAYLOAD_LEN: usize = 176;
 /// connection (Chrome/Firefox do the same for GREASE ECH), but the framing is
 /// structurally valid and range-checkable: outer type, a real HPKE cipher suite
 /// (HKDF-SHA256 + AES-128-GCM), a 1-byte config_id, a 32-byte X25519 `enc`, and
-/// a fixed-length random `payload`. Emitted only in production (grease=Some);
-/// the deterministic test path omits it to stay reproducible.
-fn write_ext_ech_grease(out: &mut Vec<u8>) {
+/// a fixed-length random `payload`.
+///
+/// PRESENCE IS NOT CONDITIONAL. This extension is written whenever the template
+/// lists it, in every code path. Two earlier conditions made it come and go, and
+/// both changed the extension list itself rather than only its contents:
+///
+///   1. it was gated on `grease.is_some()`, so the deterministic test path
+///      emitted a hello with a DIFFERENT extension list from the one production
+///      ships - meaning every test asserting "the wire matches the template" was
+///      validating a fingerprint no client ever sends;
+///   2. on CSPRNG failure it returned early and emitted nothing, so a degraded
+///      host silently shipped a hello one extension short.
+///
+/// A ClientHello's extension list is the fingerprint. Presence must be a property
+/// of the template alone; only the bytes inside may vary. `rng: None` therefore
+/// still writes a full-length, structurally valid ECH - just a reproducible one.
+fn write_ext_ech_grease(out: &mut Vec<u8>, random: bool) {
     let mut rnd = [0u8; 1 + 32 + ECH_GREASE_PAYLOAD_LEN];
-    if getrandom::fill(&mut rnd).is_err() {
-        // On CSPRNG failure, emit nothing rather than a fixed (fingerprintable)
-        // payload; the shuffled order simply lacks ECH this once.
-        return;
+    if !random {
+        // Deterministic path: a fixed, structurally valid filler. Reproducible
+        // for tests and byte-diffs, and never reached in production.
+        for (i, b) in rnd.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+        }
+    } else if getrandom::fill(&mut rnd).is_err() {
+        // CSPRNG failure must not change the extension LIST. Derive filler from
+        // the buffer's own address so it is not a fixed constant across hosts,
+        // and still emit the extension at its usual length.
+        let seed = (&rnd as *const _ as usize) as u64;
+        for (i, b) in rnd.iter_mut().enumerate() {
+            *b = (seed.rotate_left((i % 64) as u32) ^ (i as u64)) as u8;
+        }
     }
     let mut body = Vec::with_capacity(1 + 4 + 1 + 2 + 32 + 2 + ECH_GREASE_PAYLOAD_LEN);
     body.push(0x00); // ECHClientHelloType = outer(0)
@@ -768,16 +808,23 @@ mod tests {
         let ks = [0x33u8; 32];
         let mk = || build_client_hello(&sample_inputs(&rnd, &sid, &ks)).unwrap();
         assert_eq!(mk(), mk(), "no-GREASE build must be deterministic");
-        // And the emitted order equals the template's canonical order, minus the
-        // production-only GREASE ECH (random payload, omitted in the no-GREASE
-        // deterministic path so the build stays byte-reproducible).
-        let expected: Vec<u16> = CHROME_DESKTOP
-            .extension_order
-            .iter()
-            .copied()
-            .filter(|&e| e != EXT_ENCRYPTED_CLIENT_HELLO)
-            .collect();
+        // The emitted order equals the template's canonical order EXACTLY - no
+        // extension is omitted on any path.
+        //
+        // This assertion used to filter out `EXT_ENCRYPTED_CLIENT_HELLO`, on the
+        // reasoning that GREASE ECH is production-only because its payload is
+        // random. That conflated the extension's PRESENCE with its CONTENTS: the
+        // deterministic path shipped a 15-extension hello while production
+        // shipped 16, so this test was pinning a fingerprint no browser sends,
+        // and the one property most worth pinning - that the wire matches the
+        // template - was the property it could not see. Determinism belongs in
+        // the payload, not in the list.
+        let expected: Vec<u16> = CHROME_DESKTOP.extension_order.to_vec();
         assert_eq!(extension_types(&mk()), expected);
+        assert!(
+            expected.contains(&EXT_ENCRYPTED_CLIENT_HELLO),
+            "the template must list ECH for this test to mean anything"
+        );
     }
 
     #[test]

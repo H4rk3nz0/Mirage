@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 49740c50b28ed90cfe3c138630499bd20c8aedb75e4bb7adb8323da3f25638de # shrinks to rnd = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], sid = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], ks = [0, 0, 0, 0, 0, 0, 0, 0, 2, 138, 193, 236, 184, 140, 12, 159, 117, 103, 31, 42, 191, 178, 183, 9, 222, 10, 114, 213, 8, 197, 170, 249], sni = "c-r43eq1--chf.st", alpn = true, ek_fill = 64, use_grease = false, use_hybrid = false

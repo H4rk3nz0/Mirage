@@ -7,9 +7,350 @@ then, pre-releases may make breaking changes between versions.
 
 ## [Unreleased]
 
-## [0.1.7-alpha.1] - 2026-08-08
+## [0.1.8-alpha.1] - 2026-08-10
+Measurement-integrity and multi-carrier release. The theme is that several things
+this project believed about itself were untested, testing them changed the answers,
+and the mechanisms that survived are now enforced by signatures rather than by
+tests.
 
 ### Added
+- **Multi-carrier replay: `M`, the ramp, and the interleaving all come from the
+  capture.** A profile already knew how many concurrent connections its capture
+  contained and was discarding it - `from_csv` rebased every flow to start after
+  the previous one ended, serialising traffic that was concurrent. A serialised
+  replay of concurrent connections is a shape real traffic never produces.
+
+  `MeasuredProfile` now keeps the joint cross-flow timeline and each flow's arrival
+  offset. `CarrierSet` builds one emitter per captured flow, so the carrier count
+  is the captured flow count and the open ramp is the recorded one. Opening all
+  carriers at t=0 leaks nothing but is still an arrival pattern the cover class does
+  not produce; opening one when the queue deepens leaks demand. Neither happens.
+
+- **Heterogeneous carriers - browse latency and video throughput at the same time.**
+  The 60-cell capture matrix established that no single cover class clears both
+  constraints: browse has the best gap bound (95.6 ms) and fails the throughput
+  floor, segmented video clears throughput and stalls ~10 s, live audio fails the
+  floor at 338 ms.
+
+  Searching harder for one class that does both was the wrong response - nothing
+  requires all carriers to wear the same profile. `HeteroCarrierSet` runs
+  browse-class carriers for interactive streams and video-class carriers for bulk,
+  so each stream class gets the axis its cover class is good at. A host running a
+  browser and a video player at once is ordinary traffic, so the composite is *more*
+  plausible cover than either alone rather than less.
+
+- **Deficit permutation (`DeficitPermuter`), opt-in and off by default.** Recovers
+  the envelope lost to `min(demand, token)` mismatch by reordering records within a
+  window while tracking a deficit against the trace's size histogram, so the realised
+  marginal converges to the trace's exactly.
+
+  It is in deliberate tension with the rest of the design: it makes record ORDER
+  depend on payload, trading marginal divergence for ordering divergence. That is
+  the mechanism, not a defect, which is why it is off by default and why the strict
+  payload-invariance tests assert the default path. Enabling it is gated on the `W`
+  sweep against ΔACF with a real-traffic baseline, which has not been run.
+
+- **An adversarial probe suite** (`scripts/probe-suite/`). Active probing is what
+  actually kills deployed circumvention systems; this repository had sixteen files
+  of traffic-analysis tooling and none for probing. Seventeen probe classes, scored
+  two ways: `partition.py` asks whether an endpoint answers some classes locally
+  (needs **nothing but the bridge's address**), `compare.py` asks whether it responds
+  identically to the real host (needs a synchronised capture of that host).
+
+- **The client bounds what an application can push into a paced tunnel.** Under
+  Proteus the service rate is fixed by the cover, so an app offering more than the
+  envelope carries drives queue delay to divergence, something times out, the user
+  retries, and offered load rises again. That positive feedback is the "egress
+  down under load, never idle" collapse: a queueing failure wearing the costume of
+  a transport fault.
+
+  The local SOCKS socket's receive buffer is now clamped so the application's own
+  congestion control backs off, with no new protocol and no signalling. Sized as
+  `rho_max x mu x gap` from **two measured quantities** - `cover_upstream_bps()`
+  and `cover_gap_secs(0.99)` - rather than a constant. The lever is on the SOCKS
+  side only: TCP window sizes are in the clear, so applying it to the carrier
+  would publish an unusual window to anyone watching.
+- **Admission control** at `rho_max = 0.85`, refusing with a proper SOCKS reply
+  rather than accepting and stalling - a refusal that returns promptly lets an
+  application's retry logic behave sanely, where a hang produces the amplification
+  the mechanism exists to prevent. Refusals are logged, because refusal *rate* is
+  the only signal an operator has that the cover profile is undersized for the
+  workload.
+- **An adversarial probe suite** (`scripts/probe-suite/`). Active probing is what
+  actually kills deployed circumvention systems; this repository had sixteen files
+  of traffic-analysis tooling and none for probing.
+
+  17 probe classes, interleaved ABAB against the real cover host **in-session** so
+  drift cannot align with the label. The pass criterion is byte-and-timing
+  **indistinguishability, not rejection** - a bridge that cleanly refuses a
+  malformed probe has told the prober it is not a web server.
+
+  It refuses rather than reports when it cannot mean what it says: a run with no
+  successful real-host observations is a broken reference arm, not a suspicious
+  bridge.
+- **A response-support test**, which is the durable form of the timing result. A
+  splice cannot answer before one network round trip, so its response distribution
+  has a hard floor the real host does not have. Every mitigation an operator
+  reaches for - jitter to match medians, a fixed added delay, clamping every reply
+  to the server's p05 - makes the bridge's support a strict SUBSET of the
+  server's, and no location or scale matching repairs a support mismatch.
+
+  Validated against three synthetic mitigations. Two defeat Mann-Whitney AUC
+  entirely (0.519 and 0.488, p ~ 0.5); one defeats the floor-gap test as well. The
+  support test catches all three, reporting **probes-to-distinguish** rather than
+  a rate - because P=0.11 reads as negligible and means 26 probes.
+- **Browser-based cover capture** (`tools/cover-sources/`): a CONNECT tap that
+  forwards bytes unchanged, plus raw `dumpcap` capture with per-stream TLS record
+  extraction and retained pcaps.
+- **`scripts/stop.sh`** - the only sanctioned way to stop or find processes in
+  this project. `pkill -f`/`pgrep -f` match any command line containing the
+  pattern, including the invoking shell; that killed this project's own tooling
+  five times. `--find` does exact-substring matching over `/proc`, excludes its
+  own process tree, refuses pattern metacharacters, and never kills.
+- **`TemplateProvenance::validated_against_capture`** on TLS fingerprint
+  templates, with a startup warning. Age and correctness are independent axes and
+  only one had an instrument - `checked_days` says when someone last looked, not
+  whether what they wrote was ever right.
+
+### Changed
+- **Demand has no path into any scheduling decision, enforced at the signature.**
+  Five instances of the same defect were closed the same way this release - not by
+  adding a check, but by removing the argument through which demand could arrive:
+
+  | decision | enforcement |
+  |---|---|
+  | how many carriers | `flow_starts.len()`, from the capture; no count parameter |
+  | when a carrier opens | recorded arrival offsets; no queue input |
+  | what a carrier emits, and when | `carrier_schedules(&self)` takes no other argument |
+  | whether an emission is due now | `next_due()` returns the instant; there is no `is_due(now)` to read a clock with |
+  | a stream's class | `ClassifiedStream::accept()` takes port and hint, never a byte count |
+
+  The last is the sharpest form: adding a byte count to `accept()` breaks every call
+  site, which is a louder alarm than any test or review comment. Where the reach is
+  absent rather than guarded, reintroducing it is noisy.
+- **`docs/cover-scheduling.md` is marked PROVISIONAL and Finding 6 of the Proteus
+  v2 plan is withdrawn.** Both rest on captures taken with the defective tap below,
+  and the segmented-HLS row that carried the headline conclusion was additionally
+  measured at a non-default buffer setting.
+
+  The conclusion that dies is **"segmented adaptive video dominates on both axes."**
+  It does not: at library defaults it has video's capacity *and* video's stalls, so
+  segmented HLS and buffered progressive video are one class on this axis rather
+  than two. On the current measurements **no cover class clears both the throughput
+  floor and the latency bound** - browse and live audio fail the floor, both video
+  classes stall for seconds. If that survives re-measurement, the design question
+  moves from "which cover class" to "what to do without one": a workload split, an
+  admission policy that does not promise interactive latency, or a different
+  architecture.
+
+  What survives is the *statistic*: the capacity-relevant quantity is the
+  high-quantile gap, not mean rate, record CV, or duty cycle. That is an argument
+  from Little's law and is independent of the table - and it is strengthened rather
+  than weakened, since the re-measure moved HLS's gap bound by 11x while its mean
+  rate barely moved. What changed is where HLS ranks, not what to rank by.
+
+  Neither document is retracted; the mechanisms are separable from the numbers. The
+  four-class re-take is pre-registered in the v2 plan with per-class expectations so
+  it can falsify rather than confirm.
+
+- **The browser capture tap silently dropped every long-lived connection.** It
+  wrote a trace only after both pump threads joined - that is, only when the
+  connection *closed* - so anything still open when the browser exited was never
+  written. Measured: a 45 s video session produced 47 connection files across 22
+  hosts and **not one of them was the video stream**. The short-lived background
+  connections (telemetry, safebrowsing, settings) all closed and were recorded;
+  the single long-lived connection carrying the segments vanished.
+
+  The failure looks exactly like success - a healthy directory full of traces,
+  none of them the traffic under study. Any capture taken before this fix
+  under-represents long-lived connections, which is the population the trace
+  library exists to model. Now flushed on SIGTERM/SIGINT/exit, marked
+  `closed=false` so a truncated final gap is not mistaken for a real one, and
+  written via rename so a reader can never see a half-written trace.
+
+- **Segmented video at library defaults is a different cover class than measured.**
+  The prior HLS capture ran `hls.js` at `maxBufferLength: 10`, a third of the
+  library default, and the plan predicted a deeper buffer would keep more segments
+  in flight rather than lengthen gaps. Re-measured at defaults across two
+  independent players on a 10 s-segment stream:
+
+  | player | default | median gap | p99 | max |
+  |---|---|---|---|---|
+  | hls.js | `maxBufferLength=30` | 0.00 ms | 1.3 ms | **10007 ms** |
+  | Shaka | `bufferingGoal=10` | 0.00 ms | 2.8 ms | **10213 ms** |
+
+  Against 877 ms previously - an **11x** increase, and the specific failure mode
+  the plan named: *the player switches strategy*. Both fetch a burst back-to-back
+  then idle for a full segment duration, which is the buffered-video structure
+  returning. The idles are mid-trace and periodic (5-6 per 50 s), checked against
+  the end of each trace rather than assumed.
+
+  Consequence for a shipped parameter: **`GAP_QUANTILE = 0.99` is wrong for this
+  class by 3-4 orders of magnitude.** The gap distribution is bimodal and the long
+  gaps are 0.08-0.11% of the sample, so p99 sits inside the fast mode - 1.3 ms
+  against a real 10 s stall, a 7507x underestimate for hls.js and 3657x for Shaka.
+  A receive buffer sized from it would be provisioned for the wrong mode. This is
+  the same defect as the fixed 0.5 s constant it replaced, and it survived because
+  every class measured until now had a unimodal gap distribution. Not yet fixed;
+  the statistic needs to be mode-aware or per-class.
+
+- **A splice's timing tell is proportional to bridge-to-cover RTT, not to
+  prober-to-bridge RTT** - so cover-host selection is a latency decision and not only
+  a plausibility one. Decomposing a probe's latency into TCP setup and everything
+  after it:
+
+      cover host : connect 17.84 + post-connect 14.11 = 31.95 ms
+      bridge     : connect  0.09 + post-connect 31.89 = 31.98 ms
+
+  The bridge's post-connect cost equals the cover's *entire* cost, connect included,
+  to within **0.06 ms**. A splice does not add cost, it **relocates** cost out of the
+  connect phase into the response phase, because its own setup to the cover happens
+  after the prober's connect has already returned.
+
+  This corrects an earlier conclusion in this changelog's own 0.1.8 notes, that a
+  spliced bridge "pays the same round trip" and is therefore timing-indistinguishable.
+  The 32.0-vs-32.0 totals that supported it were two errors of equal size cancelling:
+  the bridge's own connect was free on loopback while it paid the cover's in full.
+  Modelled at the cover's distance the same run separates 15 of 17 classes at N=1.
+
+  No enforcement yet. The figures come from a bridge on loopback and are a lower
+  bound on a real deployment's gap, not a measurement of one - the honest test needs
+  a bridge genuinely remote from the prober, at two or three known cover distances so
+  the slope is measured rather than a single point.
+
+### Fixed
+- **The probe decoys defaulted to nothing, and setting them "correctly" did not
+  help.** A bridge that answers some probe classes locally and forwards the rest
+  can be split on that alone - no reference capture of the host it fronts, no
+  population baseline. Send 17 TLS/HTTP-shaped probes, take each class's median
+  latency, and ask whether they form one cluster or two. A real web host forwards
+  nothing, so every class costs one round trip and the medians are unimodal.
+
+  Measured against a live bridge, n=100 per class, gap statistic `G` with a
+  matched-lognormal null:
+
+  | `http_shadow_target` | bridge `http11` | cover `http11` | G | p |
+  |---|---|---|---|---|
+  | unset | 21.3 ms | 33.4 ms | 10.74 | 0.0002 |
+  | `example.com:80` | 13.5 ms | 32.4 ms | 10.90 | 0.0002 |
+  | cover host `:80` | **32.0 ms** | **31.9 ms** | **0.23** | **1.0** |
+
+  The middle row is the finding. Pointing the decoy at *a* plaintext-HTTP server is
+  exactly what the previous startup warning asked for, and it does not close the
+  leak - the outlier moves from 21.3 ms to 13.5 ms and the endpoint remains just as
+  separable. The observable was never "does this answer HTTP plausibly"; it is
+  **"does this cost what the cover host costs."** A decoy at any other network
+  distance substitutes one timing anomaly for another, and the old warning fired on
+  absence, never on wrongness.
+
+  The fix that worked is `reality_cover_addr` **verbatim**, not the cover host on
+  :80. The :80 variant collapsed the partition just as well and opened a *byte*
+  channel: the cover's :443 answers a plaintext GET with silence and a FIN, its :80
+  with a real 301, so `http11` response bytes went 0-vs-0 to **173-vs-0**. That is
+  the worse tell of the two - categorical, so it costs a prober one probe instead of
+  a hundred. Forwarding to the cover's own TLS port gives 0-vs-0 bytes and
+  32.0-vs-31.9 ms, because the genuine host produces both.
+
+  | `http_shadow_target` | `http11` bytes | G |
+  |---|---|---|
+  | unset | 0 vs 0 | 10.74 |
+  | `example.com:80` | 406 vs 0 | 10.90 |
+  | cover host `:80` | 173 vs 0 | 0.23 |
+  | **`reality_cover_addr`** | **0 vs 0** | **0.47** |
+
+  Both decoys now default to `reality_cover_addr` verbatim, and the bridge warns on
+  a different host *and* on the right host at a different port. Two startup warnings
+  were inverted by this and have been corrected: a TLS endpoint is the *right*
+  target when it is the cover's own, and `http_shadow_target == shadow_target` is
+  now the correct configuration rather than a footgun.
+
+  The general lesson, recorded because it cost a round trip to learn: the partition
+  statistic and the cross-arm comparator are blind to each other, so a fix validated
+  by one must be re-run against the other before it is called done.
+
+  Scope, plainly: this closes the partition a prober can find knowing only the
+  bridge's address. The cross-arm comparator, which needs a synchronised capture of
+  the genuine host, still separates 9 of 17 classes on byte-level and lifecycle
+  differences. Strictly weaker, not gone.
+
+
+Measurement release. The theme is that several things this project believed about
+itself turned out to be untested, and testing them changed the answers.
+
+- **A replay schedule could carry a periodically tiled direction - a deterministic
+  single-flow signature.** `proteus_profile_up` names a SEPARATE upstream capture,
+  and `merge_directional` tiles it end to end across the downstream span. That
+  leaves the upstream record sequence exactly periodic: one FFT of upstream gaps,
+  or one period check, finds it in a SINGLE flow with no reference class, no
+  population statistics and no threshold to tune. It is the kind of detector a
+  censor runs at line rate on every connection.
+
+  It is a different class of defect from everything else in the shaping design.
+  The rest are statistical-accumulation problems where an adversary needs N
+  observations and the argument is about the constant; this one is decisive at
+  N=1. It also destroys request-response causality between directions, so the
+  replay emits shapes real traffic never produces - formally the joint penalty is
+  `D(P_up (x) P_down || P_joint)`, which is infinite wherever the product measure
+  has mass the joint does not.
+
+  Detected structurally (`tiled_direction`, KMP smallest-period over the record
+  sequence) against the merged bytes rather than the config, since the merge is
+  what introduces the tiling. Refused at startup unless
+  `proteus_tiled_schedule_ok` is set. `docs/operators.md` no longer recommends the
+  configuration that caused it.
+- **A bulk transfer starved every interactive stream.** `MuxState::pending_outbound`
+  drained a single FIFO, so a download that enqueued a run of full-size frames put
+  every other stream behind all of them. On an ordinary link that delay is
+  absorbed; under a paced carrier the service rate is fixed by the cover envelope,
+  so it is the difference between a usable tunnel and a page load that stalls for
+  the length of a download. Now deficit round-robin across streams, quantum
+  configurable via `MuxPolicy::drr_quantum_bytes`.
+
+  Measured: with 20 bulk frames queued ahead of an interactive stream, FIFO served
+  it at position 20; DRR serves it at position <= 2. **This costs exactly zero
+  divergence** - which stream's bytes fill a frame is inside the AEAD, so the
+  emitted record sizes and timings are byte-identical either way. Intra-stream
+  order is preserved exactly; only the interleaving of streams changes.
+
+### Measured
+- **The `firefox-desktop` TLS fingerprint does not match Firefox.** A capture of
+  Firefox 153 shows **17 extensions and no GREASE**; the template emits **12 with
+  GREASE in the first and last slots**, differing in count, order and GREASE
+  presence at once. A ClientHello matching nothing in the population is worse than
+  matching the wrong browser: "block handshakes matching no known client" runs at
+  line rate on the first packet and defeats every downstream defence because none
+  of them are reached. **Not yet fixed** - re-derivation needs captures across
+  multiple builds, since a template matching one machine exactly is its own
+  uniqueness problem.
+- **Browse cover cannot meet a 200 kbps floor.** 88 kB per page load over a 0.34 s
+  burst is ~141 kbps at a page every 5 s and ~23 kbps at every 30 s. Duty cycle is
+  structural: a page load is mostly silence and no scheduler recovers silence.
+- **Segmented adaptive video (HLS) is the strong cover class**: 3.51 Mbps
+  sustained with a **877 ms worst-case gap and zero gaps over one second** in 74 s,
+  against buffered progressive video's 15-second stalls at a similar idle fraction.
+- **Firefox opens 3 concurrent connections to one HTTP/2 origin** (2-4 across
+  pages), not the 1 or 6 reasoned from protocol defaults. This unblocks a
+  trace-determined carrier count greater than one.
+- **The CONNECT tap is byte-identical to raw capture** on ClientHello extension
+  order and GREASE, which retroactively validates the fingerprint and cover-class
+  findings taken through it.
+
+### Documented
+- **[`docs/cover-scheduling.md`](docs/cover-scheduling.md) - cover selection is a
+  queueing problem.** Four plausible capacity statistics measured across four real
+  cover classes; all four rank the classes differently and all four are wrong.
+  Each is a summary of the cover's *marginal*; the binding constraint is the
+  *tunnel's queue*, and by Little's law a bounded gap gives bounded delay
+  regardless of rate. The surviving statistic is the high-quantile inter-record
+  gap multiplied by the offered rate.
+- **[`docs/proteus-2.0.md`](docs/proteus-2.0.md)** - what the shaper is, what
+  each mechanism does, the measurement that justifies it, and - in "What 2.0 does
+  not do" - the objectives it falls short of, including the constant-rate
+  square-root-law gap, unsolved trace repetition, the unestimated intrinsic
+  dimension that decides whether smoothing is even available, and the unbounded
+  model-error floor. Replaces the working plan file, which has been removed now
+  that its conclusions live in the release document and its failure modes in
+  docs/measurement-methodology.md.
 - **Target-conditioned cover is reachable from the automatic path.** Proteus has
   always preferred `<library>/<cover-host>/` so the shaped envelope matches the
   site the SNI announces, and fell back to a generic class when that directory

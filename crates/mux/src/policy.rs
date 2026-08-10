@@ -29,6 +29,25 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// enough to enforce backpressure long before the process OOMs.
 pub const DEFAULT_MAX_PENDING_OUTBOUND: usize = 1024;
 
+/// Bytes of credit each stream gets per deficit-round-robin round when the
+/// outbound queue is drained.
+///
+/// The outbound queue used to be drained strictly FIFO, so a bulk transfer that
+/// enqueued a run of full-size frames put every interactive stream behind all of
+/// them. Under a paced carrier the service rate is fixed by the cover envelope,
+/// so that head-of-line delay is not absorbed by a fast link - it is the
+/// difference between a usable tunnel and one where a page load stalls behind a
+/// download.
+///
+/// **This is free on the wire.** Which stream's bytes fill a frame is inside the
+/// AEAD; the emitted record sizes and timings are byte-identical either way. It
+/// is one of the few changes available that costs exactly zero divergence.
+///
+/// 4 KiB matches the frame body cap, so a stream sending full-size frames makes
+/// one frame of progress per round and small interactive writes interleave
+/// between them.
+pub const DEFAULT_DRR_QUANTUM_BYTES: usize = 4096;
+
 /// Configurable per-mux-connection policy. Apply via
 /// [`crate::stream::StreamId::new`] consumers and the connection
 /// driver (v0.2 will host the driver).
@@ -47,6 +66,10 @@ pub struct MuxPolicy {
     /// Max pending outbound frames before the state machine
     /// applies backpressure. See [`DEFAULT_MAX_PENDING_OUTBOUND`].
     pub max_pending_outbound: usize,
+    /// Per-round byte credit for deficit round-robin across streams when the
+    /// outbound queue is drained. See [`DEFAULT_DRR_QUANTUM_BYTES`]. Set to 0 to
+    /// restore strict FIFO (bulk transfers then starve interactive streams).
+    pub drr_quantum_bytes: usize,
 }
 
 impl Default for MuxPolicy {
@@ -56,6 +79,7 @@ impl Default for MuxPolicy {
             max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             max_pending_outbound: DEFAULT_MAX_PENDING_OUTBOUND,
+            drr_quantum_bytes: DEFAULT_DRR_QUANTUM_BYTES,
         }
     }
 }
@@ -70,5 +94,6 @@ mod tests {
         assert_eq!(p.initial_window, 65536);
         assert_eq!(p.max_concurrent_streams, 256);
         assert_eq!(p.stream_idle_timeout, Duration::from_secs(120));
+        assert_eq!(p.drr_quantum_bytes, 4096);
     }
 }

@@ -362,7 +362,15 @@ unrelated ones).
 
 If you want a *specific* envelope - your own site, a particular stream, an upload endpoint you
 control - record it with `mirage-cover-record` and set `proteus_profile`. Setting that path turns
-auto-sourcing off, so set `proteus_profile_up` to a dense capture as well or downloads inherit a
-20x slowdown. Details, including per-site target-conditioned replay and the bandwidth cost of a
+auto-sourcing off. Prefer ONE capture containing both directions.
+
+`proteus_profile_up` - a separate upstream capture - buys upload capacity at a cost that was
+previously understated here. The two directions then come from unrelated flows, so the replay has
+no request-response causality and can emit shapes real traffic never produces (downstream data
+with no preceding request); and the upstream is *tiled periodically* at that capture's span, which
+puts a comb in the upstream inter-record spectrum. Both are visible in a single flow, without
+statistics. Use it only when the alternative is no pacing at all, and expect the client to warn.
+
+Details, including per-site target-conditioned replay and the bandwidth cost of a
 given profile: [`tools/cover-sources/README.md`](../tools/cover-sources/README.md) and
 [Proteus](proteus.md).

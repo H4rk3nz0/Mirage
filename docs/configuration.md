@@ -157,7 +157,76 @@ continuously: [cover sources](../tools/cover-sources/README.md).
 | `wu_evasion` | `false` | Wear the Wu-2023 printable preamble on the high-entropy carriers (obfuscated QUIC + Shadowsocks-2022). For QUIC it must match the client; Shadowsocks is auto-detected per connection. Enable on networks running GFW-class entropy DPI. |
 | `dnstt_enabled`, `dnstt_domain`, `dnstt_bind` | `false` | DNS-tunnel carrier. |
 | `vless_uuid_hex` | - | VLESS credential. |
-| `shadow_target`, `http_shadow_target` | - | Where unauthenticated/probe traffic is transparently forwarded (the cover). |
+| `shadow_target`, `http_shadow_target` | `reality_cover_addr` | Where unauthenticated/probe traffic is transparently forwarded. Both default to `reality_cover_addr` verbatim. **Leave them alone unless you know why.** See below. |
+
+#### Why the probe decoys default to the cover host
+
+Both fields forward probe traffic somewhere; the question is where. The answer is
+not "anywhere plausible", and it is not even "the right host on a sensible port" -
+it is **`reality_cover_addr` exactly**. That is a measured result rather than a
+preference, and both of the plausible-looking alternatives were tried and leak.
+
+The test scores a single endpoint's probe classes *against each other*: send 17
+TLS/HTTP-shaped probes, take each class's median latency, and ask whether they
+form one cluster or two. A real web host forwards nothing, so every class costs
+one round trip and the medians are unimodal. A bridge that answers some classes
+locally and forwards the rest splits into a fast group and a slow group. The
+split needs no reference capture of the genuine host, which is what makes it
+worth defending against.
+
+Against a live bridge:
+
+| `http_shadow_target` | `http11` bytes | `http11` timing | gap stat G | p |
+|---|---|---|---|---|
+| unset | 0 vs 0 | 21.3 / 33.4 ms | 10.74 | 0.0002 |
+| `example.com:80` | 406 vs 0 | 13.5 / 32.4 ms | 10.90 | 0.0002 |
+| cover host `:80` | **173 vs 0** | 32.0 / 31.9 ms | 0.23 | 1.0 |
+| **`reality_cover_addr`** (`:443`) | **0 vs 0** | **32.0 / 31.9 ms** | **0.47** | **0.9993** |
+
+Row 2 is why "point it at a plaintext-HTTP server" - all the old startup warning
+asked for - is not the fix. It moves the outlier from 21.3 ms to 13.5 ms and leaves
+the endpoint exactly as separable. The observable was never "does this answer HTTP
+plausibly"; it is **"does this cost what the cover host costs,"** and only a decoy
+at the cover's own distance pays the right price.
+
+Row 3 is why the **port** matters, and it is a tell this project introduced while
+fixing the timing one. The cover's `:443` is a TLS port: it answers a plaintext GET
+with silence and a FIN. Its `:80` answers with a real 301. So forwarding to `:80`
+closed the timing partition and opened a **173-vs-0 byte channel** - the worse of the
+two, because bytes are categorical and cost a prober a single probe rather than a
+hundred.
+
+Row 4 is the answer, and it is the same principle as the rest of the design:
+**forward, do not emulate.** Send failed HTTP probes to the cover's own TLS port and
+the genuine host produces both the silence and the round trip, because it is the
+genuine host doing it.
+
+The bridge now warns on a different host *and* on the right host at a different
+port. Reproduce with `scripts/probe-suite/`; predictions and outcomes are recorded
+before each run in `scripts/probe-suite/PREREGISTERED.md`.
+
+#### Cover-host choice is a latency decision
+
+A related measurement, from the same suite: a splice does not add cost, it
+**relocates** cost out of the connect phase into the response phase, because its own
+setup to the cover happens after the prober's connect has already returned.
+
+    cover host : connect 17.84 + post-connect 14.11 = 31.95 ms
+    bridge     : connect  0.09 + post-connect 31.89 = 31.98 ms
+
+The bridge's post-connect cost equals the cover's *entire* cost to within 0.06 ms.
+The size of that relocation is the **bridge-to-cover RTT**, so a bridge network-close
+to its cover host is far harder to separate on timing than one far from it.
+
+Prefer a `reality_cover_addr` that is close to the bridge. This is not yet checked at
+startup, and the figures above come from a bridge on loopback - they are a lower
+bound on a real deployment's gap, not a measurement of one.
+
+**What this does not fix.** The cross-arm comparator (`compare.py`, which does need
+a synchronised capture of the real host) still separates 9 of 17 classes on byte-level
+and connection-lifecycle differences. Closing the partition removes the tell available
+to a prober who knows only the bridge's address; it does not make the bridge
+indistinguishable from the host it fronts.
 
 The bridge takes the same `proteus` / `proteus_profile` / `proteus_profile_up` keys as the
 client, with the same meanings - see [Proteus](#proteus-traffic-shaping). Both ends must

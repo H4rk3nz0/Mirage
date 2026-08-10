@@ -913,6 +913,39 @@ be bought for a tenth of what the cheap fix already delivered. Not built, delibe
 
 ## What is measured, and what is not
 
+> ### Cover class is now known to matter more than anything in this document
+>
+> Four cover classes were captured from a real browser on the wire and compared on
+> the same day by the same method. The result reorders the priorities below:
+>
+> | | browse page load | buffered video | live audio | **segmented HLS** |
+> |---|---|---|---|---|
+> | sustained rate | **23–141 kbps** | 11.87 Mbps | 139 kbps | **3.51 Mbps** |
+> | worst gap | 122 ms | **15014 ms** | 1633 ms | **877 ms** |
+> | gaps > 1 s | 0 | yes | 3 | **0** |
+> | record CV | 1.33 | 0.06 | 0.49 | 0.77 |
+>
+> **Browse cover cannot carry a general-purpose tunnel.** 88 kB per page over a
+> 0.34 s burst is ~141 kbps at a page every 5 s and ~23 kbps at every 30 s. Duty
+> cycle is structural — a page load is mostly silence, and no scheduler recovers
+> silence.
+>
+> **Record-size variance is not the capacity statistic**, by three independent
+> routes: the engine preserves the size marginal by construction; browse has the
+> *highest* CV and the lowest capacity; video has CV 0.06 and 1200× the
+> throughput. Any analysis ranking cover classes by size dispersion ranks them
+> backwards. The statistic that survives is the **high-quantile inter-record gap
+> times the offered rate** — see [cover-scheduling.md](cover-scheduling.md).
+>
+> ### The TLS fingerprint is known-wrong and it precedes all of this
+>
+> A capture of Firefox 153 shows **17 extensions and no GREASE**. The
+> `firefox-desktop` template emits **12 with GREASE in the first and last slots**.
+> A ClientHello matching nothing in the population is detected on the first packet,
+> before any envelope is observed — which makes every number in this document
+> academic until it is fixed. It is not yet fixed; re-derivation needs captures
+> across multiple browser builds.
+>
 > ### Results predating the host-aware cover library do not transfer
 >
 > Every separability number recorded in this document and in the repository's history

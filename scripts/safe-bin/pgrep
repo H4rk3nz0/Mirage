@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# pgrep is not available in this project. Use scripts/stop.sh.
+#
+# `pkill -f <pattern>` matches the invoking shell's own command line whenever the
+# pattern appears in it, so it kills its own process tree. In this repository that
+# has now happened six times: it killed the user's Firefox, and it killed three
+# separate measurement runs mid-flight - including one that had to be restarted
+# after 30 minutes of capture.
+#
+# scripts/stop.sh exists precisely for this and does the discovery safely: it
+# matches an exact substring over /proc, excludes its own tree, and refuses
+# patterns containing shell metacharacters.
+#
+# A warning in a document did not prevent the sixth instance. This does.
+echo "pgrep is disabled in this repo - it kills its own process tree." >&2
+echo "Use: scripts/stop.sh <pidfile|dir>   |   scripts/stop.sh --find <exact-substring>" >&2
+echo "     scripts/stop.sh --list" >&2
+exit 64

@@ -1,0 +1,248 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>cover-source: four-class re-take</title>
+<!--
+  The four cover classes, driven identically, at library defaults.
+
+    classes.html?cls=browse|buffered|audio|hls&secs=60
+
+  This is the RE-TAKE of the four-class table. The original was captured with a
+  tap that wrote a connection's trace only when that connection CLOSED, so every
+  long-lived connection was silently absent - in a study whose subject is
+  long-lived streaming. The tap is fixed; this drives the same four classes
+  through it.
+
+  SOURCES ARE PINNED HERE because the originals were not recorded anywhere, which
+  made the first table unreproducible even before it was known to be wrong.
+
+  Each class ends in VERDICT:OK with numbers or VERDICT:FAIL with a reason. A
+  headless run fails silently in several ways that all leave trace files behind -
+  autoplay blocked, source 404, stream stalled, page loaded but idle - and each
+  produces a clean-looking capture of nothing.
+-->
+<style>body{font:13px/1.5 monospace;margin:1rem}video,audio{width:320px}#log{white-space:pre-wrap}</style>
+<div id="log"></div>
+<script src="hls.min.js"></script>
+<script src="shaka-player.compiled.js"></script>
+<script>
+const q = new URLSearchParams(location.search);
+const CLS    = q.get("cls") || "browse";
+const SECS   = parseInt(q.get("secs") || "60", 10);
+const PLAYER = q.get("player") || "native";      // hlsjs | shaka | native
+const BUFFER = q.get("buffer") || "default";     // default | short | long
+const MODE   = q.get("mode")   || "sustained";   // single | sustained | throttled
+const REP    = parseInt(q.get("rep") || "0", 10);
+
+// Buffer settings per player. `default` sets NOTHING - the library's own value is
+// read back and reported, because an asserted default is just another
+// hand-written constant, and the last time one was assumed it was wrong by 3x.
+const BUFFERS = {
+  hlsjs:  {short: 10, long: 120},   // maxBufferLength; library default 30
+  shaka:  {short: 3,  long: 60},    // streaming.bufferingGoal; default 10
+};
+
+const SOURCES = {
+  // Buffered progressive video: one big MP4 fetched by the media element itself.
+  // 30 MB arrives in ~0.1 s on a fast link, so `sustained` mode cannot observe
+  // progressive buffering here at all - the matrix records that cell as refused
+  // with its reason rather than pretending. `throttled` mode is the one that
+  // models a player consuming at playback rate, and is the measurable cell.
+  buffered: "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/1080/Big_Buck_Bunny_1080_10s_30MB.mp4",
+  // Live audio: a continuous icecast stream, no seek, no buffer target.
+  audio: "https://ice1.somafm.com/groovesalad-128-mp3",
+  // Segmented adaptive video, 10 s segments.
+  hls: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
+  // Dynamic browse: real pages, loaded in sequence into an iframe.
+  // ONE page, then stop.
+  //
+  // This drove four navigations on a timer and the resulting trace's largest
+  // gaps were the driver's own inter-navigation idle - 12974 ms against an
+  // ~18 s interval. That is the seek-every-8s artifact this project already
+  // documented and warned about, reintroduced by the person who wrote the
+  // warning. Knowing the rule does not stop the reach; the harness has to
+  // refuse. See the driver-cadence guard below.
+  // M is swept by SITE: different sites open different numbers of concurrent
+  // connections, so the natural spread is the sweep. Forcing it through browser
+  // prefs was tried and the prefs do not control it through a CONNECT proxy.
+  browse: {
+    wikipedia: "https://en.wikipedia.org/wiki/Queueing_theory",
+    mdn: "https://developer.mozilla.org/en-US/docs/Web/HTTP",
+    archlinux: "https://wiki.archlinux.org/title/Main_page",
+    gnu: "https://www.gnu.org/software/coreutils/",
+  },
+};
+
+const out = [];
+function say(s) { out.push(s); document.getElementById("log").textContent = out.join("\n"); console.log(s); }
+
+const fetches = [];
+try {
+  new PerformanceObserver(l => { for (const e of l.getEntries()) fetches.push({t: e.startTime/1000, name: e.name, size: e.transferSize||0}); })
+    .observe({entryTypes: ["resource"]});
+} catch (e) { say("WARN: no PerformanceObserver: " + e); }
+
+function finish(ok, reason, extra) {
+  const s = Object.assign({class: CLS, resource_fetches: fetches.length,
+                           bytes_seen: fetches.reduce((a,f)=>a+f.size,0)}, extra || {});
+  say("SUMMARY:" + JSON.stringify(s));
+  say(ok ? "VERDICT:OK" : "VERDICT:FAIL " + reason);
+  document.title = ok ? "DONE-OK" : "DONE-FAIL";
+}
+
+if (CLS === "browse") {
+  // One navigation, no timer. The class is "a page load", and its gap structure
+  // must come from the page, not from when this script decided to click.
+  const f = document.createElement("iframe");
+  f.width = 800; f.height = 500; document.body.appendChild(f);
+  let loaded = 0;
+  f.addEventListener("load", () => { loaded++; });
+  const site = q.get("site") || "wikipedia";
+  const url = SOURCES.browse[site];
+  if (!url) { finish(false, "unknown site " + site); }
+  f.src = url;
+  setTimeout(() => {
+    if (fetches.length < 1 && loaded < 1) return finish(false, "no navigation observed");
+    finish(true, "", {navigations: 1, frame_loads: loaded, site, driver_interval_s: 0});
+  }, (SECS + 10) * 1000);
+
+} else if (CLS === "hetero") {
+  // THE COMPOSITE. A browse-class load and a video-class stream from one host,
+  // concurrently - which is what the design claims ordinary traffic looks like.
+  // Measured jointly rather than as two separate captures, because the claim is
+  // about the PAIR: two carriers of different classes can each be individually
+  // faithful while the pair reads as something no real host produces.
+  const f = document.createElement("iframe");
+  f.width = 800; f.height = 500; document.body.appendChild(f);
+  f.src = SOURCES.browse.wikipedia;
+  const v = document.createElement("video"); v.muted = true; v.playsInline = true;
+  document.body.appendChild(v);
+  let ok = true;
+  if (!window.Hls || !Hls.isSupported()) { ok = false; finish(false, "hls.js unsupported"); }
+  else {
+    const hls = new Hls();
+    hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) { ok = false; finish(false, "hls fatal: " + d.details); } });
+    hls.loadSource(SOURCES.hls); hls.attachMedia(v);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(e => finish(false, "play(): " + e)));
+  }
+  setTimeout(() => {
+    if (!ok) return;
+    // Both halves must have actually run, or the "composite" is one class with a
+    // dead sibling and its joint reading is meaningless.
+    const pages = fetches.filter(x => x.name.indexOf("wikipedia.org") >= 0).length;
+    if (pages < 1) return finish(false, "browse half never loaded");
+    if (v.currentTime < SECS * 0.4) return finish(false, `video half played only ${v.currentTime.toFixed(1)}s`);
+    finish(true, "", {played_s: +v.currentTime.toFixed(2), browse_fetches: pages,
+                      driver_interval_s: 0});
+  }, (SECS + 10) * 1000);
+
+} else if (CLS === "hls") {
+  const v = document.createElement("video"); v.muted = true; v.playsInline = true;
+  document.body.appendChild(v);
+  const done = (cfg) => setTimeout(() => v.currentTime >= SECS * 0.5
+      ? finish(true, "", {played_s: +v.currentTime.toFixed(2), config_readback: cfg,
+                          driver_interval_s: 0})
+      : finish(false, `played only ${v.currentTime.toFixed(1)}s`), (SECS + 10) * 1000);
+
+  if (PLAYER === "shaka") {
+    if (!window.shaka || !shaka.Player.isBrowserSupported()) finish(false, "shaka unsupported");
+    else {
+      shaka.polyfill.installAll();
+      const p = new shaka.Player(v);
+      if (BUFFER !== "default") {
+        p.configure({streaming: {bufferingGoal: BUFFERS.shaka[BUFFER]}});
+      }
+      const c = p.getConfiguration().streaming;
+      done({bufferingGoal: c.bufferingGoal});
+      p.addEventListener("error", e => finish(false, "shaka: " + (e.detail && e.detail.code)));
+      p.load(SOURCES.hls).then(() => v.play().catch(e => finish(false, "play(): " + e)))
+                         .catch(e => finish(false, "shaka load: " + (e && e.code)));
+    }
+  } else if (PLAYER === "hlsjs") {
+    if (!window.Hls || !Hls.isSupported()) finish(false, "hls.js unsupported");
+    else {
+      const cfg = BUFFER === "default" ? {} : {maxBufferLength: BUFFERS.hlsjs[BUFFER]};
+      const hls = new Hls(cfg);
+      done({maxBufferLength: hls.config.maxBufferLength});
+      hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) finish(false, "fatal: " + d.details); });
+      hls.loadSource(SOURCES.hls); hls.attachMedia(v);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(e => finish(false, "play(): " + e)));
+    }
+  } else {
+    // Firefox has no native HLS. Declared and refused rather than silently
+    // falling back to hls.js, which would report a native cell that never ran.
+    finish(false, "native HLS unsupported in this browser - cell not applicable");
+  }
+
+} else if (CLS === "buffered" && MODE === "throttled") {
+  // Consume the file at PLAYBACK RATE via explicit Range requests, one chunk per
+  // second, rather than letting the media element fetch as fast as the link
+  // allows. `sustained` mode on a 30 MB file completed in 0.5 s at 541 Mbps and
+  // produced a trace with no playback behaviour in it at all - the class being
+  // modelled is a player consuming a stream in real time, and that is what this
+  // does. Chunk size is the file's own average bitrate.
+  const url = SOURCES.buffered, CHUNK = 375000;   // ~3 Mbps, one second of video
+  let off = 0, chunks = 0, failed = null;
+  const tick = setInterval(async () => {
+    try {
+      // no-cors: the response is opaque and that is fine - this cell measures the
+      // wire behaviour of consuming a file at playback rate, not its contents.
+      const bust = url + (url.indexOf('?') < 0 ? '?' : '&') + 'n=' + chunks;
+      const r = await fetch(bust, {mode: 'no-cors',
+                                  headers: {Range: `bytes=${off}-${off + CHUNK - 1}`}});
+      if (r.type !== "opaque" && !r.ok && r.status !== 206) { failed = "HTTP " + r.status; clearInterval(tick); return; }
+      // An opaque response reports 0 bytes; advance by the requested size so the
+      // read head still walks the file.
+      const b = await r.arrayBuffer().catch(() => new ArrayBuffer(0));
+      off += (b.byteLength || CHUNK); chunks++;
+      if (off > 30_000_000) { off = 0; }        // wrap; keep consuming
+    } catch (e) { failed = String(e); clearInterval(tick); }
+  }, 1000);
+  setTimeout(() => {
+    clearInterval(tick);
+    if (failed) return finish(false, "range fetch failed: " + failed);
+    if (chunks < SECS * 0.5) return finish(false, `only ${chunks} chunks in ${SECS}s`);
+    // driver_interval_s is DECLARED here: this mode is periodic by construction,
+    // so the guard will refuse to read a gap bound off it. That is correct - the
+    // cell measures throughput and duty cycle, not silence structure.
+    finish(true, "", {chunks, bytes: off, driver_interval_s: 1});
+  }, (SECS + 10) * 1000);
+
+} else {
+  // buffered | audio - a media element fetching its own source, no player library.
+  const el = document.createElement(CLS === "audio" ? "audio" : "video");
+  el.muted = true; el.playsInline = true; el.src = SOURCES[CLS];
+  document.body.appendChild(el);
+  el.addEventListener("error", () => finish(false, "media error on " + SOURCES[CLS]));
+  el.play().catch(e => finish(false, "play(): " + e));
+  // Track when the media stopped fetching, so "buffered video" can be told from
+  // "file download".
+  let lastFetch = 0;
+  const watch = setInterval(() => {
+    const m = fetches.filter(f => f.name.indexOf(SOURCES[CLS]) === 0);
+    if (m.length) lastFetch = Math.max(lastFetch, m[m.length - 1].t);
+  }, 500);
+  setTimeout(() => {
+    clearInterval(watch);
+    // Live audio has no duration and may report currentTime oddly, so the check
+    // is that it played SOMETHING and moved.
+    const t = el.currentTime;
+    if (!(t > 1)) return finish(false, `playback advanced only ${t.toFixed(1)}s`);
+    if (CLS === "buffered") {
+      // THE ARTIFACT GUARD. A 30 MB file finished in ~2 s at 541 Mbps, so the
+      // trace was one download burst and contained no playback behaviour at all
+      // - yet it verified OK, because playback had indeed advanced. Fetch
+      // activity must span a meaningful part of the capture for this to be the
+      // buffered-video class rather than a file transfer.
+      const perf = performance.now() / 1000;
+      if (lastFetch < perf * 0.25) {
+        return finish(false,
+          `media fetching stopped at ${lastFetch.toFixed(1)}s of ${perf.toFixed(1)}s - ` +
+          `this is a file download, not progressive playback`);
+      }
+    }
+    finish(true, "", {played_s: +t.toFixed(2), last_media_fetch_s: +lastFetch.toFixed(2),
+                      driver_interval_s: 0,
+                      buffered_end_s: el.buffered.length ? +el.buffered.end(el.buffered.length-1).toFixed(2) : 0});
+  }, (SECS + 10) * 1000);
+}
+</script>
