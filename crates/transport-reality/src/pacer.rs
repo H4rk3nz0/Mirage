@@ -659,17 +659,17 @@ impl DeficitPermuter {
         // Measured: with the cap set to 1, a size reached -2 by the eleventh
         // record. The fix is a MUST-PICK: when a size in the window has fallen to
         // the cap, it is emitted next regardless of what the queue wants.
-        for i in 0..w {
-            if self.deficit(remaining[i].bytes) <= -self.delta_max.max(1) {
-                *self.emitted.entry(remaining[i].bytes).or_default() += 1;
+        for (i, tok) in remaining.iter().enumerate().take(w) {
+            if self.deficit(tok.bytes) <= -self.delta_max.max(1) {
+                *self.emitted.entry(tok.bytes).or_default() += 1;
                 self.total_emitted += 1;
                 return i;
             }
         }
 
         let mut best: Option<(usize, usize)> = None;
-        for i in 0..w {
-            let sz = remaining[i].bytes;
+        for (i, tok) in remaining.iter().enumerate().take(w) {
+            let sz = tok.bytes;
             if self.deficit(sz) + 1 > self.delta_max {
                 continue; // this size is already running ahead
             }
@@ -2642,7 +2642,7 @@ mod tests {
             let mut set =
                 HeteroCarrierSet::new(&[(StreamClass::Interactive, &bp), (StreamClass::Bulk, &vp)]);
             let mut out = Vec::new();
-            while let Some((c, _, em)) = set.next_due(|a, b| f(a, b)) {
+            while let Some((c, _, em)) = set.next_due(f) {
                 out.push((c, em.at.to_bits(), em.bytes));
             }
             out
