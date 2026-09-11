@@ -14,7 +14,7 @@
   <a href="docs/security-model.md">Security model</a>
 </p>
 
-> **Status:** `0.1.8-alpha.1`. Deployable today. Wire formats and config may still change
+> **Status:** `0.1.8-alpha.3`. Deployable today. Wire formats and config may still change
 > before a stable release.
 
 Mirage is not a single protocol. It is a **stack of interchangeable layers** - you pick
