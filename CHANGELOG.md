@@ -7,6 +7,8 @@ then, pre-releases may make breaking changes between versions.
 
 ## [Unreleased]
 
+## [0.2.0-alpha.3] - 2026-11-10
+
 ### Security
 - Updated Quinn, rustls, WebPKI roots, Tokio, and RustCrypto dependencies for
   the reported RustSec advisories. Mirage and its vendored WebRTC DTLS code now

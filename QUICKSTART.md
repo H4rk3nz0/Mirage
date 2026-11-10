@@ -3,7 +3,7 @@
 Deploy a Mirage proxy from a clean checkout: a **single bridge + client**
 (standalone) or a **two-bridge cohort** (fleet). Copy-paste configs included.
 
-**Status: 0.1.8-alpha.1, early alpha. APIs, config fields, and wire formats
+**Status: 0.2.0-alpha.3, early alpha. APIs, config fields, and wire formats
 may change before a stable release. Test on non-hostile networks first.**
 
 ---

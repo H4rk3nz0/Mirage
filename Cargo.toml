@@ -43,7 +43,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.8-alpha.1"
+version = "0.2.0-alpha.3"
 # MSRV. Must match rust-toolchain.toml. RustCrypto's patched crypto-bigint
 # requires 1.87; all workspace crates inherit this version.
 edition = "2021"

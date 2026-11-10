@@ -232,6 +232,11 @@ narrowly triaged warnings are documented in [.cargo/audit.toml](.cargo/audit.tom
 new untriaged advisories fail CI. CI also checks release workflows.
 Releases require a tag matching the workspace version, using
 `vMAJOR.MINOR.PATCH` or `vMAJOR.MINOR.PATCH-alpha.N` (likewise `beta` or `rc`).
+Set `[workspace.package].version` in `Cargo.toml`, run `cargo update --workspace`
+to refresh `Cargo.lock`, and move the release notes from `Unreleased` to a
+matching `CHANGELOG.md` heading. Commit those files before creating the tag.
+The release workflow reads the version at the tagged commit; a later commit to
+`main` cannot repair a tag on an older commit.
 
 The [documentation index](docs/) links to the configuration reference,
 internals, platform notes, measurements, and operator procedures.
