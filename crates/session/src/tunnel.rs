@@ -88,12 +88,26 @@ pub async fn write_padded_handshake_floor<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    write_padded_handshake_floor_with_fill(stream, msg, floor, |bytes| {
+        getrandom::fill(bytes).map_err(|_| SessionError::Entropy)
+    })
+    .await
+}
+
+async fn write_padded_handshake_floor_with_fill<S, F>(
+    stream: &mut S,
+    msg: &[u8],
+    floor: usize,
+    mut fill: F,
+) -> Result<(), SessionError>
+where
+    S: AsyncWrite + Unpin,
+    F: FnMut(&mut [u8]) -> Result<(), SessionError>,
+{
     let base = msg.len().max(floor);
     let mut pb = [0u8; 2];
-    let pad_extra = match getrandom::fill(&mut pb) {
-        Ok(()) => (u16::from_le_bytes(pb) as usize) % (HS_PAD_MAX + 1),
-        Err(_) => 0,
-    };
+    fill(&mut pb)?;
+    let pad_extra = (u16::from_le_bytes(pb) as usize) % (HS_PAD_MAX + 1);
     let total = base + pad_extra;
     let pad_len = total - msg.len();
     let total_u16 =
@@ -104,9 +118,7 @@ where
     if pad_len > 0 {
         let pad_start = frame.len();
         frame.resize(pad_start + pad_len, 0u8);
-        if let Some(tail) = frame.get_mut(pad_start..) {
-            let _ = getrandom::fill(tail);
-        }
+        fill(&mut frame[pad_start..])?;
     }
     stream.write_all(&frame).await.map_err(SessionError::Io)?;
     stream.flush().await.map_err(SessionError::Io)
@@ -369,6 +381,31 @@ mod tests {
         let mut s = [0u8; 32];
         getrandom::fill(&mut s).unwrap();
         s
+    }
+
+    #[tokio::test]
+    async fn handshake_padding_rng_failure_writes_nothing() {
+        for fail_on in [1, 2] {
+            let (mut writer, mut reader) = tokio::io::duplex(4096);
+            let mut draws = 0;
+            let err =
+                write_padded_handshake_floor_with_fill(&mut writer, &[0xAB; 32], 32, |bytes| {
+                    draws += 1;
+                    if draws == fail_on {
+                        Err(SessionError::Entropy)
+                    } else {
+                        bytes.fill(0xA5);
+                        Ok(())
+                    }
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SessionError::Entropy));
+            drop(writer);
+            let mut wire = Vec::new();
+            reader.read_to_end(&mut wire).await.unwrap();
+            assert!(wire.is_empty(), "failed draw {fail_on} leaked a frame");
+        }
     }
 
     /// review-1: a framed handshake message round-trips exactly, its on-wire

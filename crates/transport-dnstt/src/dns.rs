@@ -238,24 +238,25 @@ pub fn encode_query(id: u16, qname: &str) -> Option<Vec<u8>> {
     // 1232-byte UDP bufsize + a fresh 8-byte client COOKIE (RFC 7873), which
     // real resolvers randomize per server, so it also blends with normal query
     // entropy rather than repeating a constant.
-    write_edns0_opt_query(&mut out);
+    write_edns0_opt_query(&mut out)?;
     Some(out)
 }
 
 /// Append a client-side EDNS0 OPT pseudo-RR (root name, TYPE=OPT, CLASS=UDP
 /// bufsize, TTL=0, RDATA = one COOKIE option with an 8-byte client cookie).
-fn write_edns0_opt_query(out: &mut Vec<u8>) {
+fn write_edns0_opt_query(out: &mut Vec<u8>) -> Option<()> {
+    let mut cookie = [0u8; 8];
+    getrandom::fill(&mut cookie).ok()?;
     out.push(0x00); // NAME = root
     out.extend_from_slice(&TYPE_OPT.to_be_bytes());
     out.extend_from_slice(&EDNS_UDP_BUFSIZE.to_be_bytes()); // CLASS field = bufsize
     out.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // TTL: ext-rcode/version/flags = 0
-    let mut cookie = [0u8; 8];
-    let _ = getrandom::fill(&mut cookie); // best-effort; zeros on CSPRNG failure
     let rdlen: u16 = 4 + 8; // COOKIE option header (4) + 8-byte client cookie
     out.extend_from_slice(&rdlen.to_be_bytes());
     out.extend_from_slice(&EDNS_OPT_COOKIE.to_be_bytes()); // OPTION-CODE
     out.extend_from_slice(&8u16.to_be_bytes()); // OPTION-LENGTH = 8 (client cookie)
     out.extend_from_slice(&cookie);
+    Some(())
 }
 
 /// A parsed query, carrying everything the authoritative response must mirror.

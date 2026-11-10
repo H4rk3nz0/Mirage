@@ -411,7 +411,8 @@ where
     let fingerprint: &'_ crate::tls_fingerprint::TlsFingerprintTemplate =
         match inputs.tls_fingerprint {
             Some(t) => t,
-            None => crate::tls_fingerprint::pick_weighted_template(),
+            None => crate::tls_fingerprint::try_pick_weighted_template()
+                .map_err(|_| CarrierError::Reality("CSPRNG unavailable".into()))?,
         };
     // Per-connection REAL ML-KEM-768 keypair for the hybrid X25519MLKEM768
     // key_share. We RETAIN the decapsulation key (`mlkem_dk`) so that when the
@@ -430,9 +431,12 @@ where
         server_name: inputs.server_name,
         include_alpn: true,
         fingerprint,
-        // Per-connection GREASE (RFC 8701) + the hybrid key_share so the
-        // ClientHello byte-matches modern Chrome/Firefox.
-        grease: Some(crate::tls_fingerprint::GreaseValues::random()),
+        // Fresh GREASE/ECH material plus a hybrid key share. The template
+        // decides whether RFC 8701 GREASE and extension shuffling are emitted.
+        grease: Some(
+            crate::tls_fingerprint::GreaseValues::try_random()
+                .map_err(|_| CarrierError::Reality("CSPRNG unavailable".into()))?,
+        ),
         mlkem_ek: Some(&mlkem_ek),
     })
     .map_err(CarrierError::from)?;
@@ -1268,6 +1272,12 @@ where
             (None, None) => unreachable!("ephemeral branch always populates"),
         };
 
+    // Draw the ticket material before the first TLS write. If entropy fails,
+    // abort before sending a partial ServerHello that would never complete.
+    let mut nst_rand = [0u8; 4 + 32 + 192];
+    getrandom::fill(&mut nst_rand)
+        .map_err(|_| CarrierError::Reality("CSPRNG unavailable for TLS ticket".into()))?;
+
     // 2. Bridge ephemeral for TLS 1.3 ECDH.
     let bridge_eph_sk = StaticSecret::from(rand32());
     let bridge_eph_pk = *PublicKey::from(&bridge_eph_sk).as_bytes();
@@ -1378,29 +1388,26 @@ where
     // for wire realism only. The ticket + nonce are CSPRNG opaque blobs of a
     // realistic size (~192 B, typical of real tickets).
     {
-        let mut nst_rand = [0u8; 4 + 32 + 192];
-        if getrandom::fill(&mut nst_rand).is_ok() {
-            let age_add = u32::from_be_bytes([nst_rand[0], nst_rand[1], nst_rand[2], nst_rand[3]]);
-            let nonce = &nst_rand[4..36];
-            let ticket = &nst_rand[36..];
-            // 2-hour lifetime, within the RFC 8446 7-day ceiling and typical of
-            // real deployments.
-            let nst = build_new_session_ticket(7200, age_add, nonce, ticket);
-            // Red-team #8: in cover-matched mode (pinned / cover-mimicry, where
-            // `cover_flight_target` is the measured real-cover flight size), only
-            // append the ticket if the flight record STILL fits that size. If it
-            // would push us over, skip it - preserving the size-match matters more
-            // than the ticket-shape realism, and overshooting the cover would be
-            // its own size tell. In ephemeral mode (no target) always append.
-            let fits = match cover_flight_target {
-                Some(target) => {
-                    RECORD_HEADER_LEN + flight.len() + nst.len() + 1 + AEAD_TAG_LEN <= target
-                }
-                None => true,
-            };
-            if fits {
-                flight.extend_from_slice(&nst);
+        let age_add = u32::from_be_bytes([nst_rand[0], nst_rand[1], nst_rand[2], nst_rand[3]]);
+        let nonce = &nst_rand[4..36];
+        let ticket = &nst_rand[36..];
+        // 2-hour lifetime, within the RFC 8446 7-day ceiling and typical of
+        // real deployments.
+        let nst = build_new_session_ticket(7200, age_add, nonce, ticket);
+        // Red-team #8: in cover-matched mode (pinned / cover-mimicry, where
+        // `cover_flight_target` is the measured real-cover flight size), only
+        // append the ticket if the flight record STILL fits that size. If it
+        // would push us over, skip it - preserving the size-match matters more
+        // than the ticket-shape realism, and overshooting the cover would be
+        // its own size tell. In ephemeral mode (no target) always append.
+        let fits = match cover_flight_target {
+            Some(target) => {
+                RECORD_HEADER_LEN + flight.len() + nst.len() + 1 + AEAD_TAG_LEN <= target
             }
+            None => true,
+        };
+        if fits {
+            flight.extend_from_slice(&nst);
         }
     }
     // M1: reproduce the cover's record FRAMING (count + per-record sizes) when we
@@ -1535,7 +1542,7 @@ fn extract_sni(ch_record: &[u8]) -> Option<String> {
 /// cover cannot stall a legitimate handshake longer than the fail path would.
 async fn equalize_pass_path_via_cover(cover: &mut TcpStream, ch_bytes: &[u8], cap: Duration) {
     cover.set_nodelay(true).ok();
-    let _ = tokio::time::timeout(cap, async {
+    let exchange = async {
         cover.write_all(ch_bytes).await?;
         cover.flush().await?;
         // A single successful read == the cover's first flight byte has
@@ -1545,8 +1552,12 @@ async fn equalize_pass_path_via_cover(cover: &mut TcpStream, ch_bytes: &[u8], ca
         let mut buf = [0u8; 4096];
         let _ = cover.read(&mut buf).await?;
         Ok::<(), io::Error>(())
-    })
-    .await;
+    };
+    if cap.is_zero() {
+        let _ = exchange.await;
+    } else {
+        let _ = tokio::time::timeout(cap, exchange).await;
+    }
 }
 
 /// Phase 2J helper (closes [RT-CN-1]): forward client traffic to
@@ -1566,9 +1577,6 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
 {
     cover.set_nodelay(true).ok();
-    // Replay the buffered ClientHello so the cover sees the exact
-    // bytes the client sent. SNI / key_share all line up.
-    cover.write_all(buffered_client_hello).await?;
     // Jitter the cap per-connection. A FIXED cut (every unauthenticated
     // cover-forwarded session severed at exactly `duration_cap`) is a Mirage
     // signature no real HTTPS server produces. Draw a uniform factor in
@@ -1578,14 +1586,20 @@ where
         duration_cap
     } else {
         let mut b = [0u8; 8];
-        let f = match getrandom::fill(&mut b) {
-            Ok(()) => 0.6 + (u64::from_le_bytes(b) as f64 / u64::MAX as f64) * 1.3,
-            Err(_) => 1.0,
-        };
+        getrandom::fill(&mut b)
+            .map_err(|_| io::Error::other("reality: cover duration entropy unavailable"))?;
+        let f = 0.6 + (u64::from_le_bytes(b) as f64 / u64::MAX as f64) * 1.3;
         duration_cap.mul_f64(f)
     };
+    // Replay the buffered ClientHello only after the cover duration draw
+    // succeeds, so entropy failure cannot leave a recognizable partial flow.
+    cover.write_all(buffered_client_hello).await?;
     let fut = tokio::io::copy_bidirectional(client, &mut cover);
-    let result = tokio::time::timeout(duration_cap, fut).await;
+    let result = if duration_cap.is_zero() {
+        Ok(fut.await)
+    } else {
+        tokio::time::timeout(duration_cap, fut).await
+    };
     let _ = cover.shutdown().await;
     match result {
         Ok(Ok((c2s, s2c))) => Ok((c2s + buffered_client_hello.len() as u64, s2c)),
@@ -1999,7 +2013,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for RealityStream<S> {
             // cover-envelope token, so emit it as ONE record and don't re-split.
             vec![take]
         } else {
-            self.shaper.split_plan(take)
+            match self.shaper.split_plan(take) {
+                Ok(plan) => plan,
+                Err(_) => {
+                    return Poll::Ready(Err(io::Error::other(
+                        "reality: record-shaping entropy unavailable",
+                    )));
+                }
+            }
         };
         let mut wire: Vec<u8> =
             Vec::with_capacity(take + sublens.len() * (RECORD_HEADER_LEN + AEAD_TAG_LEN));
@@ -2126,6 +2147,43 @@ mod tests {
     use super::*;
     use tokio::io::duplex;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn zero_cover_cap_allows_a_complete_forwarded_exchange() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cover_task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 9];
+            sock.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"HELLOping");
+            sock.write_all(b"pong").await.unwrap();
+        });
+
+        let cover = TcpStream::connect(addr).await.unwrap();
+        let (mut bridge_side, mut client_side) = duplex(64);
+        let forwarding = tokio::spawn(async move {
+            forward_to_cover_with_stream(&mut bridge_side, cover, b"HELLO", Duration::ZERO).await
+        });
+        client_side.write_all(b"ping").await.unwrap();
+        let mut response = [0u8; 4];
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client_side.read_exact(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&response, b"pong");
+        client_side.shutdown().await.unwrap();
+        cover_task.await.unwrap();
+        let (c2s, s2c) = tokio::time::timeout(Duration::from_secs(2), forwarding)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!((c2s, s2c), (9, 4));
+    }
 
     #[test]
     fn parse_server_flight_tolerates_trailing_new_session_tickets() {

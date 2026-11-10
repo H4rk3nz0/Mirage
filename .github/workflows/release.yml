@@ -3,12 +3,12 @@ name: Release
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+*'
+      # GitHub tag filters are globs, not regular expressions. Match broadly;
+      # the validate job below enforces the version grammar and Cargo version.
+      - 'v*'
   # Manual run from the Actions tab ("Run workflow"). A tag push is the normal
-  # path; this is for testing the pipeline or cutting a release without pushing a
-  # tag. On a manual run `github.ref_name` is the branch, so every version
-  # reference below uses `inputs.tag` when set and falls back to the tag name
-  # otherwise.
+  # path. For manual runs, select a ref at the release tag's commit and enter
+  # that existing tag. The validation job rejects any source mismatch.
   workflow_dispatch:
     inputs:
       tag:
@@ -17,22 +17,75 @@ on:
         type: string
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
-  # NOTE: no `RUSTFLAGS: -D warnings` here on purpose. Warning-denial is a lint
-  # gate (enforced in ci.yml on every push), not a release concern — a release
-  # must produce binaries, not fail on a stray warning. Leaving RUSTFLAGS unset
-  # also lets setup-cross-toolchain-action's target env apply cleanly.
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  # Resolve the requested tag once and make every build use that exact commit,
+  # so the release label, source tree, and provenance agree.
+  validate:
+    name: Validate release tag and source
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      installer_version: ${{ steps.source.outputs.installer_version }}
+      short_version: ${{ steps.source.outputs.short_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Check tag and workspace version
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
+            echo "::error::Release tag must be vMAJOR.MINOR.PATCH or an alpha/beta/rc numbered prerelease."
+            exit 1
+          fi
+          VERSION=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')
+          if [[ "$RELEASE_TAG" != "v$VERSION" ]]; then
+            echo "::error::Tag $RELEASE_TAG does not match workspace version $VERSION."
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "::error::Manual run ref and release tag point to different commits. Select a ref at the tag commit."
+            exit 1
+          fi
+          # MSI and CFBundleVersion compare three numeric components. Reserve
+          # slots within each patch for alpha, beta, rc, then stable.
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          import re
+
+          match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)(?:-(alpha|beta|rc)\.(\d+))?", os.environ["RELEASE_TAG"])
+          assert match is not None
+          major, minor, patch = map(int, match.group(1, 2, 3))
+          stage, number = match.group(4, 5)
+          if major > 255 or minor > 255 or patch > 64:
+              raise SystemExit("Installer version exceeds its supported major/minor/patch range")
+          if stage is None:
+              slot = 999
+          else:
+              number = int(number)
+              if number > 199:
+                  raise SystemExit("Installer prerelease number must be at most 199")
+              slot = {"alpha": 0, "beta": 200, "rc": 400}[stage] + number
+          print(f"installer_version={major}.{minor}.{patch * 1000 + slot}")
+          print(f"short_version={major}.{minor}.{patch}")
+          PY
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   # ------------------------------------------------------------------
   # Build release binaries for each target platform.
   # ------------------------------------------------------------------
   build:
     name: Build (${{ matrix.target }})
+    needs: validate
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -71,15 +124,8 @@ jobs:
             strip: false
             archive: tar.gz
 
-          # NOTE: MIPS routers (mips/mipsel-unknown-linux-musl) are intentionally
-          # NOT built here. They are Rust tier-3 with NO prebuilt std on the pinned
-          # 1.86 stable toolchain (`rustup target add mips*` => "rust-std ...
-          # unavailable"), so they require nightly `-Z build-std`, which would break
-          # the MSRV-1.86 stable pin. `ring` also has no MIPS backend, so a MIPS
-          # build additionally has to drop the QUIC (Hysteria2/MASQUE) and WebRTC
-          # transports and swap the rustls provider to rustls-rustcrypto. The
-          # documented recipe for a future opt-in MIPS "lite" build lives in
-          # docs/building.md ("MIPS routers (advanced / deferred)").
+          # MIPS needs nightly build-std and a different crypto provider; see
+          # docs/building.md. It is outside this stable release matrix.
 
           - os: macos-latest
             target: x86_64-apple-darwin
@@ -101,24 +147,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
 
-      # rust-toolchain.toml pins channel="1.86", which rustup uses for every cargo
-      # build here, so the target's std must live in THAT toolchain. Install 1.86
-      # with the target for EVERY leg (native + musl-ARM) so `cargo build --target
-      # <triple>` finds core/std.
+      # Install the target std into the toolchain selected by rust-toolchain.toml.
       - name: Install Rust 1.86 with the target std
         shell: bash
         run: rustup toolchain install 1.86 --profile minimal --target ${{ matrix.target }}
 
-      # CROSS legs (aarch64 / armv7 MUSL): `ring` ships C + perlasm and needs a musl
-      # C cross-compiler. We do NOT use `cross` here: when cross's host-side preflight
-      # can't set up a container it SILENTLY re-runs plain `cargo build` on the bare
-      # runner with no CC exported, so ring's cc-rs hunts for `arm-linux-musleabihf-gcc`
-      # and dies (the exact failure this replaces). This action installs the musl
-      # cross toolchain on the host and exports CC_<triple>/AR_<triple>/
-      # CARGO_TARGET_<TRIPLE>_LINKER, so the plain `cargo build --target` below just
-      # works. It only runs `rustup target add` on the active 1.86 toolchain — never a
-      # newer rustc — so the MSRV pin holds. Both targets are first-class tested here.
+      # The musl ARM legs need a C cross-compiler for ring and the target linker.
       - name: Set up musl cross toolchain (musl ARM legs)
         if: matrix.cross
         uses: taiki-e/setup-cross-toolchain-action@v1
@@ -140,18 +177,10 @@ jobs:
           restore-keys: |
             release-${{ matrix.target }}-
 
-      # The transparent VPN (Linux: /dev/net/tun; macOS: utun; Windows: Wintun)
-      # is ALWAYS compiled into the client — there is no build-time feature flag.
-      # TUN mode stays runtime-opt-in (`tun_enabled`, default false), so the
-      # shipped binary is a plain SOCKS5 proxy until the operator turns it on.
-      # The bridge/keygen/publish bins have no TUN code.
-      # All legs build with plain cargo. The musl-ARM legs get their C cross-compiler
-      # + linker from the setup-cross-toolchain step above; native legs use the host
-      # (or musl-tools) compiler.
       - name: Build release binaries
         run: |
-          cargo build --release --target ${{ matrix.target }} --bin mirage-bridge --bin mirage-keygen --bin mirage-publish --bin mirage-setup
-          cargo build --release --target ${{ matrix.target }} -p mirage-client
+          cargo build --locked --release --target ${{ matrix.target }} --bin mirage-bridge --bin mirage-keygen --bin mirage-publish --bin mirage-setup
+          cargo build --locked --release --target ${{ matrix.target }} -p mirage-client
 
       - name: Strip binaries (Linux / macOS)
         if: matrix.strip
@@ -169,21 +198,13 @@ jobs:
             mirage-bridge mirage-client mirage-keygen mirage-publish mirage-setup
           echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
 
-      # Wintun (the WireGuard TUN driver the client's VPN mode loads on Windows)
-      # is shipped ALONGSIDE the binary. It is downloaded from the official
-      # upstream, pinned to a version, and its archive is SHA-256-verified before
-      # use — so the shipped wintun.dll has auditable provenance in this workflow
-      # rather than being an opaque vendored blob. The client loads it from next
-      # to the .exe (see mirage-tun `OsTun::create`).
+      # Bundle a versioned, hash-checked Wintun DLL for VPN mode.
       - name: Fetch + verify Wintun (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
           $WINTUN_VERSION = "0.14.1"
           $WINTUN_SHA256  = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
-          # Official build host. (git.zx2c4.com is only a cgit source browser and
-          # 404s on /builds/*.zip.) The SHA-256 below is pinned, so a MITM swap of
-          # the download is caught before the DLL is bundled.
           $url = "https://www.wintun.net/builds/wintun-$WINTUN_VERSION.zip"
           Invoke-WebRequest -Uri $url -OutFile wintun.zip
           $got = (Get-FileHash wintun.zip -Algorithm SHA256).Hash.ToLower()
@@ -225,9 +246,12 @@ jobs:
   # ------------------------------------------------------------------
   android:
     name: Build (Android jniLibs)
+    needs: validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
 
       - name: Install Rust 1.86 with the Android targets
         run: rustup toolchain install 1.86 --profile minimal --target aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
@@ -254,7 +278,7 @@ jobs:
       - name: Build .so for every ABI into a jniLibs tree
         run: |
           cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o jniLibs \
-            build --release -p mirage-mobile-ffi
+            build --locked --release -p mirage-mobile-ffi
 
       - name: Package Android kit (tar.gz)
         run: |
@@ -283,9 +307,12 @@ jobs:
   # ------------------------------------------------------------------
   ios:
     name: Build (iOS XCFramework)
+    needs: validate
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
 
       - name: Install Rust 1.86 with the iOS targets
         run: rustup toolchain install 1.86 --profile minimal --target aarch64-apple-ios,aarch64-apple-ios-sim
@@ -303,8 +330,8 @@ jobs:
 
       - name: Build staticlib (device + simulator)
         run: |
-          cargo +1.86 build --release -p mirage-mobile-ffi --target aarch64-apple-ios
-          cargo +1.86 build --release -p mirage-mobile-ffi --target aarch64-apple-ios-sim
+          cargo +1.86 build --locked --release -p mirage-mobile-ffi --target aarch64-apple-ios
+          cargo +1.86 build --locked --release -p mirage-mobile-ffi --target aarch64-apple-ios-sim
 
       - name: Assemble XCFramework + package
         run: |
@@ -331,15 +358,11 @@ jobs:
           if-no-files-found: error
 
   # ------------------------------------------------------------------
-  # Desktop GUI (mirage-client-gui): glibc-dynamic on Linux, native on
-  # macOS/Windows. NOT musl-static — the Slint software renderer's winit backend
-  # dlopens the desktop windowing libs (X11/Wayland) at runtime, which a fully
-  # static musl binary cannot do. No system build libraries are needed (Slint's
-  # software renderer). Ships alongside a matching mirage-client, which the GUI
-  # supervises and expects next to itself.
+  # The Linux GUI is glibc-dynamic and bundles the matching client daemon.
   # ------------------------------------------------------------------
   gui:
     name: Build GUI (${{ matrix.target }})
+    needs: validate
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -366,9 +389,9 @@ jobs:
             archive: zip
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
 
-      # rust-toolchain.toml pins channel="1.86"; install it with the target std.
-      # The GUI builds on 1.86 (smol_str is lock-pinned to 0.3.2 for exactly this).
       - name: Install Rust 1.86 with the target std
         shell: bash
         run: rustup toolchain install 1.86 --profile minimal --target ${{ matrix.target }}
@@ -384,23 +407,14 @@ jobs:
           restore-keys: |
             release-gui-${{ matrix.target }}-
 
-      # No apt-get / system libs: Slint's software renderer links only the
-      # standard C runtime. On Linux the windowing stack (X11/Wayland) is dlopened
-      # at RUN time on the user's desktop, not needed to build.
       - name: Build GUI + client
-        run: cargo build --release --target ${{ matrix.target }} -p mirage-client-gui -p mirage-client
+        run: cargo build --locked --release --target ${{ matrix.target }} -p mirage-client-gui -p mirage-client
 
       - name: Strip binaries (Linux / macOS)
         if: matrix.strip
         run: |
           cd target/${{ matrix.target }}/release
           strip mirage-client-gui mirage-client 2>/dev/null || true
-
-      # NOTE: the installer legs below run on GitHub's mac/Windows runners and
-      # can't be exercised locally — the first release run is expected to shake
-      # out any runner-specific tweaks (WiX path, iconutil, appimagetool).
-      # Installers are UNSIGNED for the alpha; see docs/install.md for the
-      # one-time "open past the OS warning" steps on macOS/Windows.
 
       - name: Fetch + verify Wintun (Windows)
         if: runner.os == 'Windows'
@@ -444,6 +458,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ inputs.tag || github.ref_name }}"; VER="${TAG#v}"
+          DEBVER="${VER/-/\~}"
           SRC="target/${{ matrix.target }}/release"
           ICON="crates/client-gui/assets/icon-256.png"
           mkdir -p dist
@@ -456,7 +471,7 @@ jobs:
           install -m755 "$SRC/mirage-client-gui" "$SRC/mirage-client" "$DEB/usr/bin/"
           install -m644 packaging/linux/mirage.desktop "$DEB/usr/share/applications/mirage.desktop"
           install -m644 "$ICON" "$DEB/usr/share/icons/hicolor/256x256/apps/mirage.png"
-          printf 'Package: mirage\nVersion: %s\nArchitecture: amd64\nMaintainer: Mirage <mirage@localhost>\nSection: net\nPriority: optional\nDepends: libc6\nDescription: Mirage anti-censorship client (GUI + daemon)\n Desktop GUI and client daemon for the Mirage anti-censorship network.\n' "$VER" > "$DEB/DEBIAN/control"
+          printf 'Package: mirage\nVersion: %s\nArchitecture: amd64\nMaintainer: Mirage <mirage@localhost>\nSection: net\nPriority: optional\nDepends: libc6\nDescription: Mirage anti-censorship client (GUI + daemon)\n Desktop GUI and client daemon for the Mirage anti-censorship network.\n' "$DEBVER" > "$DEB/DEBIAN/control"
           dpkg-deb --build --root-owner-group "$DEB" "dist/mirage-${TAG}-amd64.deb"
 
           # ---- AppImage (binary links only libc; X11/Wayland come from the host) ----
@@ -468,21 +483,29 @@ jobs:
           install -m644 "$ICON" "$APPDIR/mirage.png"
           printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/bin/mirage-client-gui" "$@"\n' > "$APPDIR/AppRun"
           chmod +x "$APPDIR/AppRun"
-          wget -qO appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          curl -fsSLo appimagetool https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          echo 'ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool' | sha256sum -c -
+          curl -fsSLo appimage-runtime https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+          echo '2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  appimage-runtime' | sha256sum -c -
           chmod +x appimagetool
           ./appimagetool --appimage-extract >/dev/null   # extract & run (no FUSE on runners)
-          ARCH=x86_64 ./squashfs-root/AppRun "$APPDIR" "dist/mirage-${TAG}-x86_64.AppImage"
+          ARCH=x86_64 ./squashfs-root/AppRun --runtime-file "$GITHUB_WORKSPACE/appimage-runtime" "$APPDIR" "dist/mirage-${TAG}-x86_64.AppImage"
 
       - name: Build .dmg (macOS)
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          TAG="${{ inputs.tag || github.ref_name }}"; VER="${TAG#v}"
+          TAG="${{ inputs.tag || github.ref_name }}"
+          SHORTVER="${{ needs.validate.outputs.short_version }}"
+          BUILDVER="${{ needs.validate.outputs.installer_version }}"
           SRC="target/${{ matrix.target }}/release"
           APP="Mirage.app"
           rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp "$SRC/mirage-client-gui" "$SRC/mirage-client" "$APP/Contents/MacOS/"
-          sed "s/{VERSION}/$VER/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+          sed -e "/CFBundleVersion/s/{VERSION}/$BUILDVER/" \
+              -e "/CFBundleShortVersionString/s/{VERSION}/$SHORTVER/" \
+              packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+          plutil -lint "$APP/Contents/Info.plist"
           # Build an .icns from the PNG set.
           rm -rf mirage.iconset; mkdir mirage.iconset
           cp crates/client-gui/assets/icon-16.png  mirage.iconset/icon_16x16.png
@@ -502,15 +525,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $TAG = "${{ inputs.tag || github.ref_name }}"; $VER = $TAG -replace '^v',''
-          # MSI ProductVersion must be numeric x.x.x.x (0-65534). Map the tag's
-          # semver to it: base MAJOR.MINOR.PATCH, and the pre-release number (if
-          # any) as the 4th field so alpha.1/alpha.2 stay distinct. e.g.
-          # v0.1.3-alpha.1 -> 0.1.3.1 ; v0.1.3 -> 0.1.3.0
-          $base = ($VER -split '-')[0]
-          $build = 0
-          if ($VER -match '-') { $pre = ($VER -split '-',2)[1]; if ($pre -match '(\d+)') { $build = $Matches[1] } }
-          $MSIVER = "$base.$build"
+          $TAG = "${{ inputs.tag || github.ref_name }}"
+          $MSIVER = "${{ needs.validate.outputs.installer_version }}"
           $SRC = "target/${{ matrix.target }}/release"
           New-Item -ItemType Directory -Force -Path wixbuild, dist | Out-Null
           Copy-Item "$SRC/mirage-client-gui.exe","$SRC/mirage-client.exe","$SRC/wintun.dll" wixbuild/
@@ -540,18 +556,17 @@ jobs:
   # ------------------------------------------------------------------
   release:
     name: Publish GitHub release
-    needs: [build, android, ios, gui]
+    needs: [validate, build, android, ios, gui, smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      # Required for keyless Sigstore build-provenance attestation. This lets a
-      # user cryptographically verify that a downloaded binary was built by THIS
-      # workflow from THIS source - the defence against a censor serving a
-      # trojaned rebuild with a matching (also-forged) SHA256SUMS file.
+      # Required to attest the published archive digests.
       id-token: write
       attestations: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
 
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
@@ -587,9 +602,23 @@ jobs:
           echo "$NOTES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
+      - name: Recheck release tag before publishing
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          TAG_SHA=$(git rev-parse "$RELEASE_TAG^{commit}")
+          if [[ "$TAG_SHA" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Release tag moved during the build: $TAG_SHA != $EXPECTED_SHA"
+            exit 1
+          fi
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           name: Mirage ${{ inputs.tag || github.ref_name }}
           body: |
             ## Mirage ${{ inputs.tag || github.ref_name }}
@@ -612,7 +641,7 @@ jobs:
 
             Installers bundle `mirage-client-gui` + a matching `mirage-client`.
             **Installers are unsigned** for the alpha — see
-            [docs/install.md](https://github.com/OWNER/mirage/blob/main/docs/install.md)
+            [docs/install.md](https://github.com/${{ github.repository }}/blob/${{ env.RELEASE_TAG }}/docs/install.md)
             for the one-time step to open past the macOS Gatekeeper / Windows
             SmartScreen warning. A plain archive is also provided per platform.
 
@@ -633,10 +662,9 @@ jobs:
             | Android (`.so` per ABI + Kotlin bridge) | `mirage-${{ inputs.tag || github.ref_name }}-android.tar.gz` |
             | iOS (XCFramework + Swift bridge) | `mirage-${{ inputs.tag || github.ref_name }}-ios-xcframework.zip` |
 
-            **Verify before running** (a censor's easiest attack is a trojaned build):
+            **Verify before running:**
             1. `sha256sum -c SHA256SUMS.txt` against the archive you downloaded.
-            2. Verify build provenance (proves it was built by this workflow from
-               this source, not repackaged):
+            2. Verify the archive's GitHub workflow attestation:
                `gh attestation verify <archive> --owner ${{ github.repository_owner }}`
 
             ### Included binaries

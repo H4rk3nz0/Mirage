@@ -43,43 +43,19 @@
 //! - **Cost cap**: <= 5% of session traffic by volume. Larger
 //!   ratios make cover-traffic detectable as itself a signal.
 //!
-//! # NOT ON THE LIVE PATH - status
+//! # Live wiring
 //!
-//! **The schedulers in this module ([`CoverScheduler`],
-//! [`CbrCoverScheduler`]) are NOT constructed on any live path.**
-//! Nothing outside this module's own unit tests instantiates them;
-//! the client and bridge runtimes do not drive `tick()`. Do not
-//! mistake this module for active cover-traffic coverage.
+//! The client constructs [`CoverScheduler`] in its cover-traffic
+//! task when destinations are configured. It ticks about once per
+//! second, uses process-wide tunnel byte counters as its activity
+//! signal, fetches decoy HTTPS content through its local SOCKS
+//! listener, and records the fetch cost. This is idle-triggered
+//! traffic; it does not provide a demand-independent wire schedule.
 //!
-//! What DOES ship on the live path is transport-*layer* shaping via
-//! `mirage-transport-pad`: its `PaddedStream` emits **chaff frames**
-//! (zero-payload padded frames at a fixed `chaff_interval_ms`
-//! cadence, and an optional CBR mode) so idle periods keep a steady
-//! wire cadence. That transport-layer chaff is the shipped defense
-//! against idle-vs-active flow classification.
-//!
-//! These session-layer schedulers are a *distinct, higher-level*
-//! capability and are tracked WIP for v0.2:
-//!
-//! - [`CoverScheduler`] is the **cover-*fetch* driver** - it decides
-//!   WHEN the client should fetch *real* HTTPS content from a decoy
-//!   destination *through the tunnel* (it fetches real HTTPS
-//!   content ... never synthesizes dummy ciphertext). That is
-//!   materially stronger than transport-pad's synthetic chaff and is
-//!   not provided anywhere else.
-//! - [`CbrCoverScheduler`] is an I/O-free constant-bitrate framing
-//!   oracle for a media pump; it overlaps transport-pad's CBR mode
-//!   but at the session-frame granularity.
-//!
-//! **Exact wiring step (v0.2):** in the client's tokio runtime
-//! (`crates/client`), spawn a task that (1) calls
-//! [`CoverScheduler::record_activity`] on every session-frame
-//! send/recv, (2) ticks [`CoverScheduler::tick`] on a ~1 s interval,
-//! and (3) on [`CoverDecision::Fetch`] issues a real HTTPS GET to
-//! `policy.destinations[destination_idx]` *through the established
-//! tunnel*, feeding the byte cost back via
-//! [`CoverScheduler::record_cover`]. Until that task exists, this
-//! module is inert.
+//! [`CbrCoverScheduler`] is an I/O-free constant-bitrate framing
+//! oracle for a future media pump. It is not wired into a live
+//! session. Transport-layer `mirage-transport-pad` shaping is a
+//! separate facility and can emit fixed-cadence chaff or CBR frames.
 
 use std::time::{Duration, Instant};
 
@@ -131,6 +107,8 @@ pub enum CoverDecision {
     OverCap,
     /// Policy declares zero destinations; cover is disabled.
     Disabled,
+    /// The OS CSPRNG failed; the caller must stop cover scheduling.
+    EntropyUnavailable,
 }
 
 /// Stateless scheduler: given the current time, last activity time,
@@ -159,8 +137,8 @@ pub struct CoverScheduler {
     /// distribution (mean = `policy.mean_inter_fetch`) after every fetch. A real
     /// Poisson process has memoryless, exponentially-distributed gaps; a fixed
     /// floor would make cover fire on a regular cadence a timing classifier can
-    /// lock onto.
-    next_interval: Duration,
+    /// lock onto. `None` means entropy failed and cover fetches stop.
+    next_interval: Option<Duration>,
 }
 
 impl CoverScheduler {
@@ -187,18 +165,16 @@ impl CoverScheduler {
     /// mean (a Poisson arrival process): `gap = -mean * ln(U)`, `U  in  (0, 1]`.
     /// Clamped to `[0.1*mean, 6*mean]` so a rare tail draw can neither stall cover
     /// for minutes (itself a fingerprint) nor hammer it. Uses the OS CSPRNG.
-    fn sample_inter_fetch(mean: Duration) -> Duration {
+    fn sample_inter_fetch(mean: Duration) -> Option<Duration> {
         let mut buf = [0u8; 8];
-        let u = match getrandom::fill(&mut buf) {
-            // Map the 64-bit draw to (0, 1] so ln() is finite.
-            Ok(()) => (u64::from_le_bytes(buf) as f64 + 1.0) / (u64::MAX as f64 + 2.0),
-            // CSPRNG unavailable: fall back to the median gap (ln 0.5) rather than
-            // stall. Reachable only if the kernel CSPRNG is broken.
-            Err(_) => 0.5,
-        };
+        getrandom::fill(&mut buf).ok()?;
+        // Map the 64-bit draw to (0, 1] so ln() is finite.
+        let u = (u64::from_le_bytes(buf) as f64 + 1.0) / (u64::MAX as f64 + 2.0);
         let mean_s = mean.as_secs_f64();
         let gap = mean_s * -(u.ln());
-        Duration::from_secs_f64(gap.clamp(mean_s * 0.1, mean_s * 6.0))
+        Some(Duration::from_secs_f64(
+            gap.clamp(mean_s * 0.1, mean_s * 6.0),
+        ))
     }
 
     /// Record application activity. Caller invokes on every
@@ -243,6 +219,9 @@ impl CoverScheduler {
         if self.policy.destinations.is_empty() {
             return CoverDecision::Disabled;
         }
+        let Some(next_interval) = self.next_interval else {
+            return CoverDecision::EntropyUnavailable;
+        };
         // No activity ever -> user hasn't sent anything; nothing to
         // hide. Scheduler stays quiet so we don't generate suspicious
         // baseline traffic from a freshly-started client.
@@ -258,7 +237,7 @@ impl CoverScheduler {
         // fetch), NOT a fixed floor that would produce a regular, classifiable
         // cadence.
         if let Some(last) = self.last_cover {
-            if now.duration_since(last) < self.next_interval {
+            if now.duration_since(last) < next_interval {
                 return CoverDecision::Skip;
             }
         }
@@ -268,16 +247,13 @@ impl CoverScheduler {
         // Pick a destination uniformly at random from the OS CSPRNG.
         // A predictable (counter-derived) pick would let an observer
         // who models the byte counters anticipate which decoy the
-        // client fetches next - a correlation handle. If the CSPRNG
-        // is momentarily unavailable we fall back to index 0 rather
-        // than stall cover traffic (itself a fingerprint); this path
-        // is only reachable if the kernel CSPRNG is broken.
+        // client fetches next - a correlation handle.
         let idx = {
             let mut buf = [0u8; 8];
-            match getrandom::fill(&mut buf) {
-                Ok(()) => (u64::from_le_bytes(buf) as usize) % self.policy.destinations.len(),
-                Err(_) => 0,
+            if getrandom::fill(&mut buf).is_err() {
+                return CoverDecision::EntropyUnavailable;
             }
+            (u64::from_le_bytes(buf) as usize) % self.policy.destinations.len()
         };
         CoverDecision::Fetch {
             destination_idx: idx,
@@ -308,6 +284,18 @@ mod tests {
         let s = CoverScheduler::new(policy_with(vec![]));
         let d = s.tick(Instant::now());
         assert_eq!(d, CoverDecision::Disabled);
+    }
+
+    #[test]
+    fn entropy_failure_stops_cover_fetches() {
+        let mut s = CoverScheduler::new(policy_with(vec!["a.example"]));
+        s.next_interval = None; // Simulate failed interval CSPRNG draw.
+        let now = Instant::now();
+        s.record_activity(1, now);
+        assert_eq!(
+            s.tick(now + Duration::from_secs(1)),
+            CoverDecision::EntropyUnavailable
+        );
     }
 
     #[test]
@@ -449,6 +437,8 @@ impl Default for CbrCoverPolicy {
 /// One tick decision for the CBR scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CbrTickDecision {
+    /// The OS CSPRNG failed; no further frames may be emitted.
+    EntropyUnavailable,
     /// Caller MUST emit `frame_size` bytes now. The caller's
     /// outbound pump pulls real bytes from the application queue
     /// (up to `frame_size`) and pads any remainder with cover
@@ -463,6 +453,12 @@ pub enum CbrTickDecision {
         /// Wall-clock instant of the next emit deadline.
         until: Instant,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum JitterPicker {
+    Csprng,
+    Infallible(fn(seq: u64, max: Duration) -> Duration),
 }
 
 /// I/O-free constant-bitrate scheduler.
@@ -485,10 +481,11 @@ pub struct CbrCoverScheduler {
     last_emit: Option<Instant>,
     real_bytes_total: u64,
     cover_bytes_total: u64,
-    /// Counter for deterministic jitter; production callers swap
-    /// in a CSPRNG-backed picker via [`Self::set_jitter_picker`].
+    /// Counter for the test-only deterministic jitter picker;
+    /// the production CSPRNG picker ignores it.
     jitter_seq: u64,
-    jitter_picker: fn(seq: u64, max: Duration) -> Duration,
+    jitter_picker: JitterPicker,
+    entropy_failed: bool,
     /// Absolute next-emit deadline, sampled ONCE per cycle in
     /// [`Self::record_emit`] (RT #30). Re-rolling jitter on every `tick`
     /// (the previous behaviour) biased emit times toward the cadence floor:
@@ -513,22 +510,24 @@ impl CbrCoverScheduler {
             real_bytes_total: 0,
             cover_bytes_total: 0,
             jitter_seq: 0,
-            jitter_picker: cbr_csprng_jitter,
+            jitter_picker: JitterPicker::Csprng,
+            entropy_failed: false,
             next_deadline_cached: None,
         }
     }
 
-    /// Override the jitter picker. Tests pin to
-    /// [`cbr_zero_jitter`]; production swaps in a CSPRNG-backed
-    /// callback (see `mirage-router::pool::csprng_jitter` for the
-    /// pattern).
+    /// Override the jitter picker for reproducible tests. Production
+    /// uses the CSPRNG picker installed by [`Self::new`].
     pub fn set_jitter_picker(&mut self, picker: fn(seq: u64, max: Duration) -> Duration) {
-        self.jitter_picker = picker;
+        self.jitter_picker = JitterPicker::Infallible(picker);
     }
 
-    /// Tick. Returns either `Emit` (cadence elapsed; frame goes
-    /// out now) or `Wait { until }` (cadence still ticking).
+    /// Tick. Emits when the cadence elapses, waits otherwise, or
+    /// reports an entropy failure so the caller can stop emission.
     pub fn tick(&mut self, now: Instant) -> CbrTickDecision {
+        if self.entropy_failed {
+            return CbrTickDecision::EntropyUnavailable;
+        }
         let next_deadline = self.next_deadline(now);
         if now >= next_deadline {
             CbrTickDecision::Emit {
@@ -559,7 +558,15 @@ impl CbrCoverScheduler {
         self.jitter_seq = self.jitter_seq.wrapping_add(1);
         // Sample this cycle's jitter EXACTLY ONCE and cache the absolute
         // deadline (RT #30). `tick`/`next_deadline` read it without re-rolling.
-        let jitter = (self.jitter_picker)(self.jitter_seq, self.policy.jitter);
+        let jitter = match self.jitter_picker {
+            JitterPicker::Csprng => cbr_csprng_jitter(self.jitter_seq, self.policy.jitter),
+            JitterPicker::Infallible(picker) => Some(picker(self.jitter_seq, self.policy.jitter)),
+        };
+        let Some(jitter) = jitter else {
+            self.entropy_failed = true;
+            self.next_deadline_cached = None;
+            return;
+        };
         self.next_deadline_cached =
             Some(now.checked_add(self.policy.cadence + jitter).unwrap_or(now));
     }
@@ -622,36 +629,19 @@ pub fn cbr_zero_jitter(_seq: u64, _max: Duration) -> Duration {
 /// CSPRNG-backed jitter picker. Pulls fresh randomness from the
 /// OS RNG on every call; ignores `seq`. This is the production
 /// default installed by [`CbrCoverScheduler::new`] (closes
-/// [RT-S3]). On the rare case OS entropy is unavailable, falls
-/// back to a deterministic mix of `seq` so the scheduler never
-/// stalls on cover-traffic emission - but that fallback path is
-/// observable only if every prior `getrandom` call also failed,
-/// which on Linux/macOS/Windows requires the kernel CSPRNG to be
-/// fundamentally broken.
-pub fn cbr_csprng_jitter(seq: u64, max: Duration) -> Duration {
+/// [RT-S3]). Returns `None` if OS entropy is unavailable, so the
+/// scheduler stops instead of emitting deterministic timing.
+pub fn cbr_csprng_jitter(_seq: u64, max: Duration) -> Option<Duration> {
     if max.is_zero() {
-        return Duration::ZERO;
+        return Some(Duration::ZERO);
     }
     let max_micros = max.as_micros() as u64;
     if max_micros == 0 {
-        return Duration::ZERO;
+        return Some(Duration::ZERO);
     }
     let mut buf = [0u8; 8];
-    let r = match getrandom::fill(&mut buf) {
-        Ok(()) => u64::from_le_bytes(buf),
-        Err(_) => {
-            // Last-ditch: deterministic mix. We log at warn so
-            // operators see the entropy failure; the scheduler
-            // keeps running rather than stalling cover traffic
-            // (which would itself be a fingerprint).
-            tracing::warn!(
-                "cbr_csprng_jitter: getrandom failed, falling back to deterministic mix"
-            );
-            const PHI_FIX: u64 = 0x9E37_79B9_7F4A_7C15;
-            seq.wrapping_mul(PHI_FIX)
-        }
-    };
-    Duration::from_micros(r % max_micros)
+    getrandom::fill(&mut buf).ok()?;
+    Some(Duration::from_micros(u64::from_le_bytes(buf) % max_micros))
 }
 
 #[cfg(test)]
@@ -811,7 +801,7 @@ mod cbr_tests {
         let max = Duration::from_millis(5);
         let mut samples = std::collections::HashSet::new();
         for seq in 0u64..200 {
-            let j = cbr_csprng_jitter(seq, max);
+            let j = cbr_csprng_jitter(seq, max).unwrap();
             assert!(j < max, "jitter {j:?} >= max {max:?}");
             samples.insert(j.as_micros());
         }
@@ -832,7 +822,14 @@ mod cbr_tests {
     #[test]
     fn cbr_csprng_jitter_zero_max_is_zero() {
         // Avoid divide-by-zero on a zero jitter window.
-        assert_eq!(cbr_csprng_jitter(0, Duration::ZERO), Duration::ZERO);
+        assert_eq!(cbr_csprng_jitter(0, Duration::ZERO), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn cbr_entropy_failure_stops_emission() {
+        let mut s = CbrCoverScheduler::new(voip_policy());
+        s.entropy_failed = true; // Simulate a failed jitter draw.
+        assert_eq!(s.tick(Instant::now()), CbrTickDecision::EntropyUnavailable);
     }
 
     #[test]
@@ -844,11 +841,6 @@ mod cbr_tests {
         let mut policy = voip_policy();
         policy.jitter = Duration::from_millis(2);
         let s = CbrCoverScheduler::new(policy);
-        // Function pointers compare by address; the default must
-        // not equal the deterministic picker.
-        let det: fn(u64, Duration) -> Duration = cbr_deterministic_jitter;
-        let zero: fn(u64, Duration) -> Duration = cbr_zero_jitter;
-        assert!(s.jitter_picker as usize != det as usize);
-        assert!(s.jitter_picker as usize != zero as usize);
+        assert!(matches!(s.jitter_picker, JitterPicker::Csprng));
     }
 }

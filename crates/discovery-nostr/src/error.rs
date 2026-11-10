@@ -5,6 +5,10 @@ use thiserror::Error;
 /// Error variants for the Nostr adapter.
 #[derive(Debug, Error)]
 pub enum NostrError {
+    /// Operating-system entropy was unavailable while building a frame.
+    #[error("frame entropy unavailable")]
+    Entropy,
+
     /// Wire format invalid (JSON parse, field missing, wrong type).
     #[error("wire: {0}")]
     Wire(&'static str),

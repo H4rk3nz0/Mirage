@@ -3,286 +3,166 @@
 </p>
 
 <p align="center">
-  Pluggable carriers &middot; epoch-rotated discovery &middot; authenticated session crypto &middot; replay-based traffic shaping &middot; onion routing<br>
-  <sub>All behind one local SOCKS5 proxy or a full-device VPN</sub>
-</p>
-
-<p align="center">
-  <a href="docs/getting-started.md"><b>Get started</b></a> &nbsp;&middot;&nbsp;
-  <a href="docs/operators.md">Run a bridge</a> &nbsp;&middot;&nbsp;
-  <a href="docs/features.md">Features</a> &nbsp;&middot;&nbsp;
+  <a href="docs/getting-started.md">Getting started</a> ·
+  <a href="docs/operators.md">Run a bridge</a> ·
+  <a href="docs/features.md">Features</a> ·
   <a href="docs/security-model.md">Security model</a>
 </p>
 
-> **Status:** `0.1.8-alpha.3`. Deployable today. Wire formats and config may still change
-> before a stable release.
+# Mirage
 
-Mirage is not a single protocol. It is a **stack of interchangeable layers** - you pick
-what your network lets through, and the same session crypto rides on top of any of them.
+Mirage is an alpha-stage censorship-circumvention proxy. Applications can use its
+local SOCKS5 listener, or it can route device traffic through a TUN interface.
+Clients connect to privately operated bridges using an invite. A hybrid
+Noise-XX/ML-KEM session runs over a choice of carriers, including Reality-style
+TLS, HTTP/3, WebSocket, and DNS-based transports. Bridges can also be found
+through rotating rendezvous records on Nostr, DNS TXT, and the BitTorrent DHT.
 
----
+**Status:** `0.1.8-alpha.1`. Wire formats and configuration can change. The
+traffic-disguise claims have important limits; see [Security and
+evidence](#security-and-evidence).
 
-## Why it works
+## Start
 
-| Principle | What it means |
+To connect, get a `mirage://...` invite from a bridge operator and put it in
+`client.json`:
+
+```json
+{
+  "local_bind": "127.0.0.1:1080",
+  "invite": "mirage://..."
+}
+```
+
+```sh
+mirage-client client.json
+```
+
+Point applications at `socks5h://127.0.0.1:1080` so hostname resolution goes
+through the bridge. The desktop client, `mirage-client-gui`, accepts the same
+invite and can manage profiles and reconnects. For whole-device routing, see
+the [TUN setup](docs/getting-started.md#4-whole-device-vpn-optional).
+
+To operate a bridge, run the setup wizard and share the invite it creates:
+
+```sh
+mirage-setup
+mirage-bridge bridge.json
+```
+
+The [client guide](docs/getting-started.md) and [operator guide](docs/operators.md)
+cover installation, configuration, and troubleshooting.
+
+## What is in the stack
+
+| Layer | Role |
 |---|---|
-| **Don't be invisible, be uninteresting** | Ride protocols the censor doesn't want to block - HTTP/3, WebRTC, DNS-over-HTTPS, TLS. |
-| **The adversary pays per block** | Blocking Mirage should mean blocking Cloudflare, or video calls, or DNS. That's a bill they have to justify. |
-| **Small blast radius** | Losing a bridge, a discovery channel, a key, or the upstream CDN degrades gracefully. Nothing takes down the fleet. |
+| Session | Noise-XX with ML-KEM-768, authenticated frames, and capability-token access. |
+| Carrier | Moves the session over a network path; the client can configure several and fail over. |
+| Discovery | Epoch-rotated, invite-gated bridge records over Nostr, DNS TXT, or the DHT. |
+| Circuit | Optional onion routing across up to three bridges. |
+| Ingress | Local SOCKS5 or a TUN-based device VPN. |
 
-**One build, every capability.** There are no `--features` flags to remember and no
-"optional" builds. Every carrier, every discovery channel, the GUI, and the TUN VPN are
-compiled into the standard build. What you actually use is chosen at **runtime, in config**.
+The standard build includes the available carriers. Configuration chooses which
+ones a client and bridge use:
 
----
+| Carrier | Transport |
+|---|---|
+| Reality-style | TLS-like TCP with forwarding of unauthorized probes to a configured cover site |
+| Hysteria2, MASQUE | QUIC and HTTP/3 |
+| WebRTC | DTLS/SCTP data channel |
+| WebSocket, meek | HTTP upgrade and CDN-fronted HTTPS |
+| Shadowsocks-2022, VLESS | Compatible proxy transports |
+| DoH, dnstt | HTTPS DNS and plain DNS tunneling |
+| obfs | Opaque TCP |
 
-## Proteus: wear real traffic, not a fake shape
+These carriers have different fingerprints, performance, and deployment
+requirements. [Features](docs/features.md) describes each one and its settings.
+The [security model](docs/security-model.md) explains what each can and cannot
+conceal.
 
-Our flagship layer, and a genuine upgrade to Reality. **Reality** makes the *connection*
-look real - a real TLS session to a real host, resistant to active probing. **Proteus**
-makes the *flow* look real too.
+## Proteus traffic shaping
 
-Even a perfect TLS disguise leaks its purpose through traffic *shape* - packet sizes and
-timing. A proxy shuttling data doesn't breathe like someone streaming a video, and
-traffic-analysis classifiers key on exactly that. Proteus closes it: it records a
-**genuine** video stream or web page load and replays its exact wire envelope - sizes,
-direction, timing - with your data hidden inside the encrypted record bodies.
-
-> **What we have actually measured, as of 0.1.8-alpha.1.** Cover class matters more
-> than shaping quality, and the statistic that predicts usable capacity is the
-> high-quantile inter-record **gap** - not mean rate, duty cycle, or record-size
-> variance, three of which rank the cover classes backwards. That follows from
-> Little's law and holds independently of the numbers below.
->
-> Across a 60-cell capture matrix (5 repetitions per cell, two players, three buffer
-> settings), worst-case gap by cover class:
->
-> | class | worst gap | throughput |
-> |---|---|---|
-> | browse page load | **95.6 ms** | fails the floor |
-> | live audio | 338.8 ms | 139 kbps, fails the floor |
-> | segmented video (HLS) | **~10 s** | clears easily |
->
-> **No single cover class clears both constraints.** An earlier claim that segmented
-> video did was wrong twice over: its sub-second gap was a property of a non-default
-> player buffer, and the capture tap that produced it silently dropped every
-> long-lived connection. Mirage's answer is to stop using one class - interactive
-> streams ride browse-class carriers, bulk streams ride video-class carriers, which
-> is what a host running a browser and a video player looks like anyway. See
-> [cover-scheduling.md](docs/cover-scheduling.md) (numbers marked provisional pending
-> a re-take) and [measurement-methodology.md](docs/measurement-methodology.md) for how
-> each of those errors was found.
-
-> **Where 2.0 stands.** Shipped and verified: replay envelope, displacement,
-> multi-carrier replay with capture-derived carrier count and ramp, heterogeneous
-> carriers, probe-decoy defaults, and a Firefox ClientHello matched to a real capture.
-> Provisional: the cover-class numbers, pending a re-take. Off pending measurement:
-> deficit permutation. Blocked on inputs this machine does not have: probe-suite
-> figures at real network distance, and a Chrome ClientHello capture. Full board in
-> [proteus-2.0.md](docs/proteus-2.0.md).
-
-The point is *replay, not fake*. A generated "video-like" pattern is always subtly wrong,
-and subtly-wrong is detectable; a real recorded envelope carries no invented structure to
-be wrong about. The size axis is closed on the wire: the paced tunnel's records match the
-recorded profile exactly, per carrier.
-
-**Timing is not closed yet, and the docs say so.** Replicated censor-vantage measurement
-still separates an active tunnel from an idle one at about AUC 0.57 against a 0.53 control
-- far from the 1.0 an unshaped tunnel gives, and not the indistinguishability the design
-aims at. Two causes were found and fixed this cycle; the remainder is unattributed. See
-[proteus.md](docs/proteus.md), which carries the numbers and the failed hypotheses rather
-than only the successes.
-
-Turning it on is one line, on the bridge and on the client:
+Proteus is an optional layer that records traffic from a cover workload and
+replays its record sizes, directions, and timing. Each scheduled record is sent
+whether or not application data is waiting; data replaces padding inside that
+record. The schedule therefore does not need to follow the application's
+momentary demand. Enable it on **both** the client and bridge:
 
 ```json
 { "proteus": true }
 ```
 
-That is the whole procedure. With nothing else configured, each end records and refreshes
-its own cover library in the background - measured at 2 seconds from a cold start to
-wearing a real envelope. There is no recorder to run, no timer to install and no capture
-files to copy anywhere.
+Each side can source and refresh its cover library automatically. A custom
+library can be recorded with `mirage-cover-record` and selected with
+`proteus_profile`; see [cover sources](tools/cover-sources/README.md).
+Proteus does not pace every carrier; check the [carrier
+list](docs/proteus.md#which-carriers-actually-wear-it).
 
-| | |
-|---|---|
-| **Both directions** | Client shapes what it sends up, bridge shapes what it sends down - a censor watching either sees real traffic. |
-| **Never twice the same** | Each session chains a random shuffle of real traces from ONE cover class, so there's no fixed fingerprint, nothing loops, and the session's rate never steps mid-flow the way a mixture's does. |
-| **Cover classes** | Web browsing by default; video too once the budget reaches 6 GB/day - a video capture is the better downstream disguise, but its upstream is too sparse to carry a handshake, so the two get paired. |
-| **Self-contained** | The recorder pulls from real open sources using its own TLS stack - no yt-dlp, ffmpeg, tcpdump or python. Video sources are regional (PeerTube globally; Rutube/OK.ru, Aparat, Bilibili, puhutv domestically), and `--hls-cmd` can hand off to an external extractor if you want one, without Mirage depending on it. |
-| **No demand following** | Steering big records to the moments your data is waiting was implemented, measured at **0.699** separability against a 0.544 control, and switched OFF (`ALIGN_ALPHA_PERMILLE = 0`). A rate that tracks demand is the signal Proteus exists to remove, so the wire is identical busy or idle - enforced by a test. Throughput comes from choosing SMOOTHER cover instead. |
-| **Not every carrier** | Seven carriers wear the envelope. Plain TCP, obfs-tcp, dnstt and WebRTC do not, and nothing warns you - see [proteus.md](docs/proteus.md). |
+Cover traffic runs for the lifetime of a session, including idle periods. Its
+rate is an upper bound on incompressible user throughput, before framing and
+retransmission. The configured GB/day figure is a rate expressed as a
+24-hour equivalent; traffic is incurred only while connected.
 
-### What it costs, plainly
-
-Cover runs for as long as a session is open, busy or idle, so the envelope's rate is also a
-**ceiling on your throughput**. That is not a tuning problem, it is what constant-rate cover
-means. (Per session-day: a client connected two hours a day pays for two hours, not
-twenty-four.)
-
-| budget | cover bill | sustained |
-|---|---|---|
-| 2.5 GB/day (default) | 2.5 GB/day | ~0.23 Mbit/s |
-| 6 GB/day (video cover) | 6 GB/day | ~0.56 Mbit/s |
-
-Set it directly - a number in GB/day, or `unlimited` for "I do not care, go fast":
+| Cover budget | Approximate wire-rate ceiling |
+|---|---:|
+| 2.5 GB/day (default) | 0.23 Mbit/s |
+| 6 GB/day | 0.56 Mbit/s |
 
 ```json
 { "proteus": true, "proteus_max_gb_day": 40 }
 ```
 
-**Your throughput IS your cover budget, 1:1.** A record leaves on a schedule token whether
-or not you have data, so user bytes displace padding instead of adding to it. That identity
-is exactly what makes an idle tunnel and a busy one look alike - and it means the envelope's
-rate is also your ceiling. There is no arrangement of this design that avoids it.
+A higher budget can admit faster cover, but it cannot remove the cover-rate
+bound. The current browser-like cover is suitable mainly for low-bandwidth
+work. Video cover can offer more bytes but has shown multi-second gaps; a
+high-rate video path has **not** been validated end to end. Interactive and
+bulk streams can use different cover classes. See [Proteus](docs/proteus.md)
+and the [cover scheduling analysis](docs/cover-scheduling.md).
 
-So the speed is a spending decision, not a property of the tool:
+## Security and evidence
 
-| cover you wear | sustained | you pay | status |
-|---|---|---|---|
-| browse (the default classes) | ~1 Mbit/s | 2.5-6 GB/day | measured |
-| a real 1080p stream | ~5 Mbit/s | ~2 GB/hour connected | not yet validated |
-| a real 4K stream | 15-25 Mbit/s | 7-11 GB/hour connected | not yet validated |
+Mirage authenticates sessions, forwards unauthorized Reality-style probes to a
+cover destination, and can hide destination knowledge across multiple bridges.
+It does **not** guarantee that its traffic is indistinguishable from ordinary
+TLS, HTTP/3, or video traffic. Probe timing can differ from the cover site.
+Proteus's finite trace library can repeat across sessions, and its timing
+behavior still has measured residuals. Earlier cover measurements also missed
+long-lived connections; the corrected cover-class figures remain provisional.
+A matched comparison against genuine traffic from the same origin is still
+needed.
 
-At the default budget Proteus is a low-bandwidth channel - messaging, text, light browsing.
-It is not *inherently* one: browse cover is slow because web pages are small, and the
-budget is what admits a faster class. The video rows above are what the arithmetic says a
-real stream's envelope would carry; **they have not been run end to end**, so treat them as
-the design's intent rather than a shipped capability. A deployment that needs line rate and
-will not pay for it should run Reality or Shadowsocks-2022 *without* Proteus and accept
-that flow shape is then exposed to traffic analysis.
+The optional printable preamble for opaque carriers addresses a published
+first-payload entropy heuristic. It is not a general disguise for those
+carriers. A single exit bridge sees destinations; a global observer watching
+both ends can correlate traffic. TUN mode has platform-specific DNS and routing
+limits. Read the [security model](docs/security-model.md) before relying on
+Mirage in a high-risk setting.
 
-Raising the budget also buys **latency** for browse cover - bounding the silent gaps is what
-stops short transfers waiting for the next burst. It does **not** for video: a video capture
-waits each segment's true duration, so the tunnel inherits a stall the length of one segment
-(measured 5.8 s on PeerTube, 10 s on Aparat), and a bigger budget only buys a fatter variant
-of the same stream. Video buys throughput; browse buys latency. See
-[proteus.md](docs/proteus.md) for the measurements and the concavity argument behind it.
+The [cover-native research proposal](docs/cover-native-proposal.md) explores a
+higher-rate application-based carrier. It is a design and evaluation plan,
+not an implemented transport.
 
-Want a *specific* envelope - your own site, a particular stream? Record it with
-`mirage-cover-record` and set `proteus_profile`; that pins the library and turns
-auto-sourcing off. A pinned library must contain traces for the cover host you
-announce (`<lib>/<host>/`) or the client refuses to start - wearing an envelope
-recorded against a different site than your SNI claims is a mismatch no single
-layer can detect, and pinning means it will never repair itself. Auto-sourcing
-records your cover host for you. See [cover sources](tools/cover-sources/README.md).
+## Install and build
 
-One switch turns on the whole strong posture: `"paranoid": true`. Details in the
-**[feature reference](docs/features.md)** and **[operator guide](docs/operators.md)**.
-
----
-
-## Get started
-
-**-> [Full documentation](docs/)**
-
-| I want to... | Start here |
-|---|---|
-| Connect to a bridge someone gave me | **[Getting started](docs/getting-started.md)** |
-| Run a bridge for others | **[Operator guide](docs/operators.md)** |
-| Know what's in the box | **[Feature reference](docs/features.md)** |
-| Understand how it works | **[Internals](docs/internals.md)** |
-| Tune every knob | **[Configuration](docs/configuration.md)** |
-| Know what it does and doesn't protect | **[Security model](docs/security-model.md)** |
-
-### 60-second version
-
-**Connect** - you need an invite (a `mirage://...` string) from someone running a bridge:
+Release archives for Linux, macOS, and Windows are available on the
+[releases page](../../releases). Verify the archive and its build attestation
+before running it:
 
 ```sh
-mirage-client client.json      # then point your apps at socks5h://127.0.0.1:1080
+sha256sum -c SHA256SUMS.txt
+gh attestation verify <archive> --owner <ORG>
 ```
 
-Or run `mirage-client-gui`, paste the invite, click **Connect**. The desktop app
-keeps you in control of both ends: save and switch **profiles**, force a fresh
-**re-discover** walk, reconnect, and flip **Paranoid** on, with a live view of the
-carrier, the rendezvous channels, and the bridges it has found.
-
-**Run a bridge** - the wizard writes both configs and the invite for you:
+To build with the pinned Rust toolchain:
 
 ```sh
-mirage-setup                   # answer the questions
-mirage-bridge bridge.json      # then hand out the invite it printed
+cargo build --release --workspace
 ```
 
----
-
-## What you get
-
-**Carriers** - the wire shape your traffic takes. Pick per-network; the client can hold
-several and switch when one gets blocked.
-
-| Carrier | Looks like | Good for |
-|---|---|---|
-| **Reality (+ Proteus)** | Real TLS to a real site, wearing a real traffic shape | The default. Survives active probing *and* traffic analysis. |
-| **Hysteria2** | QUIC | Lossy / high-latency links. |
-| **MASQUE** | HTTP/3 | Networks that allow QUIC to CDNs. |
-| **WebRTC** | A video call | Blocking it breaks conferencing. |
-| **meek** | CDN-fronted HTTPS | Hostile networks with a reachable CDN. |
-| **WebSocket** | Ordinary web traffic | Deploying behind nginx / a CDN. |
-| **Shadowsocks-2022** | Nothing (opaque) | Simple, fast, known-good. |
-| **VLESS** | TLS/WS-framed | Interop with existing infrastructure. |
-| **DoH** | DNS-over-HTTPS | Only DNS gets out. |
-| **dnstt** | Plain DNS | Captive portals; the last resort. |
-| **obfs** | Random bytes | Test-bed / bare TCP. |
-
-**Layers that ride on top of any carrier:** frame padding + timing jitter (defeats ML flow
-fingerprinting), stream multiplexing, and single-port dispatch across every carrier at once.
-
-**Encrypted SNI (ECH)** - on CDN-fronted TLS carriers (meek / DoH / WebSocket), the real
-inner hostname is encrypted with RFC 9180 HPKE, so a censor watching the CDN edge can't see
-which site you are really reaching. Delivered in the invite or set in config. (It hides the
-SNI, but currently rides a non-browser TLS fingerprint - see the
-[ECH caveat](docs/features.md#layers).)
-
-**Finding bridges** - epoch-rotated rendezvous over **Nostr**, **DNS TXT**, and the
-**BitTorrent DHT**, so there's no single list to seize.
-
-**Two ways to use it** - a local **SOCKS5 proxy**, or a **TUN VPN** that captures every TCP
-*and* UDP flow from the whole device with no per-app setup.
-
-**Multi-hop** - chain up to **3 bridges** into an onion circuit, each hop authenticated
-separately, so no single bridge sees both who you are and where you're going.
-
-**Paranoid mode** - one switch puts on the strongest posture at once: Reality carrier,
-handshake padding, fail-closed, and **Proteus** (see above). Set
-`"paranoid": true` in config, pass `--paranoid` to `mirage-client`, or flip the toggle in
-the GUI.
-
-Runs on **Linux, macOS, and Windows**. Full detail in the
-**[feature reference](docs/features.md)**.
-
----
-
-## Install
-
-Prebuilt binaries for Linux (x86_64/aarch64/armv7, static musl), macOS (Intel + Apple
-Silicon), and Windows are attached to every [release](../../releases).
-
-**Verify what you downloaded.** A censor's cheapest attack is getting you to run *their*
-build:
-
-```sh
-sha256sum -c SHA256SUMS.txt                                   # integrity
-gh attestation verify <archive> --owner <ORG>                 # provenance (Sigstore)
-```
-
-### Build from source
-
-```sh
-cargo build --release --workspace     # needs the pinned toolchain (rust-toolchain.toml)
-nix build .#mirage-bridge             # or reproducibly, via Nix
-```
-
-No feature flags, no system libraries. The desktop GUI (`mirage-client-gui`)
-renders with Slint's software renderer - it builds with plain `cargo` and links
-only the standard C runtime. On Linux it's a glibc build that uses your existing
-desktop at run time; it ships in the `...-gui` release archives. On Wayland it
-routes through XWayland, because pointer input is not delivered reliably to the
-pinned Slint version on a native Wayland surface (`MIRAGE_FORCE_WAYLAND=1` opts
-out).
-
----
+See [building](docs/building.md) for platform details and the Nix path.
+The [documentation index](docs/) links to configuration, internals, and
+operator procedures.
 
 ## License
 

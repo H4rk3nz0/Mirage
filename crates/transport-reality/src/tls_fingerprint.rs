@@ -34,9 +34,8 @@
 //! - `SSLVersion` - decimal form of `legacy_version` (e.g. 771 = 0x0303).
 //! - `Cipher` - `-`-joined decimal cipher-suite values.
 //! - `SSLExtension` - `-`-joined decimal extension-type values,
-//!   EXCLUDING GREASE (0x?A?A). Mirage DOES emit GREASE on the wire
-//!   (RFC 8701 - first + last extension slots, cipher, groups,
-//!   key_share, supported_versions) but excludes it from the JA3
+//!   EXCLUDING GREASE (0x?A?A). Templates whose captured browser uses
+//!   RFC 8701 GREASE emit it on the wire but exclude it from the JA3
 //!   string, so this is the full non-GREASE extension-type list.
 //! - `EllipticCurve` - `-`-joined decimal `supported_groups`.
 //! - `EllipticCurvePointFormat` - `-`-joined decimal values from
@@ -59,52 +58,27 @@ use std::fmt::Write;
 pub struct TemplateProvenance {
     /// The browser build this template claims to imitate, e.g. `"Chrome 133"`.
     pub claims_to_be: &'static str,
-    /// Days since the Unix epoch when this template was last verified against a
-    /// real ClientHello from that build. Days, not seconds: the resolution that
-    /// matters here is "which browser release", and a date a human can read in
-    /// the source is more likely to be updated than a timestamp.
+    /// Days since the Unix epoch when the template fields were last checked.
     pub checked_days: u32,
-    /// How the bytes were obtained. This decides whether the template can be
-    /// RE-DERIVED when the browser moves, or only re-transcribed by hand.
+    /// How the template fields were obtained.
     pub source: TemplateSource,
-    /// Has this template been compared, field by field, against a ClientHello
-    /// captured from the browser it claims to be?
-    ///
-    /// AGE AND CORRECTNESS ARE INDEPENDENT AXES, and only one had an instrument.
-    /// `checked_days` says when someone last looked; it cannot say whether what
-    /// they wrote was ever right. It was not: a capture of Firefox 153 shows 17
-    /// extensions and NO GREASE against this template's 12 with GREASE in the
-    /// first and last slots - differing in count, order and GREASE presence at
-    /// once. See docs/proteus-2.0.md.
+    /// Whether the full generated ClientHello was compared field by field with
+    /// a capture from the claimed browser build. A partial JA3 check is not enough.
     pub validated_against_capture: bool,
 }
 
 /// Where a template's bytes came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemplateSource {
-    /// Transcribed by hand from documentation, a fingerprint database, or
-    /// another implementation.
-    ///
-    /// The weaker provenance, and worth naming rather than leaving implicit: a
-    /// hand-written template cannot be regenerated from anything, so keeping it
-    /// current means a person re-reading a spec, and drift is silent. It is the
-    /// same borrow-versus-imitate distinction that decides REALITY over a
-    /// synthesised handshake, applied one level down - the handshake is borrowed
-    /// from a real host, but the ClientHello announcing it is imitated.
+    /// Manually assembled from documentation, another implementation, or
+    /// selected fields of a browser capture. No extractor regenerates it.
     HandTranscribed,
     /// Extracted from a packet capture of the real browser. Re-derivable: point
     /// the extractor at a fresh capture and the template regenerates.
     CapturedFromBrowser,
 }
 
-/// Beyond this, a template is describing a browser that has moved on.
-///
-/// Chrome ships a stable release roughly every four weeks and changes
-/// fingerprint-relevant details several times a year. 180 days is about four
-/// releases - long enough not to cry wolf, short enough that a template cannot
-/// quietly become a unique identifier. Warn rather than refuse: a slightly dated
-/// ClientHello still beats refusing to start, which is the same trade the trace
-/// staleness policy makes.
+/// Warn when a template's check date is more than 180 days old.
 pub const FINGERPRINT_STALE_DAYS: u32 = 180;
 
 impl TemplateProvenance {
@@ -131,30 +105,13 @@ pub fn today_days() -> u32 {
         .unwrap_or(0)
 }
 
-/// One signed parameter set describing how to emit a ClientHello
-/// with a specific JA3/JA4 fingerprint.
-///
-/// Ownership: all dynamic fields are `&'static` because templates
-/// live for the lifetime of the binary. An operator who wants a
-/// custom template constructs a `TlsFingerprintTemplate` by hand at
-/// runtime (using `Vec<u16>` etc. if they need owned data); the
-/// generator accepts any instance satisfying the struct shape
-/// through plain refs.
+/// Parameters used to generate a browser-like ClientHello. Slice fields require
+/// static storage; runtime-built vectors would need to be leaked to satisfy it.
 #[derive(Debug, Clone)]
 pub struct TlsFingerprintTemplate {
     /// Diagnostic name, used in logs + metrics labels.
     pub name: &'static str,
-    /// What browser and version this template claims to be, and when that claim
-    /// was last checked against reality.
-    ///
-    /// A ClientHello template is a perishable good. Chrome changes extension
-    /// ordering, GREASE placement, key-share groups and cipher lists on its
-    /// release cadence, so a template that matched the modal browser when it was
-    /// written drifts into being a UNIQUE IDENTIFIER - the failure is not that it
-    /// looks like nothing, it is that it looks like exactly one thing. That is a
-    /// far more likely cause of being blocked than any residual in the traffic
-    /// envelope, and the same defect the trace library had: correct on the day it
-    /// was written, with nothing to notice when it stopped being.
+    /// Claimed browser build, check date, and source of the template fields.
     pub provenance: TemplateProvenance,
     /// `legacy_version` advertised in the ClientHello record body.
     /// TLS 1.3 clients write `0x0303` here and signal real
@@ -167,6 +124,13 @@ pub struct TlsFingerprintTemplate {
     /// `EXT_KEY_SHARE` + `EXT_SUPPORTED_VERSIONS` + `EXT_SERVER_NAME`
     /// since Mirage's bridge verifier needs those.
     pub extension_order: &'static [u16],
+    /// Whether this browser emits Chrome-style RFC 8701 GREASE in the cipher,
+    /// group, key-share, version and first/last extension positions. The
+    /// captured Firefox 153 ClientHellos did not, despite offering GREASE ECH.
+    pub rfc8701_grease: bool,
+    /// Whether this browser permutes extension order on each connection.
+    /// Firefox 153's captured order was stable; Chrome's is shuffled.
+    pub shuffle_extensions: bool,
     /// Entries for the `supported_groups` extension.
     pub supported_groups: &'static [u16],
     /// Entries for the `signature_algorithms` extension.
@@ -271,27 +235,25 @@ pub const GROUP_SECP384R1: u16 = 0x0018;
 /// group in `supported_groups`.
 pub const GROUP_X25519_MLKEM768: u16 = 0x11EC;
 
-/// The 16 legal RFC 8701 GREASE values (both bytes equal, low nibble `0xA`).
-/// Real Chrome/Firefox draw from these per-connection for one cipher, one
-/// supported_group, one key_share entry, and an extension slot. JA3/JA4
-/// fingerprinters MUST ignore GREASE, so emitting it does NOT change the
-/// pinned JA3 string - it closes the "zero-GREASE TLS 1.3 => not a browser"
-/// distinguisher, which a fingerprinter otherwise flags with ~100% specificity.
+/// The 16 RFC 8701 GREASE values. The captured Firefox 153 template does not
+/// use them in cipher, group, or extension slots; it has a separate GREASE ECH
+/// extension. GREASE values are excluded from JA3.
 pub const GREASE_VALUES: [u16; 16] = [
     0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A, 0x6A6A, 0x7A7A, 0x8A8A, 0x9A9A, 0xAAAA, 0xBABA,
     0xCACA, 0xDADA, 0xEAEA, 0xFAFA,
 ];
 
 /// Draw one GREASE value uniformly from [`GREASE_VALUES`] via the OS CSPRNG.
-/// On CSPRNG failure falls back to the first value (still a legal GREASE
-/// value, never a real codepoint).
+/// Fails closed if operating-system entropy is unavailable.
 pub fn pick_grease() -> u16 {
+    try_pick_grease().expect("OS CSPRNG required for GREASE")
+}
+
+/// Fallible GREASE picker for production connection setup.
+pub fn try_pick_grease() -> Result<u16, getrandom::Error> {
     let mut b = [0u8; 1];
-    let idx = match getrandom::fill(&mut b) {
-        Ok(()) => (b[0] & 0x0F) as usize,
-        Err(_) => 0,
-    };
-    GREASE_VALUES[idx]
+    getrandom::fill(&mut b)?;
+    Ok(GREASE_VALUES[(b[0] & 0x0F) as usize])
 }
 
 /// Per-connection GREASE selection for a ClientHello, drawn fresh per
@@ -317,35 +279,28 @@ pub struct GreaseValues {
 
 impl GreaseValues {
     /// Draw a fresh per-connection GREASE set from the CSPRNG (one read for all
-    /// positions). On CSPRNG failure, fall back to DISTINCT indices so a
-    /// degraded host never emits an all-identical GREASE pattern - and note a
-    /// true RNG outage also breaks `ch_random`, failing the handshake upstream.
+    /// positions). Panics on entropy failure; production callers use
+    /// [`Self::try_random`] to return the error before writing a ClientHello.
     pub fn random() -> Self {
+        Self::try_random().expect("OS CSPRNG required for GREASE")
+    }
+
+    /// Fallible per-connection GREASE draw for production connection setup.
+    pub fn try_random() -> Result<Self, getrandom::Error> {
         let mut b = [0u8; 5];
-        let idx = match getrandom::fill(&mut b) {
-            Ok(()) => [b[0], b[1], b[2], b[3], b[4]],
-            Err(_) => [0, 1, 2, 3, 4],
-        };
-        Self {
-            cipher: GREASE_VALUES[(idx[0] & 0x0F) as usize],
-            group: GREASE_VALUES[(idx[1] & 0x0F) as usize],
-            ext_first: GREASE_VALUES[(idx[2] & 0x0F) as usize],
-            ext_last: GREASE_VALUES[(idx[4] & 0x0F) as usize],
-            version: GREASE_VALUES[(idx[3] & 0x0F) as usize],
-        }
+        getrandom::fill(&mut b)?;
+        Ok(Self {
+            cipher: GREASE_VALUES[(b[0] & 0x0F) as usize],
+            group: GREASE_VALUES[(b[1] & 0x0F) as usize],
+            ext_first: GREASE_VALUES[(b[2] & 0x0F) as usize],
+            ext_last: GREASE_VALUES[(b[4] & 0x0F) as usize],
+            version: GREASE_VALUES[(b[3] & 0x0F) as usize],
+        })
     }
 }
 
-/// `ed25519` (0x0807). RETAINED ONLY as a named constant for the negative
-/// assertion in tests - it must NOT appear in any template's `sig_algs`.
-///
-/// JA4 RESIDUAL - RESOLVED: desktop Chrome/Firefox/Safari do not advertise
-/// ed25519, so neither does Reality anymore. The bridge's ephemeral cert +
-/// CertVerify were migrated to `ecdsa_secp256r1_sha256` (0x0403, see
-/// `tls_cert::build_self_signed_ecdsa_p256` and `tls_handshake_flight::
-/// build_certificate_verify`), and 0x0807 was dropped from every template, so
-/// advertised == signed == a scheme every browser offers. JA4 now matches the
-/// mimicked browser.
+/// `ed25519` (0x0807), retained for the negative assertion in tests. Shipped
+/// templates use ECDSA for the certificate and CertificateVerify path.
 pub const SIG_ED25519: u16 = 0x0807;
 /// `ecdsa_secp256r1_sha256`.
 pub const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
@@ -428,6 +383,8 @@ pub const CHROME_DESKTOP: TlsFingerprintTemplate = TlsFingerprintTemplate {
         // order. Required alongside the ML-KEM group (red-team HIGH #1).
         EXT_ENCRYPTED_CLIENT_HELLO,
     ],
+    rfc8701_grease: true,
+    shuffle_extensions: true,
     supported_groups: &[
         GROUP_X25519_MLKEM768,
         GROUP_X25519,
@@ -453,22 +410,16 @@ pub const CHROME_DESKTOP: TlsFingerprintTemplate = TlsFingerprintTemplate {
     compression_methods: &[0x00],
 };
 
-/// Firefox desktop stable-ish fingerprint template.
-///
-/// Firefox tends to emit `record_size_limit` and orders extensions
-/// differently from Chrome. A client that looks like Chrome on a
-/// network where Firefox is dominant (or vice versa) is another
-/// signal - operators should pick the template matching the
-/// majority baseline of their deployment's users.
+/// Firefox 153 desktop template. JA3 fields were reconciled against a capture;
+/// the full generated ClientHello has not been validated against that browser.
 pub const FIREFOX_DESKTOP: TlsFingerprintTemplate = TlsFingerprintTemplate {
     name: "firefox-desktop",
     provenance: TemplateProvenance {
-        claims_to_be: "Firefox 135",
-        // 2026-01-15. Stamped at the value the code actually reflects, not
-        // at today: the extension set and X25519MLKEM768 group were last
-        // reconciled with a real browser then. Dating it today would make
-        // the staleness check assert its own freshness.
-        checked_days: 20468,
+        claims_to_be: "Firefox 153",
+        // 2026-08-08: Firefox 153.0.3 capture used to reconcile the JA3
+        // fields below (docs/cover-scheduling.md). The full ClientHello has
+        // not been checked byte-for-byte, hence the false flag below.
+        checked_days: 20673,
         source: TemplateSource::HandTranscribed,
         validated_against_capture: false,
     },
@@ -483,16 +434,8 @@ pub const FIREFOX_DESKTOP: TlsFingerprintTemplate = TlsFingerprintTemplate {
         0xC02B, 0xC02F, 0xCCA9, 0xCCA8, 0xC02C, 0xC030, 0xC00A, 0xC013, 0xC014, 0x009C, 0x009D,
         0x002F, 0x0035,
     ],
-    // DERIVED FROM A REAL CAPTURE, not transcribed from documentation.
-    //
-    // 45 Firefox 153 ClientHellos were captured on the wire (the CONNECT tap in
-    // tools/cover-sources). All 33 that negotiated TLS 1.3 carried this exact
-    // membership and this exact order. The previous list was a strict SUBSET -
-    // 12 of the real 17 - missing session_ticket, status_request,
-    // delegated_credentials, SCT and compress_certificate, and ordering
-    // key_share/supported_versions/signature_algorithms differently from the
-    // browser it claimed to be. A fingerprint that is a subset of its target is
-    // not a near-miss; it is a distinct fingerprint matching nothing.
+    // Manually transcribed from 33 captured Firefox 153 TLS 1.3 ClientHellos;
+    // the full generated ClientHello has not been validated against a capture.
     extension_order: &[
         EXT_SERVER_NAME,
         EXT_EXTENDED_MASTER_SECRET,
@@ -514,6 +457,8 @@ pub const FIREFOX_DESKTOP: TlsFingerprintTemplate = TlsFingerprintTemplate {
         // (red-team HIGH #1).
         EXT_ENCRYPTED_CLIENT_HELLO,
     ],
+    rfc8701_grease: false,
+    shuffle_extensions: false,
     supported_groups: &[
         GROUP_X25519_MLKEM768,
         GROUP_X25519,
@@ -578,6 +523,9 @@ pub const SAFARI_DESKTOP: TlsFingerprintTemplate = TlsFingerprintTemplate {
         EXT_SIGNATURE_ALGORITHMS,
         EXT_KEY_SHARE,
     ],
+    // Retain the prior production behavior pending a Safari wire capture.
+    rfc8701_grease: true,
+    shuffle_extensions: true,
     supported_groups: &[GROUP_X25519, GROUP_SECP256R1, GROUP_SECP384R1],
     sig_algs: &[
         SIG_ECDSA_SECP256R1_SHA256,
@@ -621,10 +569,7 @@ pub const ALL_TEMPLATES: &[&TlsFingerprintTemplate] =
 /// the v0.1t analyst-finding response (per-session diversity beats
 /// per-deployment diversity for population-statistics resistance).
 ///
-/// Determinism: uses the OS CSPRNG. On RNG failure (vanishingly
-/// rare; typically only on a misconfigured container without
-/// /dev/urandom) falls back to [`CHROME_DESKTOP`] rather than
-/// panicking.
+/// Determinism: uses the OS CSPRNG and fails closed on entropy failure.
 ///
 /// Prefer [`pick_weighted_template`] in production: uniform
 /// rotation makes Mirage look like a population that's
@@ -633,60 +578,46 @@ pub const ALL_TEMPLATES: &[&TlsFingerprintTemplate] =
 /// distribution, closing the population-statistics tail of
 /// [RT-CN-4].
 pub fn pick_random_template() -> &'static TlsFingerprintTemplate {
-    let mut byte = [0u8; 1];
-    let idx: usize = match getrandom::fill(&mut byte) {
-        Ok(_) => byte[0] as usize % ALL_TEMPLATES.len(),
-        Err(_) => 0,
-    };
-    ALL_TEMPLATES[idx]
+    try_pick_random_template().expect("OS CSPRNG required for TLS fingerprint")
 }
 
-/// Pick a fingerprint template weighted by approximate
-/// real-world browser-population shares. Closes [RT-CN-4]
-/// (population-statistics tail): uniform random over {Chrome,
-/// Firefox, Safari} produces a 33%-each distribution; real-world
-/// passive observation sees ~75% Chrome / 15% Safari / 10%
-/// Firefox (rough StatCounter-style numbers, late 2025). With
-/// uniform rotation, a censor running a long-flow population
-/// classifier would see "this network has too much Firefox" -
-/// itself a Mirage signature. Weighted rotation makes Mirage's
-/// JA3 distribution match the host network's real distribution.
-///
-/// Operators in regions with different browser-share patterns
-/// (e.g., heavy QQ Browser in CN, Yandex in RU) SHOULD inject a
-/// custom template + adjust weights via [`pick_weighted_from`];
-/// the built-in defaults are tuned for global-average traffic.
-///
-/// CSPRNG failure: falls back to [`CHROME_DESKTOP`] (the highest-
-/// share template), preserving population blending under
-/// degraded conditions.
+/// Fallible random template picker for connection setup.
+pub fn try_pick_random_template() -> Result<&'static TlsFingerprintTemplate, getrandom::Error> {
+    let mut byte = [0u8; 1];
+    getrandom::fill(&mut byte)?;
+    Ok(ALL_TEMPLATES[byte[0] as usize % ALL_TEMPLATES.len()])
+}
+
+/// Pick one template per process using heuristic Chrome/Firefox/Safari weights
+/// of 75/10/15. These are not measured for a particular deployment. Production
+/// connection setup uses the fallible [`try_pick_weighted_template`].
 pub fn pick_weighted_template() -> &'static TlsFingerprintTemplate {
-    // Red-team round 2: pick ONCE per process and reuse it for every Reality
-    // connection. A real device runs ONE browser, so drawing a fresh
-    // browser-family template per connection means one source IP flips
-    // Chrome/Firefox/Safari across reconnects - a zero-false-positive passive
-    // correlation tell (the same class as the WS persona fix). The weighted draw
-    // still shapes the population ACROSS clients (each client is a stable sample
-    // from the Chrome-75/Safari-15/Firefox-10 distribution); it just no longer
-    // rotates WITHIN one client.
+    try_pick_weighted_template().expect("OS CSPRNG required for TLS fingerprint")
+}
+
+/// Fallible, per-process-pinned template picker for production connections.
+pub fn try_pick_weighted_template() -> Result<&'static TlsFingerprintTemplate, getrandom::Error> {
+    // Keep a stable browser family within this process's Reality connections.
     static PINNED: std::sync::OnceLock<&'static TlsFingerprintTemplate> =
         std::sync::OnceLock::new();
-    PINNED.get_or_init(pick_weighted_population)
+    if let Some(template) = PINNED.get() {
+        return Ok(*template);
+    }
+    let selected = try_pick_weighted_population()?;
+    Ok(*PINNED.get_or_init(|| selected))
 }
 
-/// The per-client population draw underlying [`pick_weighted_template`], WITHOUT
-/// the per-process pin.
-///
-/// A fresh client calls [`pick_weighted_template`] once and reuses the pinned
-/// result for every connection (one device runs one browser). This exposes the
-/// same weighted draw un-pinned, so population-level analysis - e.g. an
-/// adversary modelling a censor's JA3 sample across MANY independent clients -
-/// can simulate N separate clients by calling this N times. Weights and template
-/// set live here in one place so the pinned and population views never drift.
+/// Draw from the built-in weights without the per-process pin. This is useful
+/// for sampling the template distribution in tests and measurements.
 pub fn pick_weighted_population() -> &'static TlsFingerprintTemplate {
+    try_pick_weighted_population().expect("OS CSPRNG required for TLS fingerprint")
+}
+
+/// Fallible population draw, before the per-process pin.
+pub fn try_pick_weighted_population() -> Result<&'static TlsFingerprintTemplate, getrandom::Error> {
     // Weights: Chrome 75, Safari 15, Firefox 10 -> bucket sum 100.
     // Order matches ALL_TEMPLATES order.
-    pick_weighted_from(&[
+    try_pick_weighted_from(&[
         (&CHROME_DESKTOP, 75),
         (&FIREFOX_DESKTOP, 10),
         (&SAFARI_DESKTOP, 15),
@@ -704,23 +635,28 @@ pub fn pick_weighted_population() -> &'static TlsFingerprintTemplate {
 pub fn pick_weighted_from(
     pool: &[(&'static TlsFingerprintTemplate, u32)],
 ) -> &'static TlsFingerprintTemplate {
-    let total: u32 = pool.iter().map(|&(_, w)| w).sum();
+    try_pick_weighted_from(pool).expect("OS CSPRNG required for TLS fingerprint")
+}
+
+/// Fallible weighted picker. An empty or zero-weight pool uses the default.
+pub fn try_pick_weighted_from(
+    pool: &[(&'static TlsFingerprintTemplate, u32)],
+) -> Result<&'static TlsFingerprintTemplate, getrandom::Error> {
+    let total: u64 = pool.iter().map(|&(_, w)| u64::from(w)).sum();
     if total == 0 || pool.is_empty() {
-        return &CHROME_DESKTOP;
+        return Ok(&CHROME_DESKTOP);
     }
-    let mut buf = [0u8; 4];
-    let pick: u32 = match getrandom::fill(&mut buf) {
-        Ok(()) => u32::from_le_bytes(buf) % total,
-        Err(_) => return &CHROME_DESKTOP,
-    };
-    let mut acc: u32 = 0;
+    let mut buf = [0u8; 8];
+    getrandom::fill(&mut buf)?;
+    let pick = u64::from_le_bytes(buf) % total;
+    let mut acc: u64 = 0;
     for &(tpl, w) in pool {
-        acc = acc.saturating_add(w);
+        acc += u64::from(w);
         if pick < acc {
-            return tpl;
+            return Ok(tpl);
         }
     }
-    pool[pool.len() - 1].0
+    Ok(pool[pool.len() - 1].0)
 }
 
 // JA3 computation
@@ -787,12 +723,11 @@ pub fn warn_if_fingerprints_stale(now_days: u32) {
     if !unvalidated.is_empty() {
         tracing::warn!(
             templates = %unvalidated.join(", "),
-            "TLS ClientHello templates have NOT been validated against a capture of the \
-             browser they claim to be. A measured comparison against Firefox 153 found the \
-             firefox template emitting 12 extensions with GREASE against a real 17 with \
-             none. A ClientHello matching nothing in the population is an exact-match \
-             first-packet block, and it defeats every downstream defence because none of \
-             them are reached. Treat the TLS fingerprint as KNOWN-WRONG."
+            "TLS ClientHello templates have NOT been fully validated against captures of the \
+             browsers they claim to be. Firefox 153's JA3 now matches a measured capture, \
+             but other ClientHello fields and the Chrome/Safari templates remain unverified. \
+             A ClientHello matching nothing in the population can be blocked by an exact \
+             first-packet rule before downstream defences are reached."
         );
     }
     for t in ALL_TEMPLATES {
@@ -1150,5 +1085,12 @@ mod tests {
             let pick = pick_weighted_from(&pool);
             assert_eq!(pick.name, "firefox-desktop");
         }
+    }
+
+    #[test]
+    fn weighted_picker_handles_weights_above_u32_total() {
+        let pool = [(&CHROME_DESKTOP, u32::MAX), (&FIREFOX_DESKTOP, u32::MAX)];
+        let pick = try_pick_weighted_from(&pool).expect("entropy available");
+        assert!(matches!(pick.name, "chrome-desktop" | "firefox-desktop"));
     }
 }

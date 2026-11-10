@@ -1,21 +1,15 @@
-name: JA3 fingerprint drift
+name: Pinned JA3 regression
 
-# A26: detect drift between Mirage's pinned ClientHello fingerprint
-# templates (Chrome / Firefox / Safari) and current real-world
-# browser JA3 strings. If Chrome releases a stable version that
-# changes its wire fingerprint, the `chrome-desktop` template
-# becomes a standing signature for Mirage clients - operators
-# need to know.
+# A26: verify that Mirage's committed ClientHello templates (Chrome /
+# Firefox / Safari) still have their expected JA3 strings and do not collide.
+# These tests use only in-tree constants. They cannot detect a real browser
+# update or prove that any current browser has the same fingerprint. That
+# requires fresh ClientHello captures and comparison against this source.
 #
-# This job runs on a weekly schedule (plus manual dispatch). It asserts the
-# committed pinned-JA3 regression tests still pass and that the fingerprint
-# templates don't collide with each other - reproducible, fail-loud, in-tree
-# (zero external data).
+# The full suite already runs on every push in ci.yml. Keep this focused manual
+# workflow for operators investigating a fingerprint mismatch.
 
 on:
-  schedule:
-    # 09:00 UTC every Monday - ahead of the week's operational load.
-    - cron: "0 9 * * 1"
   workflow_dispatch:
 
 concurrency:
@@ -27,26 +21,11 @@ env:
 
 jobs:
   pinned_regression:
-    name: Pinned JA3 strings match source
+    name: Pinned JA3 tests
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: .
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Run the pinned JA3 tests
         run: |
-          cargo test -p mirage-transport-reality --lib tls_fingerprint:: -- --nocapture
-
-  no_overlap:
-    name: Templates do not collide
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: .
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Three templates must have three distinct JA3 strings
-        run: cargo test -p mirage-transport-reality --lib templates_have_distinct_ja3
+          cargo test --locked -p mirage-transport-reality --lib tls_fingerprint:: -- --nocapture

@@ -394,7 +394,7 @@ where
     // `ok`, so the pass and fail paths take identically-distributed time.
     // The delay does not depend on the verify result, so there is no
     // close-latency oracle a forged-valid knock could read out.
-    tokio::time::sleep(random_tarpit()).await;
+    tokio::time::sleep(random_tarpit()?).await;
     if !ok {
         return Err(TransportError::Auth("obfs auth verify failed"));
     }
@@ -408,21 +408,19 @@ where
 /// path of [`obfs_server_authenticate`] (finding #9) so the two are
 /// identically distributed in time; it also masks the
 /// constant-time-but-variable auth-tag-verify timing. Closes
-/// [RT-CN-3]. CSPRNG failure falls back to the lower bound (0 ms
-/// - matches an immediate close).
-fn random_tarpit() -> Duration {
+/// [RT-CN-3]. A CSPRNG failure aborts both auth branches equally instead of
+/// yielding a deterministic zero-delay response.
+fn random_tarpit() -> Result<Duration, TransportError> {
     let min = OBFS_AUTH_FAIL_JITTER_MIN.as_millis() as u64;
     let max = OBFS_AUTH_FAIL_JITTER_MAX.as_millis() as u64;
     let span = max.saturating_sub(min);
     if span == 0 {
-        return OBFS_AUTH_FAIL_JITTER_MIN;
+        return Ok(OBFS_AUTH_FAIL_JITTER_MIN);
     }
     let mut bytes = [0u8; 8];
-    if getrandom::fill(&mut bytes).is_err() {
-        return OBFS_AUTH_FAIL_JITTER_MIN;
-    }
+    getrandom::fill(&mut bytes).map_err(|_| TransportError::Other("CSPRNG failure".into()))?;
     let pick = u64::from_be_bytes(bytes) % span;
-    Duration::from_millis(min + pick)
+    Ok(Duration::from_millis(min + pick))
 }
 
 #[cfg(test)]

@@ -1260,9 +1260,11 @@ fn schedule_window_icon(ui_weak: slint::Weak<AppWindow>) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::write_secret_file;
     use super::{
         format_rate, identity_color, list_dir, prettify_carrier, prettify_channel,
-        profile_subtitle, write_secret_file, Profile,
+        profile_subtitle, Profile,
     };
 
     #[test]

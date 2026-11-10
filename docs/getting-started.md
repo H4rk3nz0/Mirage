@@ -1,7 +1,7 @@
 # Getting started
 
-Goal: get your traffic through a Mirage bridge. You need **an invite** - a `mirage://...`
-string from whoever runs the bridge. Everything else has a sane default.
+To connect through a Mirage bridge, get a `mirage://...` invite from its
+operator. It carries the bridge credentials and initial connection details.
 
 - [1. Install](#1-install)
 - [2. Connect](#2-connect)
@@ -14,15 +14,15 @@ string from whoever runs the bridge. Everything else has a sane default.
 
 ## 1. Install
 
-Grab the archive for your platform from [releases](../../../releases) and verify it before
-you run it - a censor's cheapest attack is handing you a modified build:
+Download the archive for your platform from [releases](../../../releases) and
+verify it before running it:
 
 ```sh
 sha256sum -c SHA256SUMS.txt
 gh attestation verify <archive> --owner <ORG>     # Sigstore build provenance
 ```
 
-Or build it yourself (no feature flags - one build has everything):
+Or build the standard workspace:
 
 ```sh
 cargo build --release --workspace
@@ -45,13 +45,13 @@ command line opens the app already connecting to it.
 
 The app is built to keep you in control of both ends:
 
-- **Profiles** - save an invite or `client.json` under a name and switch between them with one
-  click (persisted locally, owner-only `0600`, so they survive restarts without leaking the invite).
+- **Profiles** - save an invite or `client.json` under a name and switch between
+  them. Profiles are stored locally; treat those files as bearer secrets.
 - **Re-discover** - force the client to walk its rendezvous channels (DHT / Nostr / DNS) again
   right now instead of waiting for the next periodic sweep. The **Discovery** panel shows which
   channels are in play and how many bridges it has found.
 - **Reconnect** - drop and re-establish the tunnel.
-- **Paranoid** - flip on the strongest posture (Reality + Proteus + fail-closed) without
+- **Paranoid** - enable Reality, Proteus, and fail-closed settings without
   editing config. The bridge must have Proteus on too, or the session will not come up.
 
 Install it from the native installer for your platform - **AppImage/`.deb`** (Linux),
@@ -77,7 +77,7 @@ Run it:
 mirage-client client.json
 ```
 
-That's the whole minimum config. The invite carries the bridge address, its public key, your
+The invite carries the bridge address, its public key, your
 capability token, and which carriers that bridge offers - so you don't configure carriers by
 hand.
 
@@ -101,9 +101,8 @@ The client is a standard **SOCKS5** proxy on `127.0.0.1:1080`.
 curl --proxy socks5h://127.0.0.1:1080 https://example.com
 ```
 
-> **Use `socks5h`, not `socks5`.** The `h` makes the *proxy* resolve DNS. Plain `socks5`
-> resolves hostnames on your machine, which leaks every site you visit to the local network
-> - exactly what you're trying to avoid.
+> **Use `socks5h`.** The `h` makes the proxy resolve hostnames. Plain `socks5`
+> uses your local resolver and may expose DNS outside the tunnel.
 
 **Firefox:** Settings -> Network Settings -> Manual proxy -> SOCKS v5 `127.0.0.1:1080`, and
 tick **"Proxy DNS when using SOCKS v5"**.
@@ -119,8 +118,8 @@ chromium --proxy-server="socks5://127.0.0.1:1080" \
 
 ## 4. Whole-device VPN (optional)
 
-TUN mode captures **every TCP and UDP flow from the entire machine** - no per-app proxy
-setup. It is compiled into the standard client; you turn it on in config:
+TUN mode routes device traffic through the client without per-app proxy setup.
+It is included in the standard client; enable it in config:
 
 ```json
 {
@@ -130,12 +129,11 @@ setup. It is compiled into the standard client; you turn it on in config:
 }
 ```
 
-On start the client opens the TUN device **and installs the OS routes that make the kernel
-actually send your traffic through it** - a split-default that captures everything, plus a
+On start the client opens the TUN device and installs split-default routes, plus a
 per-bridge bypass route so the encrypted carrier packets to the bridge don't loop back into the
-tunnel. It restores your original routing table when it exits. If it cannot install those
-routes it **fails closed**: it prints an error and refuses to run, rather than leaving an
-interface up that would leak your traffic in clear.
+tunnel. It restores the previous routes when it exits. If route installation
+fails, the client reports the error and refuses to start TUN mode. See the
+[security model](security-model.md) for DNS and route limitations.
 
 It needs elevated privileges for the network device and the routing table:
 
@@ -170,11 +168,14 @@ knobs are:
 You don't have to guess blindly - the client scores carriers on live success and prefers
 what has been working. Details in [features](features.md).
 
-**No invite at all?** Set a discovery channel and the client will find bridges itself:
+Discovery refreshes bridge records associated with an invite. It does not
+provide public, anonymous bridge credentials. Keep the invite in the config
+when enabling discovery channels:
 
 ```json
 {
   "local_bind": "127.0.0.1:1080",
+  "invite": "mirage://...",
   "nostr_relays": ["wss://relay.example"],
   "dht_enabled": true
 }
@@ -190,13 +191,11 @@ what has been working. Details in [features](features.md).
 **Connects, but no traffic** - you're probably using `socks5` instead of `socks5h`, or the
 bridge can't reach the destination.
 
-**TUN mode won't start** - it fails closed on purpose, so it tells you why. Almost always it's
+**TUN mode won't start** - check the startup error. One common cause is missing
 privileges: Linux needs `CAP_NET_ADMIN`/root (grant it with `setcap`, above, or run under
 `sudo`), macOS needs `sudo`, and Windows needs an **elevated** (Administrator) terminal - the
-Wintun adapter and the route changes both require it. Mirage does **not** pop its own UAC
-prompt; start it already-elevated. The client logs the exact reason at startup - run it in a
-terminal and read the first ten lines. It will never silently bring up a tunnel that leaks your
-traffic.
+Wintun adapter and the route changes both require it. Mirage does not open a UAC
+prompt; start it elevated. Run the client in a terminal to see the startup error.
 
 **All carriers fail on one network but work on another** - that network is blocking your
 current carrier. Try the table above; start with `meek` or `dnstt`.

@@ -204,9 +204,9 @@ fn build_probe_client_hello(server_name: &str) -> Result<Vec<u8>, crate::error::
     let mut random = [0u8; 32];
     let mut session_id = [0u8; 32];
     let mut sk_bytes = [0u8; 32];
-    getrandom::fill(&mut random).map_err(|_| crate::error::RealityError::ZeroPoint)?;
-    getrandom::fill(&mut session_id).map_err(|_| crate::error::RealityError::ZeroPoint)?;
-    getrandom::fill(&mut sk_bytes).map_err(|_| crate::error::RealityError::ZeroPoint)?;
+    getrandom::fill(&mut random).map_err(|_| crate::error::RealityError::Entropy)?;
+    getrandom::fill(&mut session_id).map_err(|_| crate::error::RealityError::Entropy)?;
+    getrandom::fill(&mut sk_bytes).map_err(|_| crate::error::RealityError::Entropy)?;
 
     let sk = mirage_crypto::x25519_dalek::StaticSecret::from(sk_bytes);
     let pk = *mirage_crypto::x25519_dalek::PublicKey::from(&sk).as_bytes();
@@ -220,8 +220,9 @@ fn build_probe_client_hello(server_name: &str) -> Result<Vec<u8>, crate::error::
         x25519_key_share: &pk,
         server_name,
         include_alpn: true,
-        fingerprint: tls_fingerprint::pick_weighted_template(),
-        grease: Some(GreaseValues::random()),
+        fingerprint: tls_fingerprint::try_pick_weighted_template()
+            .map_err(|_| crate::error::RealityError::Entropy)?,
+        grease: Some(GreaseValues::try_random().map_err(|_| crate::error::RealityError::Entropy)?),
         mlkem_ek: Some(&mlkem_ek),
     })
 }

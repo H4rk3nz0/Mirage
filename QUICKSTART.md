@@ -3,8 +3,8 @@
 Deploy a Mirage proxy from a clean checkout: a **single bridge + client**
 (standalone) or a **two-bridge cohort** (fleet). Copy-paste configs included.
 
-**Status: 0.1.3-alpha.1, early alpha. APIs, config fields, and wire formats
-may change before 0.1.0-stable. Test on non-hostile networks first.**
+**Status: 0.1.8-alpha.1, early alpha. APIs, config fields, and wire formats
+may change before a stable release. Test on non-hostile networks first.**
 
 ---
 
@@ -14,7 +14,7 @@ may change before 0.1.0-stable. Test on non-hostile networks first.**
 |---------|--------|
 | Post-quantum Noise-XX + ML-KEM-768 handshake | [ok] |
 | SOCKS5-over-Mirage proxy | [ok] |
-| Transparent system-wide VPN (TUN device, no per-app config) | [ok] build `mirage-client --features tun`, set `"tun_enabled": true`, run with `CAP_NET_ADMIN`. TCP **and** UDP (DNS/QUIC) tunneled. |
+| Transparent system-wide VPN (TUN device, no per-app config) | [ok] built into `mirage-client`; set `"tun_enabled": true` and grant the required OS privileges. TCP **and** UDP (DNS/QUIC) tunneled. |
 | Multi-hop onion relay (per-hop capability-token auth) | [ok] relay engine + bridge-to-bridge dialer; operator-enabled. No single hop sees both source and destination. |
 | Reality TLS carrier (DPI bypass) | [ok] |
 | obfs-tcp transport (signature bypass) | [ok] |

@@ -1,81 +1,63 @@
 # Cover selection is a queueing problem
 
-> ##  PROVISIONAL — the numbers in this document are suspect
+> **Measurement status: provisional.** The original `browser_capture.py` wrote
+> traces only when connections closed. Long-lived streams still open at browser
+> shutdown were omitted. In one 45-second retake, none of 47 saved connection
+> files contained the video stream. The four-class table, gap distributions,
+> and duty-cycle findings below are therefore biased toward short connections.
 >
-> **The instrument that produced them was defective.** `browser_capture.py` wrote a
-> connection's trace only when that connection *closed*, so every connection still
-> open when the browser exited was silently absent. Measured after the fix: a 45 s
-> video session produced 47 connection files across 22 hosts and **not one of them
-> was the video stream** — the short-lived background connections closed and were
-> recorded, the long-lived one carrying the payload vanished.
->
-> Every capture behind this document was taken with that tap. The four-class table,
-> the gap distributions, and the duty-cycle findings are therefore drawn from a
-> biased subsample: **short-lived connections only**, in a study whose whole subject
-> is long-lived streaming behaviour.
->
-> **The latency ranking has already changed.** Browse's worst gap was 122 ms in the
-> table below and 4971 ms in the first re-take; both were the capture window rather
-> than the page. Trimmed to the burst the page load actually is, it is **95.6 ms** —
-> which puts browse **ahead of live audio (338 ms)** and every video class on the
-> gap bound, the axis this document argues is the one that matters. The class that
-> fails the throughput floor is the class with the best latency, which sharpens the
-> workload-split argument rather than softening it.
->
-> **What is already known to be wrong.** The segmented-HLS row was re-measured at
-> library defaults across two independent players and moved from a 877 ms worst gap
-> to **~10 s**, with 5-6 gaps over one second per 50 s where the original reported
-> zero. See Limitations. That single row carried the document's headline conclusion.
->
-> **What is probably still right.** The *mechanisms* — that cover choice bounds queue
-> delay, that the capacity-relevant statistic is a gap bound rather than a rate, a
-> CV, or a duty cycle — are arguments from Little's law and do not depend on which
-> connections got written. The *rankings and magnitudes* do.
->
-> Not retracted, because the reasoning is separable from the numbers and worth
-> keeping. Not citable until re-measured with the fixed tap.
+> Later retakes changed the ranking: a page-load browse burst had a 95.6 ms
+> worst gap after trimming the capture window, while segmented HLS had roughly
+> 10-second gaps across two players rather than the reported 877 ms. The
+> original queueing argument also overstated what gap percentiles imply about
+> delay. Treat the old tables as a record of the experiment, not validated
+> cover-selection evidence. Re-measurement with the fixed tap is pending.
 
-*A result from Mirage's cover-class measurements, 2026-08-08. Stated separately
-from the implementation because it applies to any traffic-shaped circumvention
-system, not just this one.*
+The original cover-class measurements were taken on 8 August 2026.
 
-## Claim
+## Corrected claim
 
 Systems that shape traffic to imitate a cover class choose that class on
 **realism** — how hard the shaped flow is to distinguish from real traffic of
 that type. That is necessary and it is not sufficient, because it says nothing
 about whether the resulting tunnel is *usable*.
 
-Usability is a queueing property. A shaped tunnel's service rate is fixed by the
-cover envelope, not by the link, so the cover's **silence structure** determines
-queue delay. We measured four plausible statistics for choosing between cover
-classes. Four rank the classes differently and are all wrong. The one that
-survives is:
+Usability is a queueing property. Let `A(t)` be cumulative admitted payload bytes
+and `S(t)` the cumulative usable payload capacity of scheduled cover slots. In a
+fluid queue, backlog at time `t` is the largest positive deficit over preceding
+windows:
 
-> **The high-quantile inter-record gap of the cover, multiplied by the offered
-> rate.**
+`Q(t) = max(0, sup_{0 <= u <= t} [A(t)-A(u) - (S(t)-S(u))])`.
 
-Not the mean rate, not the record-size variance, not the duty cycle, not the idle
-fraction.
+For a constant offered rate `a`, measure `sup_{u < t} [a(t-u) -
+(S(t)-S(u))]` over the capture and its replay boundaries. A large inter-record
+gap creates one such deficit, but a run of low service across smaller gaps can
+create a larger one. A profile whose long-run usable service rate is at or below
+`a` has no finite steady-state backlog bound. The measured gap tail is a
+diagnostic, not a sufficient capacity statistic.
 
-## Why the others cannot work
+## Why the other summaries were insufficient
 
 Each rejected statistic is a summary of the cover's **marginal distribution**. The
 binding constraint is a property of the **tunnel's queue**.
 
 During a gap the tunnel cannot transmit, but the application keeps offering, so
-bytes accumulate at the offered rate. By Little's law the resulting delay is
-bounded iff the gap is bounded — *regardless of rate*. A high mean rate does not
-rescue a long gap, and a low mean rate is not fatal if gaps are short.
+bytes accumulate at the offered rate. Whether the queue recovers depends on
+later *surplus* service. Little's law relates mean backlog, arrival rate, and
+mean delay **for a stable queue**; it does not establish stability or a delay
+bound from a gap percentile. Even bounded gaps can accompany unbounded backlog
+when offered rate exceeds service rate. Conversely, an unbounded gap
+distribution may still yield finite mean delay under suitable tail and load
+conditions.
 
-Mean rate and idle fraction are integrals over a distribution whose **tail is the
-entire story**. They average away the only part that matters. Record-size variance
-is a statement about the marginal that the shaping engine preserves exactly (see
-below), so it carries no information about capacity at all.
+Mean rate is necessary to establish a capacity margin, but it does not describe
+short-window deficits. Idle fraction and gap percentiles each lose temporal
+ordering. Record-size variance alone also loses that ordering. Compute the
+service-deficit curve and test it against representative arrival processes.
 
-The precise quantity is a **product of two measured values**, and no single
-time constant can express it: a 900 ms gap absorbs ~11 kB at 100 kbps offered and
-~340 kB at 3 Mbps.
+A 900 ms gap accumulates ~11 kB at 100 kbps offered and ~340 kB at 3 Mbps.
+Those figures describe the backlog *at the end of that gap*, not the maximum
+backlog or delay over a whole flow.
 
 ## Measurements
 
@@ -103,45 +85,39 @@ network position.
   document is about — it is the only row where the two differ by an order of
   magnitude, and it is the class that fails the throughput floor.
 
-^2 **For engines that preserve the size marginal by construction, this row cannot
-  apply at all** — it is not a weak proxy but a non-applicable one. Where payload
-  displaces padding inside a fixed token (`emitted = real + pad = token`), the
-  realised size distribution is identical with and without payload, so it carries
-  no information about capacity by construction. Included here to show it also
-  ranks the classes backwards even taken at face value.
+^2 A *size marginal alone* does not describe service over time. Where payload
+  displaces padding inside fixed tokens (`emitted = real + pad = token`), the
+  realised size distribution is identical with and without payload. That protects
+  the size marginal from demand leakage; it does not make record sizes irrelevant
+  to capacity, which depends on both their sizes and their schedule.
 
-### The decisive comparison
+### A comparison that motivated the original hypothesis
 
-**Buffered progressive video and segmented adaptive video have similar idle
-fractions — 94.3% and 80.8% — and completely different usability.** What separates
-them is the gap bound: 15 s against 0.877 s. Any statistic that summarises "how
-much of the time is this cover silent" scores them as near-equivalent. They are
-not.
+The defective capture suggested buffered progressive video and segmented video
+had similar idle fractions but very different longest gaps (15 s and 0.877 s).
+The segmented-video result was overturned by the re-take (~10 s gaps). This
+comparison cannot support a usability ranking.
 
 ### How each proxy fails
 
-- **Record-size CV.** Browse has the *highest* CV (1.33) and the lowest capacity;
-  buffered video has the *lowest* (0.06) and 1200x the throughput. Ranks the
-  classes backwards. For engines that preserve the size marginal by construction —
-  where payload displaces padding within a fixed token — it is not merely a weak
-  proxy but carries no capacity information at all.
+- **Record-size CV.** It omits token rate and temporal ordering; two schedules
+  can have the same size marginal and radically different queue deficits.
 - **Mean rate.** Ranks buffered video first (11.87 Mbps). That class stalls for
   15 seconds at a time.
-- **Duty cycle / idle fraction.** Scores buffered video and segmented video as
-  comparable (94% vs 81%). Their worst-case delays differ by 17x.
+- **Duty cycle / idle fraction.** It does not say how long service stays below
+  arrivals or how quickly the queue can recover.
 - **Burst magnitude.** Follows mean rate; same failure.
 
 ## Consequence for system design
 
-1. **Select cover by high-quantile gap, then by rate.** A class that fails the
-   throughput floor is unusable, but among classes that clear it, the gap bound
-   decides. Quantile rather than maximum: the max is one observation and would
-   size every buffer for an outlier.
-2. **Derive queue parameters from the profile, not from constants.** Buffer sizing,
-   admission thresholds and rate limits should be computed as
-   `gap_quantile x offered_rate` from the cover actually in use. In Mirage a single
-   0.5 s constant was spanning a 120x range of real gap structures (122 ms to
-   15 s) and could not have been right for more than one of them.
+1. **First establish a rate margin, then measure service deficits.** Compute usable
+   capacity after framing overhead and evaluate its cumulative service over
+   windows from milliseconds to complete sessions. Test queueing under explicit
+   arrival models; a gap quantile is only one diagnostic.
+2. **Derive queue parameters from the profile and workload.** Buffer sizing and
+   admission should use the maximum or a stated tail quantile of the backlog
+   generated by the service curve under a chosen arrival envelope. The former
+   fixed 0.5 s constant and the later fixed p99 gap both miss long HLS stalls.
 3. ~~**Segmented adaptive streaming is the strong class**~~ — **WITHDRAWN.** The
    sub-second gap bound was an artifact of a non-default player buffer. At library
    defaults, across two independent players, the gap bound is ~10 s: segment
@@ -180,7 +156,7 @@ not.
   truncation artifacts of stopping the capture; each was checked against the end of
   its own trace.
 
-- **`GAP_QUANTILE = 0.99` is the wrong statistic for this class, by 3-4 orders of
+- **The former `GAP_QUANTILE = 0.99` was wrong for this class, by 3-4 orders of
   magnitude.** The gap distribution here is *bimodal* — intra-burst gaps near zero,
   inter-segment gaps near 10 s — and the long gaps are only 0.08-0.11% of the
   sample, so p99 sits inside the fast mode and never sees them:
@@ -190,13 +166,13 @@ not.
   | hls.js | 1.3 ms | 141.6 ms | 10007 ms | **7507x** |
   | Shaka | 2.8 ms | 9654 ms | 10213 ms | **3657x** |
 
-  A receive buffer sized from `cover_gap_secs(0.99)` for segmented video would be
+  A receive buffer sized from the former `cover_gap_secs(0.99)` for segmented video would be
   provisioned for a 1.3 ms stall against a real 10 s one. This is the same defect
   as the fixed 0.5 s constant it replaced — a single summary that cannot span the
   classes it is applied to — and it survived because every class measured until now
-  had a unimodal gap distribution. The quantile needs to be per-class, or the
-  statistic needs to be the mode-aware one (largest gap, or the upper mode's
-  location) rather than a fixed quantile.
+  had a unimodal gap distribution. The runtime now uses the measured maximum
+  as a conservative interim input to its bounded receive-buffer control. A
+  service-curve and arrival model are still needed for principled admission.
 - **The CONNECT tap** adds a loopback hop to timings and suppresses HTTP/3.
   Preferable is a raw on-path capture; that requires packet-capture privileges.
 - **The driver-cadence defect recurred after being documented here.** The warning

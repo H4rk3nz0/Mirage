@@ -283,13 +283,10 @@ impl NostrRelayChannel {
         // Jitter the NIP-40 expiration by up to +30 min so a relay scraper can't
         // key on a fixed created_at+TTL offset (an "hourly cadence" tell -
         // red-team #15). Real clients set varied NIP-40 expirations.
-        let jitter = {
-            let mut b = [0u8; 2];
-            match getrandom::fill(&mut b) {
-                Ok(()) => u64::from(u16::from_le_bytes(b)) % 1801, // 0..=1800s
-                Err(_) => 0,
-            }
-        };
+        let mut jitter_bytes = [0u8; 2];
+        getrandom::fill(&mut jitter_bytes)
+            .map_err(|_| ChannelError::Transport("expiration entropy unavailable".into()))?;
+        let jitter = u64::from(u16::from_le_bytes(jitter_bytes)) % 1801; // 0..=1800s
         let expires_at = created_at
             .saturating_add(self.config.default_event_ttl_secs.unwrap_or(3_600))
             .saturating_add(jitter);
@@ -312,15 +309,13 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn gen_sub_id() -> String {
+fn gen_sub_id() -> Result<String, ChannelError> {
     // 16 random hex chars - plenty unique across the lifetime of a
     // single WebSocket call, and short enough to keep frame sizes low.
     let mut raw = [0u8; 8];
-    // `getrandom::fill` is infallible on supported platforms per the
-    // crate's docs; on failure we fall back to a zeroed subid, which
-    // still works because each connection is fresh.
-    let _ = getrandom::fill(&mut raw);
-    hex::encode(raw)
+    getrandom::fill(&mut raw)
+        .map_err(|_| ChannelError::Transport("subscription entropy unavailable".into()))?;
+    Ok(hex::encode(raw))
 }
 
 #[async_trait]
@@ -394,7 +389,7 @@ impl DiscoveryChannel for NostrRelayChannel {
     }
 
     async fn fetch(&self, info_hash: &[u8; INFO_HASH_LEN]) -> Result<Vec<Vec<u8>>, ChannelError> {
-        let sub_id = gen_sub_id();
+        let sub_id = gen_sub_id()?;
 
         let epoch_kind = crate::event::mirage_event_kind(info_hash);
         // Finding #17: fetch a COARSE superset. Filter ONLY on the per-epoch

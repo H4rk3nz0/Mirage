@@ -53,7 +53,7 @@ mod claim_log;
 mod metrics;
 mod rate_limit;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -178,14 +178,10 @@ struct BridgeConfig {
     /// separately by [`anonymize_client_logs`].
     #[serde(default = "default_anonymize_target_logs")]
     anonymize_target_logs: bool,
-    /// If true (the DEFAULT), client IP addresses are never written to logs: a
-    /// per-run-salted, irreversible opaque `client-xxxxxxxx` label is logged
-    /// instead. This keeps session-lifecycle logs useful (a given client's lines
-    /// share one label within a run) while ensuring a **seized bridge with
-    /// retained logs cannot reveal which clients connected** - which is itself
-    /// incriminating for a user in a censored region, even with the destination
-    /// redacted. Set false to log raw client IPs (opt-in; only with a lawful
-    /// need AND explicit disclosure to users).
+    /// If true (default), logs replace client IPs with per-run keyed labels.
+    /// Labels correlate one client's events within a run and resist offline IP
+    /// lookup when the key is unavailable. A live process still holds that key.
+    /// Set false to log raw client IP addresses.
     #[serde(default = "default_true")]
     anonymize_client_logs: bool,
 
@@ -387,7 +383,8 @@ struct BridgeConfig {
     /// Hard cap on how long the bridge will shuttle cover-service
     /// bytes after an auth failure. Default 30 s - enough that a
     /// real HTTPS session completes, short enough that a flood of
-    /// junk connections doesn't tie up the bridge indefinitely.
+    /// junk connections doesn't tie up the bridge indefinitely. Set to 0 to
+    /// disable the post-connect duration cap for cover and shadow forwarding.
     #[serde(default = "default_reality_cover_cap_secs")]
     reality_cover_duration_cap_secs: u64,
     /// Reality anti-probe epoch binding: when `true` (default), the bridge also
@@ -967,9 +964,9 @@ fn default_anonymize_target_logs() -> bool {
 /// `client = %plog(&peer)` log sites need no per-call flag threading.
 static ANONYMIZE_CLIENT_LOGS: AtomicBool = AtomicBool::new(true);
 
-/// Per-run random salt so anonymized client labels are irreversible to the IP
-/// and unlinkable across process restarts. Set once at startup.
-static CLIENT_LOG_SALT: AtomicU64 = AtomicU64::new(0);
+/// Per-run secret key for client labels. Set once at startup before accepting
+/// sessions; keyed BLAKE3 prevents offline IP-dictionary reversal of logs.
+static CLIENT_LOG_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
 
 /// Process-wide switch for stream multiplexing. Set once at startup from
 /// `BridgeConfig::mux_enabled`; read at the post-handshake dispatch so an
@@ -998,28 +995,36 @@ static RELAY_PEER_KEYS: std::sync::OnceLock<Arc<std::collections::HashSet<[u8; 3
     std::sync::OnceLock::new();
 
 /// Initialise the client-log anonymization state from config (once, at startup).
-fn init_client_log_anonymization(anonymize: bool) {
+/// An RNG failure must prevent startup with anonymization enabled.
+fn init_client_log_anonymization(anonymize: bool) -> Result<(), String> {
+    if anonymize {
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key)
+            .map_err(|e| format!("client-log anonymization RNG failed: {e}"))?;
+        CLIENT_LOG_KEY
+            .set(key)
+            .map_err(|_| "client-log anonymization initialized twice".to_string())?;
+    }
     ANONYMIZE_CLIENT_LOGS.store(anonymize, Ordering::Relaxed);
-    let mut s = [0u8; 8];
-    let _ = getrandom::fill(&mut s);
-    CLIENT_LOG_SALT.store(u64::from_le_bytes(s), Ordering::Relaxed);
+    Ok(())
 }
 
 /// Render a client peer address for logging. When anonymization is on (default),
-/// returns a per-run-stable, irreversible opaque `client-xxxxxxxx` label (salted
-/// FNV-1a over the IP only - the ephemeral port is dropped), so one client's log
-/// lines correlate within a run but a seized log never reveals the IP. When off,
-/// returns the raw `IP:port`.
+/// returns a per-run-stable keyed label over the IP only (without the ephemeral
+/// port). Offline IP lookup requires the process key. When off, returns `IP:port`.
 fn plog(peer: &std::net::SocketAddr) -> String {
     if !ANONYMIZE_CLIENT_LOGS.load(Ordering::Relaxed) {
         return peer.to_string();
     }
-    let mut h = CLIENT_LOG_SALT.load(Ordering::Relaxed) ^ 0xcbf2_9ce4_8422_2325;
-    for b in peer.ip().to_string().as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("client-{:08x}", (h & 0xffff_ffff) as u32)
+    let key = CLIENT_LOG_KEY
+        .get()
+        .expect("client-log key must be initialized before sessions are accepted");
+    client_log_label(key, peer.ip())
+}
+
+fn client_log_label(key: &[u8; 32], ip: std::net::IpAddr) -> String {
+    let digest = mirage_crypto::blake3::keyed_hash(key, ip.to_string().as_bytes());
+    format!("client-{}", hex::encode(&digest.as_bytes()[..16]))
 }
 fn default_reality_ch_timeout_secs() -> u64 {
     10
@@ -1133,14 +1138,18 @@ fn forward_to_shadow(
         // The whole post-connect exchange (replay write + bidirectional splice)
         // is bounded by `cap` so a wedged/slow decoy cannot pin this task -
         // the earlier replay write_all had no deadline of its own.
-        let _ = tokio::time::timeout(cap, async move {
+        let exchange = async move {
             if !replay.is_empty() {
                 upstream.write_all(&replay).await?;
             }
             copy_bidirectional(&mut client, &mut upstream).await?;
             Ok::<(), std::io::Error>(())
-        })
-        .await;
+        };
+        if cap.is_zero() {
+            let _ = exchange.await;
+        } else {
+            let _ = tokio::time::timeout(cap, exchange).await;
+        }
     });
 }
 
@@ -2666,7 +2675,7 @@ async fn main() {
 
     // In-process operator admin UI (opt-in). Reads live counters, edits this
     // config file (secret-preserving, atomic 0600), and can restart the systemd
-    // unit. Token-gated + loopback-only; see `admin` module docs.
+    // unit. Token-gated; see `admin` module docs.
     if let Some(bind) = admin_ui_cli.clone().or_else(|| config.admin_bind.clone()) {
         admin::warn_if_public(&bind);
         match TcpListener::bind(&bind).await {
@@ -2675,20 +2684,28 @@ async fn main() {
                     .local_addr()
                     .map(|a| a.to_string())
                     .unwrap_or_else(|_| bind.clone());
-                let token = admin::gen_token();
-                admin::log_access_url(&addr, &token);
-                let rs_for_admin = Arc::clone(&replay_set);
-                let replay_size_fn: Arc<dyn Fn() -> u64 + Send + Sync> =
-                    Arc::new(move || rs_for_admin.len() as u64);
-                let state = Arc::new(admin::AdminState {
-                    config_path: config_path.clone(),
-                    metrics: Arc::clone(&metrics),
-                    replay_size_fn,
-                    start_time: std::time::Instant::now(),
-                    token,
-                    service_name: config.admin_service.clone(),
-                });
-                tokio::spawn(async move { admin::serve_admin(listener, state).await });
+                let token = admin::gen_token()
+                    .unwrap_or_else(|e| fatal(&format!("admin access-token RNG failed: {e}")));
+                match admin::write_access_url(&config_path, &addr, &token) {
+                    Ok(path) => {
+                        admin::log_access_file(&addr, &path);
+                        let rs_for_admin = Arc::clone(&replay_set);
+                        let replay_size_fn: Arc<dyn Fn() -> u64 + Send + Sync> =
+                            Arc::new(move || rs_for_admin.len() as u64);
+                        let state = Arc::new(admin::AdminState {
+                            config_path: config_path.clone(),
+                            metrics: Arc::clone(&metrics),
+                            replay_size_fn,
+                            start_time: std::time::Instant::now(),
+                            token,
+                            service_name: config.admin_service.clone(),
+                        });
+                        tokio::spawn(async move { admin::serve_admin(listener, state).await });
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "admin access file write failed; admin UI disabled")
+                    }
+                }
             }
             Err(e) => warn!(addr = %bind, error = %e, "admin UI bind failed; admin UI disabled"),
         }
@@ -2734,7 +2751,7 @@ async fn main() {
     let anonymize_target_logs = config.anonymize_target_logs;
     // Initialise client-IP log anonymization (default on) before any session
     // logging happens.
-    init_client_log_anonymization(config.anonymize_client_logs);
+    init_client_log_anonymization(config.anonymize_client_logs).unwrap_or_else(|e| fatal(&e));
     MUX_ENABLED.store(config.stream_mux_enabled, Ordering::Relaxed);
     // Relay mesh: parse the configured peer bridges into (a) the OUTBOUND dial
     // token map (extend-to capability) and (b) the INBOUND authorized-peer key
@@ -5077,9 +5094,11 @@ async fn run_authenticated_session(
                 "circuit-relay session; SessionTask (extend-capable{})",
                 if inbound_is_relay { " + relay-leg" } else { "" }
             );
-            let mut t = SessionTask::new(session, Arc::new(executor), SessionTaskConfig::default())
-                .with_exit_events(exit_events_rx)
-                .with_next_hop_events(next_hop_rx);
+            let mut t =
+                SessionTask::try_new(session, Arc::new(executor), SessionTaskConfig::default())
+                    .map_err(|_| "bridge circuit entropy unavailable".to_string())?
+                    .with_exit_events(exit_events_rx)
+                    .with_next_hop_events(next_hop_rx);
             if let Some(r) = rendezvous_router() {
                 t = t.with_rendezvous(r);
             }
@@ -5099,8 +5118,10 @@ async fn run_authenticated_session(
                 "circuit-relay session; SessionTask ({})",
                 if inbound_is_relay { "exit hop (relay leg)" } else { "exit-only" }
             );
-            let mut t = SessionTask::new(session, Arc::new(executor), SessionTaskConfig::default())
-                .with_exit_events(exit_events_rx);
+            let mut t =
+                SessionTask::try_new(session, Arc::new(executor), SessionTaskConfig::default())
+                    .map_err(|_| "bridge circuit entropy unavailable".to_string())?
+                    .with_exit_events(exit_events_rx);
             if let Some(r) = rendezvous_router() {
                 t = t.with_rendezvous(r);
             }
@@ -5413,13 +5434,20 @@ impl CohortState {
         let jitter = if self.reveal_jitter == 0 {
             0u8
         } else {
-            let mut b = [0u8; 1];
-            // OS CSPRNG failure would be catastrophic; under panic
-            // we fall back to "no jitter this request" so the
-            // bridge stays up. The jitter is defense-in-depth, not
-            // a cryptographic control.
-            let j = getrandom::fill(&mut b).map(|_| b[0]).unwrap_or(0);
-            j % (self.reveal_jitter + 1)
+            // Rejection sampling avoids both modulo bias and u8 overflow
+            // when the configured range includes all 256 byte values.
+            let bound = u16::from(self.reveal_jitter) + 1;
+            let accept_below = (256 / bound) * bound;
+            loop {
+                let mut b = [0u8; 1];
+                if let Err(e) = getrandom::fill(&mut b) {
+                    warn!(error = %e, "cohort reveal jitter RNG failed; withholding response");
+                    return (Vec::new(), COHORT_STATUS_EXHAUSTED);
+                }
+                if u16::from(b[0]) < accept_below {
+                    break (u16::from(b[0]) % bound) as u8;
+                }
+            }
         };
         let requested = max_n.saturating_sub(jitter).max(1);
         let remaining_cap = (self.reveal_cap as usize).saturating_sub(entry.seen.len());
@@ -6577,6 +6605,18 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn client_log_labels_are_stable_within_run_and_keyed_across_runs() {
+        let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let other: std::net::IpAddr = "203.0.113.8".parse().unwrap();
+        let a = client_log_label(&[7u8; 32], ip);
+        assert_eq!(a, client_log_label(&[7u8; 32], ip));
+        assert_ne!(a, client_log_label(&[8u8; 32], ip));
+        assert_ne!(a, client_log_label(&[7u8; 32], other));
+        assert_eq!(a.len(), "client-".len() + 32);
+        assert!(!a.contains("203.0.113.7"));
+    }
+
     /// The distance check compares HOSTS, so a port difference is not a mismatch
     /// but a host difference always is.
     #[test]
@@ -6777,7 +6817,7 @@ mod tests {
             client_sock,
             PROBE.to_vec(),
             shadow_addr.to_string(),
-            Duration::from_secs(5),
+            Duration::ZERO, // Zero disables the post-connect duration cap.
             Arc::clone(&metrics),
         );
 

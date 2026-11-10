@@ -6,8 +6,10 @@ generating traffic that looks like them, and what that choice costs.
 
 ## The problem a carrier does not solve
 
-Reality, Shadowsocks-2022 and Hysteria2 all make the *connection* look legitimate. None of
-them changes what the flow looks like over time. A proxy shuttling a user's browsing has a
+Reality, Shadowsocks-2022 and Hysteria2 address connection-level blocking in
+different ways; none alone makes the whole connection indistinguishable from a
+genuine application. None of them changes what the flow looks like over time.
+A proxy shuttling a user's browsing has a
 characteristic shape - request-sized bursts up, page-sized bursts down, gaps where the
 user reads - and that shape survives every layer of encryption, because it is made of
 packet sizes, directions and timings, not content.
@@ -15,28 +17,22 @@ packet sizes, directions and timings, not content.
 Flow classifiers key on exactly that. So a perfect TLS disguise still leaves a flow that a
 traffic-analysis model can pick out of a population of real ones.
 
-## Why generating a fake shape does not work
+## Why the current build replays captures
 
-The obvious fix is to synthesise a plausible envelope: model video streaming, emit packets
-matching the model. This does not reach the indistinguishability floor, and the reason is
-structural rather than a matter of better modelling.
+The generative cover modes tested here were easy to distinguish from the measured
+real traffic, even with a first-order detector. That result rejects *those modes*;
+it is not a proof that every generative model is detectable or that real traffic
+has a particular entropy-rate law. A generator that misses application, user,
+server, and network dependencies can add unnatural randomness or suppress
+natural variation. Both differences are signals.
 
-A detector distinguishing generated traffic from real traffic is exploiting **redundancy**
-- the gap between the entropy rate your generator actually has and the entropy rate of the
-real process. Real traffic's conditional entropy does not plateau: conditioning on more
-history keeps revealing structure, because the process is driven by an application, a
-user, a network and a server that are all themselves structured. A generator has a fixed
-order. Beyond that order it injects independent randomness the real process would not
-have, and *that excess is itself the signal*. Raise the model order and you push the
-detectable structure further out, but you never remove it, because you are approximating a
-process whose entropy rate keeps descending.
-
-Measured, a first-order detector separates generated cover from real cover essentially
-perfectly. The practical corollary is the one that matters:
-
-> Any entropy Proteus injects that the real flow would not have is a fingerprint.
-> Only a schedule with **zero excess entropy** - a real capture, replayed - reaches the
-> floor.
+Replay avoids inventing the sizes and timing of **one captured window**, but
+does not reach an indistinguishability floor. Reusing a finite library lowers
+cross-session diversity; recorder and protocol mismatches can distinguish even
+a single replay. The relevant comparison is a tunnel against independent,
+matched real traffic, including long sessions and repeated users. See
+[Proteus 2.0](proteus-2.0.md) and the
+[cover-native proposal](cover-native-proposal.md) for the remaining gaps.
 
 This is why `proteus = true` resolves to `replay` and not to one of the generative classes.
 The `video` and `browse` generative modes remain accepted for compatibility and are the
@@ -55,8 +51,9 @@ simulated; these are the sizes and gaps a real session actually produced.
 
 **3. A session picks a chain from it.** Both endpoints derive the same per-session seed
 from their handshake, then use it to select and shuffle several traces into one schedule.
-Several, not one, so a long session never loops a single clip - a repeating envelope is a
-periodicity tell. Because the seed is shared, both ends select the *same* chain.
+Several, not one, to reduce immediate repetition within a session. A finite library
+can still repeat clips and chain boundaries across sessions. Because the seed is
+shared, both ends select the *same* chain.
 
 **4. The pacer emits one record per schedule token**, at the captured time, padded to the
 captured size, filling with the user's data when there is any and with padding when there
@@ -76,9 +73,9 @@ tables below.
 
 A record leaves on every schedule tick whether or not the application has data.
 Idle time is filled with padding; busy time replaces that padding with the user's
-bytes. **The wire is identical either way** - which is exactly what makes an idle
-tunnel and a busy one indistinguishable. So an idle session costs precisely what
-a saturated one costs.
+bytes. The scheduled record sizes and times are independent of queue contents;
+full idle/busy wire indistinguishability has not been established. So an idle
+session costs precisely what a saturated one costs.
 
 Ramping the envelope with demand is not a missed optimisation, it IS the signal
 this exists to destroy. That was measured rather than assumed: an experiment that
@@ -468,9 +465,10 @@ UNCAPPED and is deliberately not honoured as such: it measured no less detectabl
 and it was the only setting that produced a tunnel which would not come up at all - a video
 flow opens with a quiet stretch that a faithfully replayed handshake cannot crawl past.
 
-Every trace in the library remains a real capture replayed verbatim; a budget only
-decides which real flow gets worn. That distinction is the whole argument above: selection
-among real flows adds no entropy, so it costs nothing in detectability.
+Every trace in the library remains a real capture, but a budget changes the
+distribution of selected flows. Even if each capture is genuine, selecting a
+narrow subset or repeating a finite pool can be detectable across sessions;
+the real-user comparison must include this selection policy.
 
 The honest caveat: an adversary who knew you only ever wear sub-2 GB/day flows learns
 something from that fact. It is weak - plenty of real users are on metered links and never
@@ -734,9 +732,9 @@ unchanged size histogram).
 
 ### A per-window number is the wrong threat model
 
-0.57 sounds like noise, and for an observer who sees ONE window it is. That is not the
-threat. A censor watching a host sees every window that host produces and can average them,
-and for independent samples the separation grows as `sqrt(N)`:
+0.57 is a weak per-window separator, but a censor can pool a host's windows.
+Under an illustrative equal-variance Gaussian model with independent windows,
+the standardized separation grows as `sqrt(N)`:
 
 ```
 per-window AUC 0.57  ->  d' ~ 0.25
@@ -744,10 +742,11 @@ N = 25   ->  d' ~ 1.25  ->  AUC ~ 0.81
 N = 100  ->  d' ~ 2.49  ->  AUC ~ 0.96
 ```
 
-A session produces hundreds of windows. So a residual that reads as noise per window can be
-close to decisive per session, and quoting only the per-window figure understates the
-exposure. `flow_classifier::measure_aggregated` measures the real curve instead of trusting
-that arithmetic, and `examples/flow_auc` prints it after every verdict.
+A session produces hundreds of windows, but the displayed extrapolation is not
+a prediction for Mirage: windows share cover state, path, and session history.
+Repetition or another cross-window artifact can also make a joint detector much
+stronger. `flow_classifier::measure_aggregated` measures a curve for the recorded
+sample; independent account histories are needed for an operational estimate.
 
 Three things make the measurement honest rather than alarming:
 
@@ -776,9 +775,10 @@ no user traffic at all it grows to +0.194, so the harness had residual structure
 two window sets that pooling turns into a confident false positive. See "Matched pairs"
 below for the cause and the fix.
 
-`sqrt(N)` is an upper bound in any case: windows from one session share a cover trace, a
-host and a network condition, so they are correlated and the true gain is smaller. The
-measured curve is the thing to trust; the arithmetic is only a reason to go and look.
+`sqrt(N)` is neither a general upper nor lower bound. Correlation can reduce
+effective sample size; exact replay or a deterministic transition can make
+multi-session detection much stronger. Test the joint distribution at 1, 10,
+and 100 sessions rather than extrapolating from window AUC.
 
 ### The floor is per-FEATURE, and treating it as one number manufactures leaks
 
@@ -915,8 +915,11 @@ be bought for a tenth of what the cheap fix already delivered. Not built, delibe
 
 > ### Cover class is now known to matter more than anything in this document
 >
-> Four cover classes were captured from a real browser on the wire and compared on
-> the same day by the same method. The result reorders the priorities below:
+> **Historical, superseded result.** The capture tap omitted long-lived
+> connections, and a re-take changed the HLS worst gap from 877 ms to roughly
+> 10 s. The table and ranking below must not be used for cover selection; see
+> [cover-scheduling.md](cover-scheduling.md) and the service-curve correction.
+> Four classes were originally compared on the same day by the same method:
 >
 > | | browse page load | buffered video | live audio | **segmented HLS** |
 > |---|---|---|---|---|
@@ -930,21 +933,20 @@ be bought for a tenth of what the cheap fix already delivered. Not built, delibe
 > cycle is structural — a page load is mostly silence, and no scheduler recovers
 > silence.
 >
-> **Record-size variance is not the capacity statistic**, by three independent
-> routes: the engine preserves the size marginal by construction; browse has the
-> *highest* CV and the lowest capacity; video has CV 0.06 and 1200× the
-> throughput. Any analysis ranking cover classes by size dispersion ranks them
-> backwards. The statistic that survives is the **high-quantile inter-record gap
-> times the offered rate** — see [cover-scheduling.md](cover-scheduling.md).
+> **Corrected interpretation.** Size variance and gap quantiles separately
+> discard the ordering of usable service. Mean usable rate must exceed offered
+> rate, and backlog depends on cumulative service deficits over windows. The
+> numbers here came from the defective capture and cannot rank cover classes.
 >
-> ### The TLS fingerprint is known-wrong and it precedes all of this
+> ### The TLS fingerprint was wrong during these measurements
 >
 > A capture of Firefox 153 shows **17 extensions and no GREASE**. The
-> `firefox-desktop` template emits **12 with GREASE in the first and last slots**.
-> A ClientHello matching nothing in the population is detected on the first packet,
-> before any envelope is observed — which makes every number in this document
-> academic until it is fixed. It is not yet fixed; re-derivation needs captures
-> across multiple browser builds.
+> earlier `firefox-desktop` template emitted **12 with GREASE in the first and
+> last slots**. The canonical template has since been revised, and its pinned
+> JA3 string matches a captured Firefox 153 TLS 1.3 ClientHello. That test alone
+> does not establish that the emitted production ClientHello matches the capture,
+> that other Firefox builds match, or that these earlier measurements transfer.
+> A fresh capture of Mirage's actual emitted packets is needed for those claims.
 >
 > ### Results predating the host-aware cover library do not transfer
 >

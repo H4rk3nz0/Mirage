@@ -380,14 +380,16 @@ async fn session_driver(
         if !delivered.is_empty() && dr_write.write_all(&delivered).await.is_err() {
             break;
         }
-        if let Some(msg) = encode_response(
-            inb.dns_id,
-            &inb.qname,
-            &resp.encode(),
-            inb.recursion_desired,
-            inb.had_opt,
-        ) {
-            let _ = socket.send_to(&msg, inb.from).await;
+        if let Some(payload) = resp.encode() {
+            if let Some(msg) = encode_response(
+                inb.dns_id,
+                &inb.qname,
+                &payload,
+                inb.recursion_desired,
+                inb.had_opt,
+            ) {
+                let _ = socket.send_to(&msg, inb.from).await;
+            }
         }
     }
     // The session was reclaimed (its sender dropped) or the peer FIN'd: stop the

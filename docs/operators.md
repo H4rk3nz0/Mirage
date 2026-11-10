@@ -7,7 +7,7 @@ from a bare VPS to a bridge people can actually use, and covers the choices that
 - [2. Run the wizard](#2-run-the-wizard)
 - [3. Install it as a service](#3-install-it-as-a-service)
 - [4. Hand out access](#4-hand-out-access)
-- [5. Let clients find you automatically](#5-let-clients-find-you-automatically)
+- [5. Publish bridge updates](#5-publish-bridge-updates)
 - [6. Multi-hop](#6-multi-hop)
 - [7. Operating it](#7-operating-it)
 
@@ -128,10 +128,11 @@ compromise - and exactly what you don't want by accident.
 
 ---
 
-## 5. Let clients find you automatically
+## 5. Publish bridge updates
 
-Invites are point-to-point. **Discovery channels** let a client with no invite find bridges
-by looking in a rendezvous location that rotates every epoch.
+**Discovery channels** let clients with an invite find updated bridge records
+at rendezvous locations that rotate every epoch. Clients still need the
+invite's salt and credentials.
 
 **An announcement expires every epoch (1 hour).** Publishing once by hand gives you a
 deployment that stops being discoverable within the hour, which is the easiest way to get
@@ -262,23 +263,30 @@ config, and restart the service from a browser:
 mirage-bridge bridge.json --admin-ui        # serves on http://127.0.0.1:3825
 ```
 
-Pass an address to override the default: `--admin-ui 127.0.0.1:9000`. On start-up the bridge prints
-a one-time URL with an access token in the fragment, e.g.
+Pass an address to override the default: `--admin-ui 127.0.0.1:9000`. At
+startup the bridge writes the access URL to a secret file and logs its path.
+The setup-generated systemd unit uses its writable state directory; a manual
+run without `STATE_DIRECTORY` writes beside the config. For example:
 
-```
-Mirage bridge admin UI:  http://127.0.0.1:3825/#t=1a2b3c...
+```sh
+sudo cat /var/lib/mirage/bridge.json.admin-url   # setup-generated systemd unit
+cat bridge.json.admin-url                        # manual run with bridge.json
 ```
 
-Open that URL (the token never leaves your machine - it isn't sent to the server or logged). The UI:
+Open the URL in the file. The fragment is not part of the initial HTTP request;
+the page sends the token in an `Authorization` header for API calls. The file
+is mode `0600` on Unix and inherits the directory ACL on Windows. Protect it
+like the bridge config. The UI:
 
 - shows the live dashboard (sessions, per-transport counts, Reality probes, rate-limit drops);
 - lets you edit every config field, grouped by section, and **Save** (written atomically, `0600`);
 - **Restart**s the `mirage-bridge` systemd unit to apply changes (set the unit name with
   `admin_service` if yours differs).
 
-It is **loopback-only and token-gated by design** - it can read and write your bridge config,
-including key material. Keep it on `127.0.0.1` (SSH-forward a port to reach it remotely); never bind
-it to a public interface. Secret fields (`*_sk_hex`, PSKs, salts, the relay token) are masked in the
+It defaults to loopback and requires the token; it can read and write your bridge config,
+including key material. Keep it on `127.0.0.1` (SSH-forward a port to reach it remotely). An
+explicit public bind is allowed but the server still requires a loopback `Host` header.
+Secret fields (`*_sk_hex`, PSKs, salts, the relay token) are masked in the
 browser and preserved on save - the UI can neither display nor overwrite a secret you don't retype.
 
 You can also enable it from the config file instead of the flag: `"admin_bind": "127.0.0.1:3825"`.

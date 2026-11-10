@@ -774,19 +774,26 @@ async fn writer_task<W>(inner: Arc<ConnInner>, mut wr: W)
 where
     W: AsyncWrite + Unpin,
 {
-    loop {
+    'writer: loop {
         inner.writer_wake.notified().await;
-        if inner.is_closed() {
-            break;
-        }
-        let out_bytes = drain_pass(&inner);
-        if !out_bytes.is_empty() {
-            if wr.write_all(&out_bytes).await.is_err() {
+        loop {
+            if inner.is_closed() {
+                break 'writer;
+            }
+            let out_bytes = drain_pass(&inner);
+            if out_bytes.is_empty() {
                 break;
+            }
+            if wr.write_all(&out_bytes).await.is_err() {
+                break 'writer;
             }
             if wr.flush().await.is_err() {
-                break;
+                break 'writer;
             }
+            // Let newly woken app streams enqueue before choosing the next
+            // bounded batch; otherwise a ready carrier can be filled with a
+            // bulk tail before an interactive task gets scheduled.
+            tokio::task::yield_now().await;
         }
     }
     let _ = wr.shutdown().await;
@@ -822,10 +829,15 @@ fn drain_pass(inner: &Arc<ConnInner>) -> Vec<u8> {
         }
         // Half-close once the staging buffer is fully flushed.
         if ob.ending && ob.buf.is_empty() && !ob.ended_sent {
-            // end_local errors only if the stream is already gone; either way
-            // the local write side is done.
-            let _ = st.end_local(sh.id);
-            ob.ended_sent = true;
+            // A partially drained outbound queue can be full. Keep EndLocal
+            // pending in that case, so the next batch retries it after freeing
+            // a slot; treating QueueFull as sent would silently lose the FIN.
+            if !matches!(
+                st.end_local(sh.id),
+                Err(MuxStateError::OutboundQueueFull(_))
+            ) {
+                ob.ended_sent = true;
+            }
         }
         // Wake a writer blocked on a full staging buffer.
         if ob.buf.len() < sh.window as usize {
@@ -846,7 +858,9 @@ fn drain_pass(inner: &Arc<ConnInner>) -> Vec<u8> {
         let mut map = inner.streams.lock().expect("streams lock");
         map.retain(|id, _| st.stream_state(*id).is_some());
     }
-    let frames = st.pending_outbound();
+    // Leave uncommitted frames in the state machine. A stream arriving while
+    // this batch is in the carrier can participate in the next DRR ordering.
+    let frames = st.pending_outbound_bounded(crate::frame::MAX_MUX_FRAME_LEN);
     drop(st);
     let mut bytes = Vec::new();
     for f in frames {
@@ -949,6 +963,145 @@ mod tests {
         let mut resp = Vec::new();
         s.read_to_end(&mut resp).await.unwrap();
         assert_eq!(resp, b"response");
+    }
+
+    #[tokio::test]
+    async fn half_close_retries_when_bounded_outbound_queue_is_full() {
+        let policy = MuxPolicy {
+            max_pending_outbound: 1,
+            ..MuxPolicy::default()
+        };
+        let (ca, _aa, _cb, mut ab) = pair(policy);
+        let peer = tokio::spawn(async move {
+            let inc = ab.accept().await.expect("incoming stream");
+            let mut stream = inc.accept();
+            let mut got = Vec::new();
+            stream.read_to_end(&mut got).await.expect("peer EOF");
+            got
+        });
+        let mut stream = ca.open(dom("queue.example", 80)).await.expect("open");
+        stream.write_all(b"payload").await.expect("write");
+        stream.shutdown().await.expect("half-close");
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), peer)
+            .await
+            .expect("EndLocal was not delivered")
+            .expect("peer task");
+        assert_eq!(got, b"payload");
+    }
+
+    #[tokio::test]
+    async fn writer_reorders_late_interactive_data_before_bulk_tail() {
+        struct Gate {
+            first_attempt: bool,
+            released: bool,
+            waker: Option<Waker>,
+            writes: Vec<Vec<u8>>,
+        }
+        struct GatedWriter(Arc<Mutex<Gate>>);
+        impl AsyncWrite for GatedWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let mut gate = self.0.lock().unwrap();
+                if !gate.released {
+                    gate.first_attempt = true;
+                    gate.waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+                gate.writes.push(buf.to_vec());
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let policy = MuxPolicy::default();
+        let mut state = MuxState::new(StreamRole::Initiator, policy.clone());
+        let bulk = state.open_local(dom("bulk.example", 80)).unwrap().raw();
+        let interactive = state
+            .open_local(dom("interactive.example", 80))
+            .unwrap()
+            .raw();
+        // The Begin frames have already gone on the wire in this fixture.
+        state.pending_outbound();
+        for sid in [bulk, interactive] {
+            state
+                .recv(MuxFrame::new(sid, crate::frame::MuxCmd::BeginOk, vec![]).unwrap())
+                .unwrap();
+        }
+        let body = vec![0x5a; crate::frame::MAX_MUX_FRAME_BODY];
+        for _ in 0..4 {
+            assert_eq!(state.send_data(bulk, &body).unwrap(), body.len());
+        }
+        let inner = Arc::new(ConnInner {
+            state: Mutex::new(state),
+            streams: Mutex::new(HashMap::new()),
+            open_waiters: Mutex::new(HashMap::new()),
+            writer_wake: Notify::new(),
+            closed: AtomicBool::new(false),
+            policy,
+            reader_abort: Mutex::new(None),
+        });
+        let gate = Arc::new(Mutex::new(Gate {
+            first_attempt: false,
+            released: false,
+            waker: None,
+            writes: Vec::new(),
+        }));
+        let writer = tokio::spawn(writer_task(
+            Arc::clone(&inner),
+            GatedWriter(Arc::clone(&gate)),
+        ));
+        inner.writer_wake.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !gate.lock().unwrap().first_attempt {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bulk write did not begin");
+        assert_eq!(
+            inner.state.lock().unwrap().pending_outbound_len(),
+            3,
+            "only one bulk frame should be committed to the writer"
+        );
+
+        // The interactive frame arrives after the first bulk batch has already
+        // been chosen. It must be eligible for the very next writer batch.
+        inner
+            .state
+            .lock()
+            .unwrap()
+            .send_data(interactive, b"ping")
+            .unwrap();
+        let wake = {
+            let mut g = gate.lock().unwrap();
+            g.released = true;
+            g.waker.take()
+        };
+        wake.expect("writer parked on gate").wake();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while gate.lock().unwrap().writes.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second writer batch did not arrive");
+
+        let gate = gate.lock().unwrap();
+        let writes = &gate.writes;
+        assert_eq!(writes[0].len(), crate::frame::MAX_MUX_FRAME_LEN);
+        let (first, _) = MuxFrame::decode_one(&writes[0]).unwrap();
+        let (second, _) = MuxFrame::decode_one(&writes[1]).unwrap();
+        assert_eq!(first.stream_id, bulk);
+        assert_eq!(second.stream_id, interactive);
+        writer.abort();
     }
 
     #[tokio::test]

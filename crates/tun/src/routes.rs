@@ -497,7 +497,7 @@ fn linux_del_route(cidr: &str) -> Vec<String> {
 }
 
 /// `ip -6 route del <cidr>` (IPv6 teardown).
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn linux_del_route6(cidr: &str) -> Vec<String> {
     vec![
         "ip".into(),

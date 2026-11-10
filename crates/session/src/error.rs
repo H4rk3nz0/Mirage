@@ -5,6 +5,10 @@ use thiserror::Error;
 /// Error produced by the session layer during handshake or framing.
 #[derive(Debug, Error)]
 pub enum SessionError {
+    /// Operating-system entropy was unavailable while preparing the handshake.
+    #[error("handshake entropy unavailable")]
+    Entropy,
+
     /// Wire format violation: wrong length, bad magic, wrong message type.
     #[error("wire: {0}")]
     Wire(&'static str),

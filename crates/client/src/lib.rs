@@ -2175,8 +2175,12 @@ async fn run_nostr_discovery(
         // Wake on whichever comes first: the periodic tick, an emergency
         // notification from the dial path (all entries failed simultaneously),
         // or an operator-requested re-discover from the management API.
+        let Ok(delay) = jitter_duration(jitter_lo, jitter_hi) else {
+            error!("nostr discovery stopped: OS CSPRNG unavailable");
+            return;
+        };
         tokio::select! {
-            () = tokio::time::sleep(jitter_duration(jitter_lo, jitter_hi)) => {},
+            () = tokio::time::sleep(delay) => {},
             _ = trigger.notified() => {
                 debug!("nostr discovery: immediate re-fetch (mass-failure or operator request)");
             }
@@ -3708,43 +3712,21 @@ pub async fn cli_main() {
     run_daemon(config, management_bind).await;
 }
 
-/// Fraction of the cover's sustainable rate we let applications drive.
+/// Heuristic fraction of the measured raw upstream cover rate admitted to apps.
 ///
-/// Queue delay in an M/M/1 approximation is `ρ/(μ(1−ρ))`. At ρ=0.85 that is
-/// ~5.7/μ; at ρ=0.95 it is ~19/μ and rising steeply. The last 15% of nominal
-/// capacity costs roughly a 3x latency increase and cannot be sustained anyway,
-/// because the service rate is fixed by the envelope and does not stretch.
+/// The 15% headroom absorbs some framing and service variation. It is not an
+/// M/M/1 delay bound: replay cover is bursty, and the measured rate includes
+/// bytes unavailable to the inner stream. Admission needs a directional
+/// service-curve analysis to bound backlog and tail delay.
 const RHO_MAX: f64 = 0.85;
 
-/// Gap quantile the local buffer is sized to absorb.
-///
-/// p99 rather than max: the maximum is a single observation and would size every
-/// buffer for an outlier.
-///
-/// # KNOWN WRONG for bimodal cover classes
-///
-/// A fixed quantile encodes an assumption that the gap distribution is unimodal.
-/// Segmented video is not: intra-burst gaps sit near zero, inter-segment gaps near
-/// the segment duration, and the long ones are only 0.08-0.11% of the sample - so
-/// p99 lands inside the fast mode and cannot see them at all.
-///
-/// Measured, two independent players at library defaults:
-///
-/// | player | p99 | p99.9 | max | p99 underestimates by |
-/// |---|---|---|---|---|
-/// | hls.js | 1.3 ms | 141.6 ms | 10007 ms | **7507x** |
-/// | Shaka | 2.8 ms | 9654 ms | 10213 ms | **3657x** |
-///
-/// A buffer sized from this for segmented video is provisioned for a 1.3 ms stall
-/// against a real 10 s one. This is the same defect as the fixed 0.5 s constant it
-/// replaced - one summary that cannot span the classes it is applied to - and it
-/// survived because every class measured until then happened to be unimodal.
-///
-/// **Not yet fixed.** The statistic needs to be mode-aware (the upper mode's
-/// location, or the largest gap) or per-class. Until then, treat any buffer sizing
-/// for a segmented-video profile as unvalidated. Browse and live-audio profiles are
-/// unimodal and this quantile is sound for them.
-const GAP_QUANTILE: f64 = 0.99;
+/// Use the largest observed upstream gap when sizing the local receive buffer.
+/// A p99 gap misses the rare but periodic 10-second pauses between video
+/// segments because more than 99% of that trace's gaps occur inside bursts.
+/// This is an interim conservative statistic: one outlier can oversize the
+/// buffer, but [`local_recv_buffer_bytes`] caps it at 256 KiB. A future
+/// service-deficit calculation can use the full schedule rather than one gap.
+const GAP_QUANTILE: f64 = 1.0;
 
 /// Fallback gap when the profile cannot supply one, in seconds.
 ///
@@ -3753,81 +3735,45 @@ const GAP_QUANTILE: f64 = 0.99;
 /// constant here was the wrong shape to begin with.
 const FALLBACK_GAP_SECS: f64 = 0.5;
 
-/// Below this per-session rate a tunnelled session is not worth having: page
-/// loads time out and the user retries, which is the loop admission control
-/// exists to break. 8 kB/s is roughly "a small page in a few seconds".
+/// Assumed minimum useful rate per active session for coarse admission control.
 const MIN_USEFUL_SESSION_BPS: f64 = 8_000.0;
 
-/// How many concurrent local sessions this cover profile can actually serve.
+/// Coarse limit on concurrent local sessions for the configured cover.
 ///
-/// `None` when not pacing - then the link is the limit and the kernel's own
-/// backpressure is the right mechanism.
+/// `None` when pacing is disabled.
 ///
-/// This is a COARSE proxy for ρ. The exact quantity is `λ/μ`, and λ is not
-/// directly observable here; what is observable is how many sessions are live and
-/// what rate each would need to be useful. Dividing `ρ_max·μ` by a minimum useful
-/// per-session rate gives an admission cap that is conservative in the right
-/// direction - it refuses before the queue diverges rather than after.
-///
-/// A finer version would feed back on actual queue depth (`pending_outbound_len`
-/// against the policy cap). That is worth doing once there is a measurement to
-/// tune it against; this is the version that closes the retry-storm loop today.
+/// Uses the raw scheduled upstream byte rate, a 15% margin, and an assumed
+/// per-session rate. It does not account for framing, dropped slots, or bursty
+/// service, so it is not a guarantee of stable queues or useful throughput.
 fn admission_cap() -> Option<usize> {
     let mu = mirage_transport_reality::cover_upstream_bps()?;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let cap = (mu * RHO_MAX / MIN_USEFUL_SESSION_BPS) as usize;
-    // Always admit at least one: refusing every session is worse than a slow one,
-    // and a profile too sparse for even one session is a configuration problem
-    // that the starvation guard already reports.
+    // Permit one session even when this heuristic computes a lower cap.
     Some(cap.max(1))
 }
 
 /// Receive-buffer size, in BYTES, for a cover of rate `mu` and gap `gap_secs`.
 ///
-/// The buffer must hold what accumulates while the cover is silent. During a gap
-/// the tunnel cannot send but the application keeps pushing, so bytes pile up at
-/// the offered rate: `gap x rate`. That product - not a time constant - is the
-/// quantity, and it is why the same gap means very different things at different
-/// rates. A 900 ms gap absorbs 11 kB at 100 kbps offered and 340 kB at 3 Mbps.
+/// During a gap the tunnel cannot send but the application may keep pushing, so
+/// pending bytes grow roughly as `gap x offered rate` until TCP backpressure
+/// reaches the application. The receive buffer is a local throttle, not a
+/// promise to hold every byte that might arrive during the gap. The 256 KiB cap
+/// deliberately applies backpressure sooner for high-rate or long-gap covers.
 ///
-/// Both inputs are MEASURED from the profile (`cover_upstream_bps`,
-/// `cover_gap_secs`) rather than assumed. The previous version used a fixed
-/// 0.5 s, which measurement showed was generous for browse cover (worst gap
-/// 122 ms) and hopeless for buffered video (worst gap 15 s) - one constant
-/// spanning a 120x range of real gap structures.
-///
-/// Note what this does NOT prove: that the limit actually binds under load. That
-/// needs the e2e harness offering 2*mu and observing bounded queue depth with no
-/// egress failure - the regression test for the collapse mode itself, rather than
-/// for the mechanism.
+/// Both inputs come from the configured profile. This is a buffer heuristic;
+/// a service-deficit calculation is needed to estimate queue depth and delay.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn local_recv_buffer_bytes(mu: f64, gap_secs: f64) -> usize {
     let want = (mu * RHO_MAX * gap_secs.max(0.0)).max(0.0) as usize;
-    // Floor so a handshake still fits in one window; ceiling so a fat video
-    // profile does not re-create the unbounded queue this exists to prevent.
+    // Floor so a handshake still fits in one window; ceiling so an outlier in
+    // the maximum-gap statistic cannot re-create the unbounded queue.
     want.clamp(8 * 1024, 256 * 1024)
 }
 
-/// Bound how fast a local application can push into a paced tunnel.
-///
-/// WHY THIS EXISTS
-///
-/// Under Proteus the service rate `μ` is fixed by the cover envelope, not by the
-/// link. An application that offers `λ > μ` drives `ρ = λ/μ` past 1, queue delay
-/// diverges, something times out, the user retries - which raises `λ` again. That
-/// positive feedback is the "egress DOWN under load, never idle" collapse: a
-/// queueing failure that looks like a transport fault.
-///
-/// Shrinking the LOCAL socket's receive buffer makes the application's own
-/// congestion control do the work: it fills the window, stops, and never learns
-/// there was a cliff. No new protocol, no explicit signalling.
-///
-/// WHERE THE LEVER GOES, and why it must not go on the carrier.
-///
-/// This adjusts the SOCKS-side socket only. TCP window sizes are in the CLEAR -
-/// applying the same trick to the carrier's socket would publish an unusual
-/// window to anyone watching, which is a fingerprint. The tunnelled flow's
-/// windows are inside the AEAD and invisible; the carrier's are not.
+/// Apply local TCP backpressure before a paced tunnel accumulates a large queue.
+/// Only the SOCKS-side socket is adjusted; the carrier's TCP window stays under
+/// its normal policy because that window is visible on the wire.
 fn clamp_local_recv_buffer(local: &TcpStream) {
     let Some(mu) = mirage_transport_reality::cover_upstream_bps() else {
         return; // not pacing: the link is the limit, leave the socket alone
@@ -4381,11 +4327,12 @@ async fn run_daemon(config: ClientConfig, management_bind: Option<String>) {
         let bg_pool = Arc::clone(&pool);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(jitter_duration(
-                    Duration::from_secs(45),
-                    Duration::from_secs(90),
-                ))
-                .await;
+                let Ok(delay) = jitter_duration(Duration::from_secs(45), Duration::from_secs(90))
+                else {
+                    error!("bridge probing stopped: OS CSPRNG unavailable");
+                    return;
+                };
+                tokio::time::sleep(delay).await;
                 probe_all_entries(&bg_pool, Duration::from_secs(5), Duration::from_secs(8)).await;
             }
         });
@@ -4405,11 +4352,12 @@ async fn run_daemon(config: ClientConfig, management_bind: Option<String>) {
         let bg_pool = Arc::clone(&pool);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(jitter_duration(
-                    Duration::from_secs(90),
-                    Duration::from_secs(180),
-                ))
-                .await;
+                let Ok(delay) = jitter_duration(Duration::from_secs(90), Duration::from_secs(180))
+                else {
+                    error!("token refresh stopped: OS CSPRNG unavailable");
+                    return;
+                };
+                tokio::time::sleep(delay).await;
                 refresh_low_entries(&bg_pool, maintenance_handshake_timeout(&bg_pool)).await;
                 // Pull the bridge's cover library once a tunnel works, so this
                 // client stops making its own un-tunnelled requests to sites
@@ -4749,14 +4697,13 @@ async fn get_or_create_carrier(
 /// a flaky-network app's retries rather than an automated multi-protocol sweep.
 /// Only incurred on failover (the happy path dials once), so it costs latency
 /// exactly when we most want to avoid looking like a probe.
-async fn failover_backoff(attempt: usize) {
+async fn failover_backoff(attempt: usize) -> Result<(), String> {
     let mut b = [0u8; 2];
-    let jitter = match getrandom::fill(&mut b) {
-        Ok(()) => (u16::from_le_bytes(b) as u64) % 500,
-        Err(_) => 0,
-    };
+    getrandom::fill(&mut b).map_err(|_| "failover entropy unavailable".to_string())?;
+    let jitter = (u16::from_le_bytes(b) as u64) % 500;
     let base = 150 + 120 * (attempt.min(6) as u64);
     tokio::time::sleep(Duration::from_millis(base + jitter)).await;
+    Ok(())
 }
 
 /// Extract the host part of a `host:port` (or bare host / IP) dial string.
@@ -4952,7 +4899,7 @@ async fn tunnel_flow(pool: Arc<EntryPool>, flow: mirage_tun::TcpFlow) -> Result<
     let mut last_err = String::from("no healthy bridge entries");
     for attempt in 0..n {
         if attempt > 0 {
-            failover_backoff(attempt).await;
+            failover_backoff(attempt).await?;
         }
         let Some(idx) = pool.pick_entry().await else {
             break;
@@ -5084,7 +5031,7 @@ async fn tunnel_one_mux(
         // Spread failover attempts in time so a censor can't watch a sub-second
         // sweep across diverse bearer classes to the same dest (critic-A).
         if attempt > 0 {
-            failover_backoff(attempt).await;
+            failover_backoff(attempt).await?;
         }
         let idx = match pool.pick_entry().await {
             Some(i) => i,
@@ -5283,7 +5230,7 @@ async fn tunnel_one(
     for attempt in 0..n {
         // Spread failover attempts (critic-A: no sub-second diverse-bearer sweep).
         if attempt > 0 {
-            failover_backoff(attempt).await;
+            failover_backoff(attempt).await?;
         }
         let idx = match pool.pick_entry().await {
             Some(i) => i,
@@ -5297,7 +5244,7 @@ async fn tunnel_one(
         // Circuit-relay: select additional onion hops (hop 1+) from OTHER pool
         // bridges so the client builds a multi-hop circuit. Empty => single-hop.
         let extra_hops: Vec<CircuitHop> = if entry.circuit_relay {
-            select_circuit_extra_hops(&pool, idx)
+            select_circuit_extra_hops(&pool, idx)?
         } else {
             Vec::new()
         };
@@ -5514,7 +5461,7 @@ async fn tunnel_one(
                     pool.record_latency(idx, t0.elapsed().as_millis() as u64)
                         .await;
                     bridge_sock.set_nodelay(true).ok();
-                    set_carrier_keepalive(&bridge_sock);
+                    set_carrier_keepalive(&bridge_sock)?;
                     // `local` consumed here - no further retry after this point.
                     return dial_with_sock(local, peer, entry, &extra_hops, bridge_sock).await;
                 }
@@ -6085,7 +6032,7 @@ async fn open_udp_relay_session(
     for attempt in 0..pool.len() {
         // Spread failover attempts (critic-A: no sub-second diverse-bearer sweep).
         if attempt > 0 {
-            failover_backoff(attempt).await;
+            failover_backoff(attempt).await?;
         }
         let Some(idx) = pool.pick_entry().await else {
             break;
@@ -7060,18 +7007,20 @@ fn hop_affinity_subnet(addr: &str) -> Option<Vec<u8>> {
 /// Fisher-Yates shuffle using the OS CSPRNG. A predictable (pool-order) circuit
 /// path lets anyone who knows the pool - e.g. an invite holder - anticipate the
 /// hops; a fresh random permutation per circuit removes that handle.
-fn csprng_shuffle<T>(v: &mut [T]) {
+fn csprng_shuffle<T>(v: &mut [T]) -> Result<(), String> {
     for i in (1..v.len()).rev() {
         let mut b = [0u8; 8];
-        let j = match getrandom::fill(&mut b) {
-            Ok(()) => (u64::from_le_bytes(b) % (i as u64 + 1)) as usize,
-            Err(_) => 0,
-        };
+        getrandom::fill(&mut b).map_err(|_| "circuit entropy unavailable".to_string())?;
+        let j = (u64::from_le_bytes(b) % (i as u64 + 1)) as usize;
         v.swap(i, j);
     }
+    Ok(())
 }
 
-fn select_circuit_extra_hops(pool: &EntryPool, entry_idx: usize) -> Vec<CircuitHop> {
+fn select_circuit_extra_hops(
+    pool: &EntryPool,
+    entry_idx: usize,
+) -> Result<Vec<CircuitHop>, String> {
     let max_extra = MAX_CIRCUIT_HOPS.saturating_sub(1);
     let entry_pk = pool.entries[entry_idx].bridge_x25519_pk;
 
@@ -7081,7 +7030,7 @@ fn select_circuit_extra_hops(pool: &EntryPool, entry_idx: usize) -> Vec<CircuitH
         .collect();
     // Randomize the path so it is not a fixed pool-order scan a pool-holder can
     // predict.
-    csprng_shuffle(&mut candidates);
+    csprng_shuffle(&mut candidates)?;
 
     let mut used_pks: Vec<[u8; 32]> = vec![entry_pk];
     let mut used_subnets: Vec<Vec<u8>> = hop_affinity_subnet(&pool.entries[entry_idx].bridge_addr)
@@ -7169,7 +7118,7 @@ fn select_circuit_extra_hops(pool: &EntryPool, entry_idx: usize) -> Vec<CircuitH
              exists to prevent. Add bridges from other operators."
         );
     }
-    hops
+    Ok(hops)
 }
 
 /// Are all recorded hop subnets distinct? (Hops with no derivable subnet - e.g. a
@@ -7635,7 +7584,12 @@ where
     let padding_on = circuit.hop_count() >= 2;
     let pad_lo = Duration::from_millis(800);
     let pad_hi = Duration::from_millis(4000);
-    let mut pad_timer = Box::pin(tokio::time::sleep(jitter_duration(pad_lo, pad_hi)));
+    let first_pad_delay = if padding_on {
+        jitter_duration(pad_lo, pad_hi)?
+    } else {
+        Duration::ZERO
+    };
+    let mut pad_timer = Box::pin(tokio::time::sleep(first_pad_delay));
 
     loop {
         tokio::select! {
@@ -7646,9 +7600,9 @@ where
                         let _ = write_cell(&mut session, &cell).await;
                     }
                 }
-                pad_timer
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + jitter_duration(pad_lo, pad_hi));
+                pad_timer.as_mut().reset(
+                    tokio::time::Instant::now() + jitter_duration(pad_lo, pad_hi)?
+                );
             }
             // Local -> circuit: read data, seal as CMD_RELAY(DATA).
             n = local.read(&mut local_buf), if !local_eof => {
@@ -7903,7 +7857,15 @@ async fn run_cover_traffic(local_bind: String, policy: CoverPolicy) {
         if activity_delta > 0 {
             scheduler.record_activity(activity_delta, now);
         }
-        if let CoverDecision::Fetch { destination_idx } = scheduler.tick(now) {
+        let destination_idx = match scheduler.tick(now) {
+            CoverDecision::Fetch { destination_idx } => destination_idx,
+            CoverDecision::EntropyUnavailable => {
+                warn!("cover traffic stopped: OS CSPRNG unavailable");
+                return;
+            }
+            _ => continue,
+        };
+        {
             let Some(dest) = policy.destinations.get(destination_idx).cloned() else {
                 continue;
             };
@@ -8125,7 +8087,11 @@ async fn probe_all_entries(pool: &EntryPool, probe_timeout: Duration, stagger_ma
             // #8: spread background probes across a random window so the fan-out
             // isn't a single N-SYN burst. ZERO on the startup path (dial fast).
             if stagger_max > Duration::ZERO {
-                tokio::time::sleep(jitter_duration(Duration::ZERO, stagger_max)).await;
+                let Ok(delay) = jitter_duration(Duration::ZERO, stagger_max) else {
+                    error!("bridge probe stopped: OS CSPRNG unavailable");
+                    return (idx, None);
+                };
+                tokio::time::sleep(delay).await;
             }
             let t0 = tokio::time::Instant::now();
             // Probe all candidates concurrently; first to succeed wins.
@@ -8235,36 +8201,35 @@ fn maintenance_handshake_timeout_for(pool: &EntryPool, pacing_active: bool) -> D
 /// censor watching a client's flows over time can fingerprint regular events
 /// (a 60 s re-probe burst, a 25 s keepalive) that no ordinary application
 /// emits on a metronome. Jittering each so it is neither fixed nor uniform
-/// across clients removes the cross-flow cadence handle. Falls back to the
-/// midpoint if the CSPRNG is momentarily unavailable (never stalls).
-fn jitter_duration(lo: Duration, hi: Duration) -> Duration {
+/// across clients removes the cross-flow cadence handle. An entropy failure
+/// aborts the affected operation rather than emitting a fixed cadence.
+fn jitter_duration(lo: Duration, hi: Duration) -> Result<Duration, String> {
     let lo_ms = lo.as_millis() as u64;
     let hi_ms = hi.as_millis() as u64;
     if hi_ms <= lo_ms {
-        return lo;
+        return Ok(lo);
     }
     let span = hi_ms - lo_ms;
     let mut buf = [0u8; 8];
-    let off = match getrandom::fill(&mut buf) {
-        Ok(()) => u64::from_le_bytes(buf) % span,
-        Err(_) => span / 2,
-    };
-    Duration::from_millis(lo_ms + off)
+    getrandom::fill(&mut buf).map_err(|_| "jitter entropy unavailable".to_string())?;
+    let off = u64::from_le_bytes(buf) % span;
+    Ok(Duration::from_millis(lo_ms + off))
 }
 
-fn set_carrier_keepalive(sock: &TcpStream) {
+fn set_carrier_keepalive(sock: &TcpStream) -> Result<(), String> {
     // Jitter per-connection (#8): a fixed 25 s/15 s keepalive is a constant
     // wire cadence unique to Mirage carriers. Real apps vary; so do we.
     let ka = socket2::TcpKeepalive::new()
         .with_time(jitter_duration(
             Duration::from_secs(20),
             Duration::from_secs(40),
-        ))
+        )?)
         .with_interval(jitter_duration(
             Duration::from_secs(10),
             Duration::from_secs(25),
-        ));
+        )?);
     let _ = socket2::SockRef::from(sock).set_tcp_keepalive(&ka);
+    Ok(())
 }
 
 /// Build the candidate address list for `entry` and TCP-connect to the first
@@ -8294,7 +8259,7 @@ async fn tcp_connect_to_entry(entry: &BridgeEntry, timeout: Duration) -> Result<
         match tokio::time::timeout(timeout, dial_bridge_tcp(addr.as_str())).await {
             Ok(Ok(sock)) => {
                 sock.set_nodelay(true).ok();
-                set_carrier_keepalive(&sock);
+                set_carrier_keepalive(&sock)?;
                 return Ok(sock);
             }
             Ok(Err(e)) => last_err = e.to_string(),
@@ -9952,7 +9917,7 @@ mod success_recording_tests {
             entry_at("10.9.9.2:443", 2),
             entry_at("10.0.0.3:443", 3),
         ]);
-        let hops = select_circuit_extra_hops(&pool, 0);
+        let hops = select_circuit_extra_hops(&pool, 0).unwrap();
         // Map the selected hops back to their pool entries to read their addrs.
         let mut flat: Vec<Vec<u8>> = vec![hop_affinity_subnet("10.0.0.1:443").unwrap()];
         for h in &hops {
@@ -9976,7 +9941,7 @@ mod success_recording_tests {
             entry_at("10.0.0.2:443", 2),
         ]);
         assert!(
-            !select_circuit_extra_hops(&pool2, 0).is_empty(),
+            !select_circuit_extra_hops(&pool2, 0).unwrap().is_empty(),
             "a homogeneous pool must still yield a circuit rather than none"
         );
     }
@@ -9995,7 +9960,7 @@ mod success_recording_tests {
             let (lo, hi) = (interval.mul_f64(0.75), interval.mul_f64(1.25));
             let mut seen = std::collections::HashSet::new();
             for _ in 0..200 {
-                let d = jitter_duration(lo, hi);
+                let d = jitter_duration(lo, hi).unwrap();
                 assert!(d >= lo && d <= hi, "{d:?} outside [{lo:?}, {hi:?}]");
                 seen.insert(d.as_millis());
             }

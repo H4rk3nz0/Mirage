@@ -100,11 +100,10 @@ pub struct ClientHelloInputs<'a> {
     /// order, signature-algorithm list, and ALPN protocols. See
     /// [`crate::tls_fingerprint`]. Default: `&CHROME_DESKTOP`.
     pub fingerprint: &'a TlsFingerprintTemplate,
-    /// Optional per-connection GREASE (RFC 8701). `Some` injects GREASE into
-    /// the cipher list, `supported_groups`, `key_share`, and the leading
-    /// extension slot - matching real Chrome/Firefox. GREASE is excluded from
-    /// JA3 by spec, so it does not change the pinned JA3 string. `None` emits
-    /// no GREASE (deterministic; used by tests). Production SHOULD pass `Some`.
+    /// Optional per-connection GREASE values. `Some` enables fresh ECH GREASE
+    /// payloads for every template, while RFC 8701 codepoints and extension
+    /// shuffling follow the selected template's captured browser behavior.
+    /// `None` gives deterministic output for tests.
     pub grease: Option<GreaseValues>,
     /// Optional real ML-KEM-768 encapsulation key (1184 B). When `Some` AND the
     /// template advertises [`GROUP_X25519_MLKEM768`], a hybrid X25519MLKEM768
@@ -167,6 +166,7 @@ pub fn build_client_hello(inputs: &ClientHelloInputs<'_>) -> Result<Vec<u8>, Rea
     if tpl.cipher_suites.is_empty() {
         return Err(RealityError::TagMismatch);
     }
+    let rfc8701_grease = inputs.grease.filter(|_| tpl.rfc8701_grease);
 
     // Build extensions body first so we can length-prefix it. Order
     // is driven by `extension_order` verbatim.
@@ -174,25 +174,22 @@ pub fn build_client_hello(inputs: &ClientHelloInputs<'_>) -> Result<Vec<u8>, Rea
     // RFC 8701: real Chrome places a GREASE extension in the FIRST slot.
     // Injected at emit time - NOT added to template.extension_order, which
     // feeds the JA3 string (GREASE must stay out of JA3).
-    if let Some(g) = inputs.grease {
+    if let Some(g) = rfc8701_grease {
         write_extension(&mut ext, g.ext_first, &[]);
     }
-    // F4: real Chrome (BoringSSL) permutes its extension order per connection -
-    // a *static* order is itself a distinguisher (a client whose extension
-    // sequence never changes is not Chrome; modern Chrome's JA3 varies per
-    // connection, and its JA4 - which sorts extensions - stays stable). Shuffle
-    // in production (grease=Some); keep the canonical template order for
-    // deterministic tests (grease=None). The GREASE first/last slots wrap the
-    // permutation, matching BoringSSL.
+    // F4: Chrome (BoringSSL) permutes extension order per connection. Firefox
+    // 153's captured order was stable. Follow the template's browser-specific
+    // policy; a universal shuffle would make Firefox's JA3 wrong on the wire
+    // even when the canonical template's JA3 regression test passes.
     let mut order: Vec<u16> = tpl.extension_order.to_vec();
-    if inputs.grease.is_some() {
-        shuffle_extensions(&mut order);
+    if inputs.grease.is_some() && tpl.shuffle_extensions {
+        shuffle_extensions(&mut order)?;
     }
     for &ext_type in &order {
         match ext_type {
             EXT_SERVER_NAME => write_ext_server_name(&mut ext, inputs.server_name),
             EXT_SUPPORTED_GROUPS => {
-                if let Some(g) = inputs.grease {
+                if let Some(g) = rfc8701_grease {
                     // RFC 8701: prepend the GREASE group. The SAME value is
                     // reused for the key_share GREASE entry (Chrome correlates
                     // the two), so a fingerprinter can't split them.
@@ -213,7 +210,7 @@ pub fn build_client_hello(inputs: &ClientHelloInputs<'_>) -> Result<Vec<u8>, Rea
                 }
             }
             EXT_SUPPORTED_VERSIONS => {
-                write_ext_supported_versions(&mut ext, inputs.grease.map(|g| g.version))
+                write_ext_supported_versions(&mut ext, rfc8701_grease.map(|g| g.version))
             }
             EXT_KEY_SHARE => {
                 // Emit the hybrid X25519MLKEM768 entry ONLY when the template
@@ -226,7 +223,7 @@ pub fn build_client_hello(inputs: &ClientHelloInputs<'_>) -> Result<Vec<u8>, Rea
                 write_ext_key_share(
                     &mut ext,
                     inputs.x25519_key_share,
-                    inputs.grease.map(|g| g.group),
+                    rfc8701_grease.map(|g| g.group),
                     hybrid_ek,
                 );
             }
@@ -298,7 +295,7 @@ pub fn build_client_hello(inputs: &ClientHelloInputs<'_>) -> Result<Vec<u8>, Rea
                 // payload varies with `grease`; the extension's PRESENCE is a
                 // property of the template, because presence is what a
                 // fingerprinter reads. See `write_ext_ech_grease`.
-                write_ext_ech_grease(&mut ext, inputs.grease.is_some());
+                write_ext_ech_grease(&mut ext, inputs.grease.is_some())?;
             }
             // Unknown (or unrecognised) extension type in template:
             // emit an empty body. A template should only reference
@@ -311,7 +308,7 @@ pub fn build_client_hello(inputs: &ClientHelloInputs<'_>) -> Result<Vec<u8>, Rea
     // RFC 8701: real Chrome also places a SECOND, distinct GREASE extension in
     // the LAST slot (empty body). Emitted at build time - kept out of
     // template.extension_order so the JA3 string is unaffected.
-    if let Some(g) = inputs.grease {
+    if let Some(g) = rfc8701_grease {
         write_extension(&mut ext, g.ext_last, &[]);
     }
 
@@ -323,7 +320,7 @@ pub fn build_client_hello(inputs: &ClientHelloInputs<'_>) -> Result<Vec<u8>, Rea
     body.extend_from_slice(inputs.session_id); // session_id
                                                // cipher_suites
                                                // RFC 8701: a single GREASE cipher is PREPENDED to the suite list.
-    let grease_cipher = inputs.grease.map(|g| g.cipher);
+    let grease_cipher = rfc8701_grease.map(|g| g.cipher);
     let cs_count = tpl.cipher_suites.len() + usize::from(grease_cipher.is_some());
     let cs_len = (cs_count * 2) as u16;
     body.extend_from_slice(&cs_len.to_be_bytes());
@@ -373,20 +370,18 @@ fn write_extension(out: &mut Vec<u8>, ext_type: u16, body: &[u8]) {
     out.extend_from_slice(body);
 }
 
-/// Fisher-Yates permutation of the extension order via the OS CSPRNG (F4). On
-/// CSPRNG failure the canonical order is left intact (still a valid, if static,
-/// ClientHello). Consumes 4 random bytes per swap; the modulo bias for a list
+/// Fisher-Yates permutation of the extension order via the OS CSPRNG (F4).
+/// CSPRNG failure aborts the ClientHello rather than emitting a static-order
+/// production fingerprint. Consumes 4 random bytes per swap; the modulo bias for a list
 /// of <=16 extensions against a 32-bit draw is ~10^-9 - irrelevant for cover
 /// ordering.
-fn shuffle_extensions(order: &mut [u16]) {
+fn shuffle_extensions(order: &mut [u16]) -> Result<(), RealityError> {
     let n = order.len();
     if n < 2 {
-        return;
+        return Ok(());
     }
     let mut rnd = [0u8; 64];
-    if getrandom::fill(&mut rnd).is_err() {
-        return;
-    }
+    getrandom::fill(&mut rnd).map_err(|_| RealityError::Entropy)?;
     for (step, i) in (1..n).rev().enumerate() {
         let mut word = [0u8; 4];
         for (w, slot) in word.iter_mut().enumerate() {
@@ -395,6 +390,7 @@ fn shuffle_extensions(order: &mut [u16]) {
         let r = u32::from_le_bytes(word) as usize;
         order.swap(i, r % (i + 1));
     }
+    Ok(())
 }
 
 fn write_ext_server_name(out: &mut Vec<u8>, name: &str) {
@@ -505,7 +501,8 @@ const ECH_GREASE_PAYLOAD_LEN: usize = 176;
 /// A ClientHello's extension list is the fingerprint. Presence must be a property
 /// of the template alone; only the bytes inside may vary. `rng: None` therefore
 /// still writes a full-length, structurally valid ECH - just a reproducible one.
-fn write_ext_ech_grease(out: &mut Vec<u8>, random: bool) {
+/// A production CSPRNG failure aborts the whole ClientHello.
+fn write_ext_ech_grease(out: &mut Vec<u8>, random: bool) -> Result<(), RealityError> {
     let mut rnd = [0u8; 1 + 32 + ECH_GREASE_PAYLOAD_LEN];
     if !random {
         // Deterministic path: a fixed, structurally valid filler. Reproducible
@@ -513,14 +510,8 @@ fn write_ext_ech_grease(out: &mut Vec<u8>, random: bool) {
         for (i, b) in rnd.iter_mut().enumerate() {
             *b = (i as u8).wrapping_mul(31).wrapping_add(7);
         }
-    } else if getrandom::fill(&mut rnd).is_err() {
-        // CSPRNG failure must not change the extension LIST. Derive filler from
-        // the buffer's own address so it is not a fixed constant across hosts,
-        // and still emit the extension at its usual length.
-        let seed = (&rnd as *const _ as usize) as u64;
-        for (i, b) in rnd.iter_mut().enumerate() {
-            *b = (seed.rotate_left((i % 64) as u32) ^ (i as u64)) as u8;
-        }
+    } else {
+        getrandom::fill(&mut rnd).map_err(|_| RealityError::Entropy)?;
     }
     let mut body = Vec::with_capacity(1 + 4 + 1 + 2 + 32 + 2 + ECH_GREASE_PAYLOAD_LEN);
     body.push(0x00); // ECHClientHelloType = outer(0)
@@ -532,6 +523,7 @@ fn write_ext_ech_grease(out: &mut Vec<u8>, random: bool) {
     body.extend_from_slice(&(ECH_GREASE_PAYLOAD_LEN as u16).to_be_bytes());
     body.extend_from_slice(&rnd[33..]); // payload: random, fixed-length bucket
     write_extension(out, EXT_ENCRYPTED_CLIENT_HELLO, &body);
+    Ok(())
 }
 
 fn write_ext_key_share(
@@ -679,10 +671,8 @@ mod tests {
         assert_eq!(parsed.x25519_key_share, ks);
     }
 
-    /// Extract the extension-type sequence (in wire order) from a generated
-    /// ClientHello record, skipping GREASE (0x?A?A). Used to assert the F4
-    /// per-connection shuffle.
-    fn extension_types(bytes: &[u8]) -> Vec<u16> {
+    /// Extract every extension type in wire order, including RFC 8701 GREASE.
+    fn raw_extension_types(bytes: &[u8]) -> Vec<u16> {
         // record(5) + hs_header(4) + version(2) + random(32) + sid_len(1)+sid +
         // then cipher list, compression, extensions. Reuse the parser's shape by
         // walking from a known offset.
@@ -700,12 +690,48 @@ mod tests {
         while p + 4 <= end {
             let t = u16::from_be_bytes([bytes[p], bytes[p + 1]]);
             let l = u16::from_be_bytes([bytes[p + 2], bytes[p + 3]]) as usize;
-            if t & 0x0F0F != 0x0A0A {
-                out.push(t);
-            }
+            out.push(t);
             p += 4 + l;
         }
         out
+    }
+
+    /// JA3-style extension sequence, omitting RFC 8701 GREASE.
+    fn extension_types(bytes: &[u8]) -> Vec<u16> {
+        raw_extension_types(bytes)
+            .into_iter()
+            .filter(|t| t & 0x0F0F != 0x0A0A)
+            .collect()
+    }
+
+    #[test]
+    fn production_firefox_keeps_captured_extension_order_without_rfc8701_grease() {
+        use crate::tls_fingerprint::FIREFOX_DESKTOP;
+        let rnd = [0u8; 32];
+        let sid = [0u8; 32];
+        let ks = [0x33u8; 32];
+        let mut inputs = sample_inputs(&rnd, &sid, &ks);
+        inputs.fingerprint = &FIREFOX_DESKTOP;
+        // Production supplies per-connection randomness for ECH, but the
+        // captured Firefox 153 hello had no RFC 8701 GREASE or shuffle.
+        inputs.grease = Some(GreaseValues {
+            cipher: 0x0A0A,
+            group: 0x1A1A,
+            ext_first: 0x2A2A,
+            ext_last: 0x3A3A,
+            version: 0x4A4A,
+        });
+        let a = build_client_hello(&inputs).unwrap();
+        let b = build_client_hello(&inputs).unwrap();
+        assert_eq!(raw_extension_types(&a), FIREFOX_DESKTOP.extension_order);
+        assert_eq!(raw_extension_types(&b), FIREFOX_DESKTOP.extension_order);
+        assert_ne!(a, b, "ECH GREASE payload should still vary per connection");
+        // The first cipher remains the browser's real first cipher, not a
+        // synthetic GREASE entry. Locate the suite vector after the session ID.
+        let cs_len_offset = 5 + 4 + 2 + 32 + 1 + sid.len();
+        let first_cipher = u16::from_be_bytes([a[cs_len_offset + 2], a[cs_len_offset + 3]]);
+        assert_eq!(first_cipher, FIREFOX_DESKTOP.cipher_suites[0]);
+        assert!(parse_client_hello_record(&a).is_ok());
     }
 
     #[test]

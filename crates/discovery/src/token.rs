@@ -135,9 +135,8 @@ pub fn sign_token(
 /// 24-hour token, pass `12 * 3600 = 43200` so individual tokens
 /// expire anywhere in `[24h, 36h)` from `issued_at`.
 ///
-/// Falls back to fixed `nominal_expires_at` if the OS CSPRNG
-/// returns an error (logged as a warning) - better fixed-TTL
-/// than panic. CSPRNG failure is otherwise extremely rare.
+/// Aborts minting if the OS CSPRNG fails; a fixed expiry would make
+/// the batch linkable by its mint timestamp.
 pub fn sign_token_jittered(
     token_id: [u8; 32],
     bridge_ed25519_pk: [u8; ED25519_PK_LEN],
@@ -149,15 +148,8 @@ pub fn sign_token_jittered(
         0u64
     } else {
         let mut buf = [0u8; 8];
-        match getrandom::fill(&mut buf) {
-            Ok(()) => u64::from_le_bytes(buf) % jitter_seconds,
-            Err(_) => {
-                tracing::warn!(
-                    "sign_token_jittered: getrandom failed, falling back to nominal expiry"
-                );
-                0
-            }
-        }
+        getrandom::fill(&mut buf).expect("OS CSPRNG required for token expiry jitter");
+        u64::from_le_bytes(buf) % jitter_seconds
     };
     let expires_at = nominal_expires_at.saturating_add(jitter);
     sign_token(token_id, bridge_ed25519_pk, expires_at, operator_sk)

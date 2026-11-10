@@ -1,45 +1,38 @@
 # Mirage documentation
 
-Mirage is a **censorship-resistance framework stack**: interchangeable carriers, bridge
-discovery, authenticated session crypto, and optional onion routing, behind a local SOCKS5
-proxy or a whole-device VPN.
+Mirage provides a local SOCKS5 proxy or TUN interface backed by an encrypted
+session to a bridge. It supports several carriers and discovery methods.
 
-These docs come in two layers. Start at the top; go down as far as you need.
-
-## Usability layer - get it working
+## Setup and operation
 
 | Doc | For |
 |---|---|
-| **[Getting started](getting-started.md)** | You have an invite and want to be online. |
-| **[Install the desktop app](install.md)** | AppImage / `.deb` / `.dmg` / `.msi`, and the unsigned-alpha warning steps. |
-| **[Operator guide](operators.md)** | You're running a bridge for other people. |
-| **[Feature reference](features.md)** | Everything in the box: carriers, discovery, defenses, binaries. |
-| **[Configuration](configuration.md)** | Every config key, what it does, and its default. |
-| **[Building & platforms](building.md)** | Supported targets, cross-compiling, routers (ARM/MIPS), and mobile. |
+| **[Getting started](getting-started.md)** | Connect with a bridge invite. |
+| **[Install the desktop app](install.md)** | Desktop packages and signing status. |
+| **[Operator guide](operators.md)** | Run a bridge. |
+| **[Feature reference](features.md)** | Carriers, discovery methods, and binaries. |
+| **[Configuration](configuration.md)** | Runtime settings and defaults. |
+| **[Building and platforms](building.md)** | Build targets, routers, and mobile clients. |
 
-## Depth layer - how and why
+## Design and measurements
 
 | Doc | For |
 |---|---|
-| **[Proteus 2.0](proteus-2.0.md)** | What the traffic shaper is, each mechanism, and the measurement that justifies it. Start here. |
-| **[Measurement methodology](measurement-methodology.md)** | The failure modes that recurred across unrelated subsystems, and how each was caught. Read before measuring anything. |
-| **[Proteus](proteus.md)** | Why the traffic shaper replays real captures instead of generating plausible ones, and what that costs. |
-| **[Internals](internals.md)** | Architecture, wire format, and what Mirage changes vs. existing protocols. |
-| **[Security model](security-model.md)** | The threat model, what is defended, and what is *not*. |
+| **[Internals](internals.md)** | Architecture and wire format. |
+| **[Security model](security-model.md)** | Threats, assumptions, and limitations. |
+| **[Proteus](proteus.md)** | Replay shaping, measurements, and cost. |
+| **[Proteus 2.0](proteus-2.0.md)** | Traffic shaping design and measurement results. |
+| **[Cover selection](cover-scheduling.md)** | Queueing analysis and corrections to the original measurements. |
+| **[Measurement methodology](measurement-methodology.md)** | How measurement failures were found and corrected. |
+| **[Cover-native transport proposal](cover-native-proposal.md)** | High-throughput research design; unimplemented and unvalidated. |
 
----
+## Build and configuration
 
-## The one thing to know first
-
-**There are no build-time feature flags.** Every carrier, every discovery channel, the
-graphical client, and the TUN VPN are compiled into the standard build. What you actually
-use is selected at **runtime, in a JSON config file**.
-
-So when the docs say "enable Reality" or "turn on TUN mode", that always means *set a key in
-your config* - never *recompile with a flag*.
+The standard workspace build includes the carriers, discovery methods, desktop
+client, and TUN support. Select the components you use in the JSON configuration.
 
 ```sh
-cargo build --release --workspace     # this is the whole build. no --features.
+cargo build --release --workspace
 ```
 
 ## Vocabulary
@@ -48,9 +41,9 @@ cargo build --release --workspace     # this is the whole build. no --features.
 |---|---|
 | **Bridge** | The server an operator runs. Clients tunnel through it to reach the internet. |
 | **Client** | The local daemon on your machine. Exposes a SOCKS5 proxy and/or a TUN device. |
-| **Carrier** | The wire shape a session rides in - Reality, WebRTC, DNS, etc. Swappable. |
+| **Carrier** | The transport carrying a session, such as Reality, WebRTC, or DNS. |
 | **Session** | The authenticated, encrypted channel between client and bridge, independent of carrier. |
 | **Invite** | A `mirage://...` string containing everything a client needs to reach one bridge. |
-| **Discovery channel** | Where clients look up bridges (Nostr / DNS TXT / DHT) when they have no invite. |
+| **Discovery channel** | Where invite holders refresh bridge records (Nostr / DNS TXT / DHT). |
 | **Circuit** | A chain of up to 3 bridges (onion routing), so no single hop sees both ends. |
 | **Cohort** | A set of bridges an operator runs together, sharing discovery and rotation. |

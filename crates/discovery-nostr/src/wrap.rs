@@ -83,8 +83,8 @@ mod frame_mask_tests {
         // A ct_len whose exact value would otherwise pass the scraper's
         // consistency test at bytes 33..35.
         let ct = vec![0x11u8; 700];
-        let masked = nip44_frame(&ct, Some(&key));
-        let unmasked = nip44_frame(&ct, None);
+        let masked = nip44_frame(&ct, Some(&key)).unwrap();
+        let unmasked = nip44_frame(&ct, None).unwrap();
 
         // Same total size (bucket is a function of ct_len either way) ...
         assert_eq!(masked.len(), unmasked.len());
@@ -124,7 +124,7 @@ mod frame_mask_tests {
 /// (`ct`) is itself AEAD output, and the nonce + mac are random, so the whole
 /// region reads as encrypted. Mirage's own seal provides the real
 /// authentication; this is pure mimicry.
-fn nip44_frame(ciphertext: &[u8], mask_key: Option<&[u8; 32]>) -> Vec<u8> {
+fn nip44_frame(ciphertext: &[u8], mask_key: Option<&[u8; 32]>) -> Result<Vec<u8>, NostrError> {
     // Guard the u16 length prefix. Announcements are ~768 B (well under the
     // publish cap), so this cap is never hit in practice.
     let ct_len = ciphertext.len().min(u16::MAX as usize);
@@ -136,7 +136,7 @@ fn nip44_frame(ciphertext: &[u8], mask_key: Option<&[u8; 32]>) -> Vec<u8> {
     let mut out = vec![0u8; total];
     // CSPRNG-fill everything first so nonce, padding, and mac all read as
     // encrypted; then overlay the version byte + length + ct.
-    let _ = getrandom::fill(&mut out);
+    getrandom::fill(&mut out).map_err(|_| NostrError::Entropy)?;
     out[0] = NIP44_VERSION;
     let body = 1 + 32; // after version + nonce
     let mut len_be = (ct_len as u16).to_be_bytes();
@@ -149,7 +149,7 @@ fn nip44_frame(ciphertext: &[u8], mask_key: Option<&[u8; 32]>) -> Vec<u8> {
     }
     out[body..body + 2].copy_from_slice(&len_be);
     out[body + 2..body + 2 + ct_len].copy_from_slice(ct);
-    out
+    Ok(out)
 }
 
 /// Recover the ciphertext from a [`nip44_frame`]. `mask_key` MUST match what
@@ -195,7 +195,7 @@ pub fn build_announcement_event(
     let info_hash_hex = hex::encode(info_hash);
     // NIP-44-shaped, bucket-padded content (red-team #15); `frame_key` (cohort
     // shared_salt) masks the length so a scraper can't enumerate frames.
-    let content = B64.encode(nip44_frame(ciphertext, frame_key));
+    let content = B64.encode(nip44_frame(ciphertext, frame_key)?);
     let mut parts = NostrEventParts::mirage_event(created_at, content)
         .with_tag(TAG_D, &info_hash_hex)
         .with_tag(TAG_EXPIRATION, expires_at.to_string());

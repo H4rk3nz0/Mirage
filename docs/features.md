@@ -1,8 +1,7 @@
 # Feature reference
 
-Everything Mirage ships. **All of it is in the standard build** - there are no optional
-features, no `--features` flags, and nothing here needs a special compile. Each item is
-turned on at runtime in your config.
+The standard workspace build includes these components. Enable the ones you use
+in the runtime configuration.
 
 - [Carriers](#carriers)
 - [Layers](#layers)
@@ -16,16 +15,16 @@ turned on at runtime in your config.
 
 ## Carriers
 
-A **carrier** is the wire shape your session takes. The session crypto is identical in every
-case - only the disguise changes. A client can hold several and switch when one stops
-working.
+A **carrier** transports the encrypted session. The session cryptography stays
+the same, while carrier syntax, performance, and visible behavior differ. A
+client can configure several carriers for failover.
 
 | Carrier | Imitates | Transport | Enable with |
 |---|---|---|---|
-| **Reality** | A real TLS session with a real site | TCP | `reality_enabled` |
-| **Hysteria2** | QUIC with aggressive congestion control | UDP | `hysteria2_enabled` |
+| **Reality** | TLS-like handshake with unauthorized-probe forwarding | TCP | `reality_enabled` |
+| **Hysteria2** | QUIC proxy transport | UDP | `hysteria2_enabled` |
 | **MASQUE / HTTP-3** | HTTP/3 web traffic (session in DATA frames) | UDP | `h3_enabled` |
-| **WebRTC** | A video call (DTLS-SCTP data channel) | UDP | `webrtc_enabled` |
+| **WebRTC** | DTLS-SCTP data channel | UDP | `webrtc_enabled` |
 | **meek** | HTTPS to a CDN (domain-fronted long-poll) | TCP | `meek_front_domain` (client) |
 | **WebSocket** | An HTTP upgrade to a web app | TCP | `ws_enabled` |
 | **Shadowsocks-2022** | Nothing - opaque random bytes | TCP | `ss2022_psk_hex` |
@@ -34,8 +33,10 @@ working.
 | **dnstt** | Ordinary DNS queries/responses | UDP | `dnstt_enabled` + `dnstt_domain` |
 | **obfs** | Random bytes over bare TCP | TCP | `obfs_enabled` |
 
-**Choosing.** Start with **Reality** - it survives active probing because a prober gets a
-genuine TLS session with a real site. Add **Hysteria2** for lossy links. Reach for **meek**
+**Choosing.** Start with **Reality** when TLS-like access and unauthorized-probe
+forwarding fit the network. The bridge can forward a prober to a real site, but
+response timing and connection behavior can still distinguish it from that site.
+Add **Hysteria2** for lossy links. Reach for **meek**
 or **dnstt** only when a network is hostile enough to need them; they cost latency or
 bandwidth. **Single-port dispatch** lets one bridge port serve every TCP carrier at once.
 
@@ -47,26 +48,23 @@ Ride on top of any carrier.
 
 | Layer | What it does | Enable with |
 |---|---|---|
-| **Padding + jitter** | Buckets frame sizes and randomises inter-packet timing, to defeat ML flow fingerprinting. | `pad_enabled` (**both** ends) |
-| **CBR mode** | Constant bitrate - near-total shape concealment, high bandwidth cost. | `pad_cbr_frame_bytes` |
+| **Padding + jitter** | Buckets frame sizes and varies timing; no classifier-resistance guarantee. | `pad_enabled` (**both** ends) |
+| **CBR mode** | Sends fixed-size frames at a configured cadence, including when idle; consumes bandwidth. | `pad_cbr_frame_bytes` |
 | **Stream multiplexing** | Many logical streams over one carrier connection, with per-stream flow control. | `stream_mux_enabled` |
-| **Cover traffic** | Fetches real decoy pages while idle, so "idle" doesn't stand out. | `cover_destinations` |
-| **Encrypted SNI (ECH)** | Encrypts the inner TLS hostname behind a CDN (RFC 9180 HPKE), so the CDN edge doesn't reveal which site you reach. TLS carriers (meek / DoH / WebSocket). | invite (`INVITE_EXT_ECH_CONFIG`) or `carrier_ech_config` |
+| **Cover traffic** | Fetches configured decoy pages while idle. | `cover_destinations` |
+| **Encrypted SNI (ECH)** | Encrypts the inner TLS hostname from on-path observers. The ECH provider can still see it. TLS carriers (meek / DoH / WebSocket). | invite (`INVITE_EXT_ECH_CONFIG`) or `carrier_ech_config` |
 
-> **ECH caveat (honest):** ECH hides the inner SNI, but on the meek/DoH/WebSocket
-> carriers it currently rides rustls's default ClientHello, whose JA3 is *not* a
-> browser's. In the wild ECH is sent almost only by browsers, so ECH on a non-browser
-> fingerprint can itself be a distinguisher. It is most useful where the carrier
-> already blends; a browser-matching ClientHello for this path (a Rust uTLS-equivalent)
-> is future work. The Reality carrier separately sends Chrome-style GREASE ECH as part
-> of its browser fingerprint.
+> **ECH limitation:** On meek, DoH, and WebSocket, ECH currently uses rustls's
+> default ClientHello, which differs from browser handshakes. ECH alone does
+> not make those carriers look like browser traffic. The Reality carrier uses
+> a separate ClientHello template.
 
 ---
 
 ## Discovery
 
-How a client finds bridges when it has no invite. Rendezvous locations are derived per
-**epoch**, so they rotate on their own.
+How an invite holder refreshes bridge records. Rendezvous locations are
+derived per epoch from the invite's secret salt.
 
 | Channel | Strength | Weakness | Enable with |
 |---|---|---|---|
@@ -83,8 +81,8 @@ You can run several at once. **Invites** remain the direct path and need no chan
 **SOCKS5 proxy** - default `127.0.0.1:1080`. No privileges needed. Per-app configuration.
 Always use `socks5h://` so DNS resolves at the bridge, not on your machine.
 
-**TUN VPN** - `"tun_enabled": true`. Captures **every TCP and UDP flow** from the whole
-device through a userspace IP stack - no per-app setup. On start the client installs the OS
+**TUN VPN** - `"tun_enabled": true`. Routes device traffic through a userspace IP
+stack without per-app setup. On start the client installs the OS
 routes that actually redirect traffic into the tunnel (a split-default capture) and adds a
 bypass route for each bridge IP so the encrypted carrier itself is not tunnelled; on exit it
 restores your routing table. Needs `CAP_NET_ADMIN` or root.

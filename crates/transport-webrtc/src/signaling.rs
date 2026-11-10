@@ -132,10 +132,10 @@ fn open_sdp(key: &[u8; 32], blob: &[u8]) -> Result<String, WebRtcError> {
 /// the STUN/DTLS UDP flow). Faking them would either re-leak real values or
 /// mismatch the actual flow, so they stay out - the residual is that a deep
 /// WHIP-offer validator would see a session-only description, not a full offer.
-fn encode_sdp_envelope(blob: &[u8]) -> String {
+fn encode_sdp_envelope(blob: &[u8]) -> Result<String, WebRtcError> {
     // A random 63-bit session id for the `o=` line, like a real origin field.
     let mut sid = [0u8; 8];
-    let _ = getrandom::fill(&mut sid);
+    getrandom::fill(&mut sid).map_err(|_| WebRtcError::Signaling("csprng".into()))?;
     let sess_id = u64::from_be_bytes(sid) >> 1;
 
     // Emit a STRUCTURALLY-REAL WebRTC data-channel offer, and carry the sealed
@@ -146,16 +146,16 @@ fn encode_sdp_envelope(blob: &[u8]) -> String {
     // parses as an ordinary data-channel offer.
     let payload = B64_NP.encode(blob);
     let mut ufrag = [0u8; 3];
-    let _ = getrandom::fill(&mut ufrag);
+    getrandom::fill(&mut ufrag).map_err(|_| WebRtcError::Signaling("csprng".into()))?;
     let ufrag = B64_NP.encode(ufrag); // ~4 ICE chars, like a real ufrag
     let mut fp = [0u8; 32];
-    let _ = getrandom::fill(&mut fp);
+    getrandom::fill(&mut fp).map_err(|_| WebRtcError::Signaling("csprng".into()))?;
     let fingerprint = fp
         .iter()
         .map(|b| format!("{b:02X}"))
         .collect::<Vec<_>>()
         .join(":");
-    format!(
+    Ok(format!(
         "v=0\r\n\
          o=- {sess_id} 2 IN IP4 0.0.0.0\r\n\
          s=-\r\n\
@@ -169,7 +169,7 @@ fn encode_sdp_envelope(blob: &[u8]) -> String {
          a=ice-ufrag:{ufrag}\r\n\
          a=ice-pwd:{payload}\r\n\
          a=fingerprint:sha-256 {fingerprint}\r\n"
-    )
+    ))
 }
 
 /// Recover the sealed blob from a body produced by [`encode_sdp_envelope`].
@@ -251,10 +251,10 @@ const CLIENT_PERSONAS: &[ClientPersona] = &[
 
 impl ClientPersona {
     /// Choose a persona for one exchange (unbiased over the 4-entry pool).
-    fn pick() -> &'static ClientPersona {
+    fn pick() -> Result<&'static ClientPersona, WebRtcError> {
         let mut b = [0u8; 1];
-        let _ = getrandom::fill(&mut b);
-        &CLIENT_PERSONAS[(b[0] as usize) % CLIENT_PERSONAS.len()]
+        getrandom::fill(&mut b).map_err(|_| WebRtcError::Signaling("csprng".into()))?;
+        Ok(&CLIENT_PERSONAS[(b[0] as usize) % CLIENT_PERSONAS.len()])
     }
 }
 
@@ -302,10 +302,10 @@ fn render_signaling_post(
 const SERVER_PERSONAS: &[&str] = &["cloudflare", "nginx", "Apache"];
 
 /// Choose a `Server` header value for one response.
-fn pick_server_persona() -> &'static str {
+fn pick_server_persona() -> Result<&'static str, WebRtcError> {
     let mut b = [0u8; 1];
-    let _ = getrandom::fill(&mut b);
-    SERVER_PERSONAS[(b[0] as usize) % SERVER_PERSONAS.len()]
+    getrandom::fill(&mut b).map_err(|_| WebRtcError::Signaling("csprng".into()))?;
+    Ok(SERVER_PERSONAS[(b[0] as usize) % SERVER_PERSONAS.len()])
 }
 
 /// Client-side [`Signaling`] that POSTs the offer to a bridge's HTTP signaling
@@ -371,10 +371,10 @@ impl Signaling for HttpSignaling {
         let mut payload = Vec::with_capacity(EPH_PK_LEN + sealed.len());
         payload.extend_from_slice(eph_pk.as_bytes());
         payload.extend_from_slice(&sealed);
-        let body = encode_sdp_envelope(&payload).into_bytes();
+        let body = encode_sdp_envelope(&payload)?.into_bytes();
         // Full Chromium `fetch()` persona (#13): a bare/absent User-Agent POSTing
         // to a signaling endpoint is itself the tell meek fixed.
-        let req = render_signaling_post(&self.path, &self.host, ClientPersona::pick(), body.len());
+        let req = render_signaling_post(&self.path, &self.host, ClientPersona::pick()?, body.len());
         sock.write_all(req.as_bytes())
             .await
             .map_err(|e| WebRtcError::Signaling(format!("write: {e}")))?;
@@ -506,8 +506,8 @@ where
     S: AsyncWrite + Unpin,
 {
     let sealed = seal_sdp(seal_key, answer_sdp.as_bytes())?;
-    let body = encode_sdp_envelope(&sealed).into_bytes();
-    let server = pick_server_persona();
+    let body = encode_sdp_envelope(&sealed)?.into_bytes();
+    let server = pick_server_persona()?;
     let resp = format!(
         "HTTP/1.1 200 OK\r\nServer: {server}\r\nContent-Type: {SIGNALING_CONTENT_TYPE}\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",

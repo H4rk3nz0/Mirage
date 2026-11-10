@@ -446,7 +446,13 @@ impl BridgeCircuitState {
     /// the client is token-authenticated by the transport handshake, so
     /// entry circuits are implicitly authorized).
     pub fn new(policy: BridgePolicy) -> Self {
-        Self {
+        Self::try_new(policy).expect("OS CSPRNG required for circuit IDs")
+    }
+
+    /// Construct a state machine, returning an error if circuit IDs cannot be
+    /// seeded with operating-system entropy.
+    pub fn try_new(policy: BridgePolicy) -> Result<Self, getrandom::Error> {
+        Ok(Self {
             circuits: HashMap::new(),
             out_to_in: HashMap::new(),
             policy,
@@ -460,9 +466,9 @@ impl BridgeCircuitState {
             // collision-free, deterministic-per-session) walk unguessable. Tests
             // that need reproducible ids call `set_out_circ_id_picker`, which
             // resets the seq to 0.
-            out_circ_id_seq: random_seq_seed(),
+            out_circ_id_seq: random_seq_seed()?,
             relay_mode: false,
-        }
+        })
     }
 
     /// Construct a state machine for a RELAY session - this bridge is an
@@ -1646,15 +1652,11 @@ impl BridgeCircuitState {
 
 // Default out_circ_id picker
 
-/// Draw a random 64-bit starting value for `out_circ_id_seq` (#14). On the
-/// astronomically-rare OS RNG failure, fall back to 0 (no worse than the old
-/// fixed start) rather than panicking a bridge accept path.
-fn random_seq_seed() -> u64 {
+/// Draw a random 64-bit starting value for `out_circ_id_seq` (#14).
+fn random_seq_seed() -> Result<u64, getrandom::Error> {
     let mut b = [0u8; 8];
-    match getrandom::fill(&mut b) {
-        Ok(()) => u64::from_le_bytes(b),
-        Err(_) => 0,
-    }
+    getrandom::fill(&mut b)?;
+    Ok(u64::from_le_bytes(b))
 }
 
 /// Deterministic per-seq picker - a golden-ratio mix over the seq counter. The

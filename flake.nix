@@ -1,26 +1,25 @@
 {
-  # Pinned Rust toolchain + reproducible build targets for Mirage (I7).
+  # Rust 1.86 build targets for Mirage.
   #
-  # Under the "lives at stake" threat model operators who self-build
-  # from source need byte-identical outputs across machines — a
-  # tampered build host must produce a binary that differs from the
-  # operator's local build, so a simple `sha256sum` check catches it.
-  # This flake delivers that invariant by:
+  # The repository does not currently include flake.lock. Nix therefore
+  # resolves moving input revisions when this flake is first built. These
+  # outputs are useful for isolated builds, but byte-for-byte reproducibility
+  # across machines is not yet an established property. To establish it,
+  # commit flake.lock and compare independent builds of the same source.
+  # This flake currently:
   #
-  # - Locking nixpkgs at a specific flake.lock rev (pins stdlib + libc).
-  # - Locking the Rust toolchain to the exact version named in
-  #   rust-toolchain.toml (via oxalica/rust-overlay).
-  # - Building each bin with `cargo build --release --locked` under a
-  #   sandboxed Nix derivation (no network, reproducible `CARGO_HOME`).
+  # - Selects the Rust 1.86 channel named in rust-toolchain.toml.
+  # - Uses the committed Cargo.lock for dependency resolution.
+  # - Builds each bin in a Nix derivation.
   #
   # Typical use:
-  #   nix develop            # enter dev shell with the pinned toolchain
+  #   nix develop            # enter dev shell with the Rust 1.86 channel
   #   nix build .#mirage-bridge
   #   nix build .#mirage-client
   #   nix build .#mirage-keygen
   #   nix build .#mirage-rotate
   #
-  # Reproducibility check (run on two machines, expect identical hash):
+  # Build comparison (not a reproducibility guarantee without a flake lock):
   #   nix build .#mirage-bridge && sha256sum result/bin/mirage-bridge
   description = "Mirage — censorship-resistance / anonymization protocol";
 
@@ -41,12 +40,12 @@
           overlays = [ (import rust-overlay) ];
         };
 
-        # Exact toolchain from rust-toolchain.toml. Keeping this
+        # Toolchain channel from rust-toolchain.toml. Keeping this
         # file as the single source of truth means Nix consumers
         # and rustup consumers stay aligned.
         toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
-        # A platform that uses our pinned toolchain for everything.
+        # Use the selected toolchain for Cargo and rustc.
         rustPlatform = pkgs.makeRustPlatform {
           cargo = toolchain;
           rustc = toolchain;
@@ -56,20 +55,15 @@
         commonAttrs = {
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
-          # Reproducibility switches (see `man cargo-config`).
           CARGO_TERM_COLOR = "never";
-          # Deterministic build-id; drop debug info so two builders
-          # with different paths produce the same binary.
-          RUSTFLAGS = "-C debuginfo=0 --remap-path-prefix $PWD=/build/mirage";
-          # Disable incremental so every build is from scratch.
+          # Drop debug info, which can embed build paths. This alone does not
+          # make the output byte-for-byte reproducible.
+          RUSTFLAGS = "-C debuginfo=0";
           CARGO_INCREMENTAL = "0";
-          # --locked refuses any drift from the committed Cargo.lock.
           cargoBuildFlags = [ "--locked" "--release" ];
-          doCheck = false;  # tests run in CI; package builds are
-                             # release-only for speed.
+          doCheck = false;  # Tests run in CI.
           meta = with pkgs.lib; {
             description = "Mirage protocol";
-            homepage = "https://github.com/OWNER/mirage";  # placeholder — set to the real repo
             license = licenses.agpl3Plus;
             platforms = platforms.linux ++ platforms.darwin;
           };
@@ -77,7 +71,7 @@
 
         mkBin = { name, bin ? name, pkg ? "mirage-bridge" }: rustPlatform.buildRustPackage (commonAttrs // {
           pname = name;
-          version = "0.1.0";
+          version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
           cargoBuildFlags = commonAttrs.cargoBuildFlags ++ [ "-p" pkg "--bin" bin ];
         });
       in
@@ -120,8 +114,7 @@
         };
 
         # ------------------------------------------------------------
-        # Dev shell. `nix develop` gives you the exact toolchain the
-        # CI uses, plus handy tools.
+        # Development shell with the Rust 1.86 channel and build tools.
         # ------------------------------------------------------------
         devShells.default = pkgs.mkShell {
           buildInputs = [
@@ -133,24 +126,21 @@
             pkgs.openssl
             pkgs.python3
             pkgs.curl
-            # For CI-local reproducibility checks.
+            # For comparing independent build outputs.
             pkgs.diffoscopeMinimal
           ];
 
-          # Same reproducibility env the packaged builds use — so
-          # `cargo build --release` inside the dev shell produces
-          # the same binary as `nix build`.
+          # Match the package's basic compiler flags in the dev shell.
           shellHook = ''
-            export RUSTFLAGS="-C debuginfo=0 --remap-path-prefix $PWD=/build/mirage"
+            export RUSTFLAGS="-C debuginfo=0"
             export CARGO_INCREMENTAL=0
             echo "mirage dev shell — toolchain: $(rustc --version)"
           '';
         };
 
         # ------------------------------------------------------------
-        # `nix flake check` hooks: fmt + clippy against the pinned
-        # toolchain. Matches .github/workflows/ci.yml so the CI-green
-        # state is reproducible locally.
+        # `nix flake check` currently runs rustfmt only. CI also runs clippy
+        # and the full test suite.
         # ------------------------------------------------------------
         checks = {
           fmt = pkgs.runCommand "mirage-fmt"

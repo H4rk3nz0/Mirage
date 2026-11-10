@@ -1,28 +1,30 @@
 # Security model
 
-Mirage is a framework stack for reaching the open internet from a network that
-tries to stop you. This page states plainly **who it defends against, how, and
-where it stops**. Anti-censorship tools that overpromise get people hurt, so the
-non-goals are as important as the guarantees.
+Mirage is a proxy for networks that restrict access to the open internet. This
+page describes its threat model, controls, and known limits. Its traffic has
+not been shown indistinguishable from a matched real service.
 
 ## Adversaries
 
 | Adversary | Capability | Mirage's stance |
 |---|---|---|
-| **Passive DPI** | Reads every packet on the wire, matches signatures and flow statistics | Primary target. Carriers mimic real protocols byte-for-byte; no Mirage-unique bytes on the wire. |
-| **Active prober** | Connects to a suspected bridge and pokes it to confirm | Defended. A bridge is indistinguishable from its cover service to anyone who can't already prove they hold an invite. |
+| **Passive DPI** | Reads every packet on the wire, matches signatures and flow statistics | Primary target. Some carriers carry valid protocol framing, but a matched real-service indistinguishability result has not been established. |
+| **Active prober** | Connects to a suspected bridge and pokes it to confirm | Invite-gated and forwarded to cover on the Reality path. Indistinguishability is unproven: response timing and cross-arm behavior retain measured differences. |
 | **Censor who holds an invite** | Obtained a real invite (leak, insider, purchased) | Partly defended. Can find and read the rendezvous, but **cannot forge or poison** it, and cannot silently escalate to writing bridge records. |
-| **Malicious bridge operator** | Runs a bridge you connect through | Sees your traffic on a single hop. Use **multi-hop** so no one hop sees both you and your destination. |
-| **Global passive adversary** | Observes both ends of every link at once | **Not defended** - see non-goals. No low-latency system defeats this. |
+| **Malicious bridge operator** | Runs a bridge you connect through | An exit bridge sees destinations and any application traffic that lacks end-to-end encryption. Multi-hop separates client and destination knowledge across operators. |
+| **Global passive adversary** | Observes both ends of every link at once | Not defended; timing and volume can correlate the ends. |
 
 ## What is defended
 
-**Carrier indistinguishability.** Every carrier is built to match a real
-protocol on the wire - Reality is a real TLS 1.3 handshake to a real cover site
-(with a browser-accurate ClientHello, a matching cipher-suite set, and a
-0.5-RTT session ticket like a genuine server issues); WebSocket auth rides in a
-`Cookie`, not a Mirage-shaped subprotocol; QUIC carriers obfuscate to look like
-ordinary QUIC. There is no constant byte pattern that flags "this is Mirage."
+**Carrier mimicry.** The carriers aim to match allowed protocols on the wire.
+Reality sends a TLS 1.3-shaped handshake; WebSocket auth rides in a `Cookie`;
+some QUIC carriers use ordinary QUIC framing. A Firefox ClientHello template
+matches a measured JA3, but that alone does not validate the complete live
+handshake or flow. The Reality probe splice has measured timing and lifecycle
+residuals, and the optional Wu printable prefix is recognizable to a classifier
+stronger than the published exemption it targets. Do not treat these carriers
+as proven indistinguishable from a real service. See [Proteus 2.0](proteus-2.0.md)
+and the [cover-native proposal](cover-native-proposal.md).
 
 **Anti-probe knocks.** Before a Mirage session starts, the client proves it
 belongs. When the operator provisions a per-bridge obfuscation secret (carried
@@ -32,10 +34,10 @@ public key from a discovery record **cannot** mint a valid knock. Without a
 provisioned secret they fall back to a public-key-derived knock (a scanner
 filter, not a secret) and the Reality carrier's stronger anti-probe still holds.
 
-**Unlinkable discovery.** Bridges announce over Nostr, DNS-TXT, and the
-BitTorrent DHT under per-epoch rendezvous points derived from a secret salt, so
-an observer without the invite can neither locate a rendezvous nor cluster an
-operator's announcements across time. The DHT rendezvous uses **Tor-style key
+**Invite-gated discovery.** Bridges announce over Nostr, DNS-TXT, and the
+BitTorrent DHT under per-epoch rendezvous points derived from a secret salt.
+An observer without the invite cannot derive those rendezvous points from the
+public records alone. The DHT rendezvous uses **Tor-style key
 blinding**: the operator holds the write key, and invite-holders can derive the
 per-epoch *read* key (to find and verify the record) but **cannot derive the
 write key** - so a cohort member cannot forge or evict the operator's bridge
@@ -47,7 +49,7 @@ RFC1918/CGNAT/ULA private ranges, and always-forbidden ranges (link-local, the
 cloud-metadata endpoint, multicast). Loopback and private networks are two
 **independent** opt-ins, so enabling one never silently re-admits the other, and
 metadata/link-local is refused regardless. DNS names are resolved once and the
-validated IPs are dialed directly, closing DNS-rebind.
+validated IPs are dialed directly to avoid a second lookup during the dial.
 
 **Multi-hop onion routing.** Chain up to three bridges; each hop authenticates
 with its own single-use capability token and can peel only its own layer, so no
@@ -61,27 +63,27 @@ verifies the certificate chain against the operator key, with a grace window for
 the previous key during rotation. Clients honour signed revocations and drop a
 revoked bridge from their pool.
 
-**Whole-device VPN, fail-closed.** In TUN mode the client installs the OS routes
-that actually capture traffic (a split-default) and a bypass route for each
-bridge IP, and restores them on exit. If it cannot install those routes it
-**refuses to run** rather than bring up an interface that would leak your
-traffic in clear.
+**TUN route installation.** In TUN mode the client installs split-default
+routes and a bypass route for each bridge IP, then restores the previous routes
+on exit. If it cannot install the required routes, it refuses to start TUN
+mode. This check does not cover every DNS or platform routing behavior; see
+the limitations below.
 
 ## What is NOT defended (non-goals)
 
-**A global passive adversary that watches both ends.** If someone can observe
-your link *and* the destination's link simultaneously, packet timing and volume
-correlate the two regardless of how the middle is disguised. No low-latency
-transport (Mirage, Tor, a VPN) defeats this; Mirage does not claim to.
+**A global passive adversary that watches both ends.** An observer of the
+client and destination links can correlate timing and volume. Mirage does not
+claim to prevent this.
 
 **End-to-end traffic-analysis / website fingerprinting.** Padding and
 constant-rate cover raise the cost of flow-shape classifiers but do not make
 flows information-theoretically indistinguishable. Treat shaping as
 defence-in-depth, not a guarantee.
 
-**The bridge you exit through sees your destination.** A single bridge is a
-proxy: it learns where you're going (though logs are anonymized by default). If
-your threat is the bridge operator, use multi-hop.
+**The bridge you exit through sees your destination.** A single bridge learns
+where it connects on your behalf. Client IPs are masked in ordinary logs by
+default, but a live bridge still sees its peers. Use separate operators and
+multi-hop if bridge-side correlation is in your threat model.
 
 **Raw-ciphertext entropy blocking, for obfs-tcp specifically.** The obfs-tcp
 carrier is uniform-random from the first byte with no protocol cover, so a censor

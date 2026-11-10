@@ -37,6 +37,10 @@ pub enum RealityError {
     #[error("x25519 zero point")]
     ZeroPoint,
 
+    /// Operating-system entropy was unavailable while building a ClientHello.
+    #[error("client hello entropy unavailable")]
+    Entropy,
+
     /// Underlying byte-stream I/O failure (TCP, duplex, etc.). Used by
     /// [`crate::carrier`]; the probe layer itself is I/O-free.
     #[error("io: {0}")]
@@ -54,6 +58,7 @@ impl From<RealityError> for mirage_transport::TransportError {
             RealityError::Replay => "replay",
             RealityError::ReplaySetFull => "replay set full",
             RealityError::ZeroPoint => "zero point",
+            RealityError::Entropy => "entropy",
             RealityError::Io(_) => "io",
         })
     }

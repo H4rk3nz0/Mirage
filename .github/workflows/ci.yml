@@ -1,10 +1,5 @@
 name: CI
 
-# Defense-in-depth: CI is load-bearing for the "no regression of any shipped
-# invariant" property. Every check here corresponds to a specific invariant
-# or audit finding. If you add a test locally, it MUST be
-# exercised in CI - local-only green is not green.
-
 on:
   push:
     branches: [main]
@@ -54,13 +49,13 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
       - name: Verify workspace builds (debug)
-        run: cargo build --workspace --all-targets
+        run: cargo build --locked --workspace --all-targets
 
       - name: Run full test suite
-        run: cargo test --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets
 
       - name: Run doctests
-        run: cargo test --workspace --doc
+        run: cargo test --locked --workspace --doc
 
   # ------------------------------------------------------------------
   # Windows TUN (Wintun) build guard. The transparent-VPN device + routing
@@ -90,7 +85,7 @@ jobs:
             target
           key: windows-tun-cargo-${{ hashFiles('Cargo.lock') }}
       - name: cargo check (client with the Wintun TUN backend)
-        run: cargo check -p mirage-client
+        run: cargo check --locked -p mirage-client
 
   # ------------------------------------------------------------------
   # Reproducibility of committed test vectors.
@@ -108,7 +103,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Discovery + Nostr test vectors must pass unchanged
-        run: cargo test -p mirage-discovery --test vectors -- --nocapture
+        run: cargo test --locked -p mirage-discovery --test vectors -- --nocapture
 
   # ------------------------------------------------------------------
   # Lint + format. Zero warnings allowed.
@@ -127,11 +122,20 @@ jobs:
 
       # No GTK/system libs: the GUI now renders via Slint's software backend.
 
+      - name: Validate Actions workflows
+        run: |
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          curl -fsSLo "$RUNNER_TEMP/actionlint.tar.gz" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP/actionlint"
+          "$RUNNER_TEMP/actionlint/actionlint" -color .github/workflows/*.yml
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
       - name: cargo clippy (all warnings = errors)
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   # ------------------------------------------------------------------
   # Security audit of dependency tree.
@@ -152,36 +156,18 @@ jobs:
         # rustc 1.88. Bump this together with the toolchain pin.
         run: cargo install --locked cargo-audit --version 0.22.1
       - name: Audit
-        # Advisories triaged as not-actionable for Mirage (unreachable trigger,
-        # GUI/build-time-only dep, or a fix that exceeds our 1.86 MSRV). The list
-        # is HARDCODED here on purpose: the job must be self-contained and cannot
-        # depend on any file being present/committed at run time. The same IDs,
-        # with full per-advisory rationale, live in `.cargo/audit.toml` for local
-        # `cargo audit` runs — keep the two in sync when you add/remove an entry.
         run: |
-          cargo audit --deny warnings \
-            --ignore RUSTSEC-2026-0009 \
-            --ignore RUSTSEC-2026-0119 \
-            --ignore RUSTSEC-2026-0194 \
-            --ignore RUSTSEC-2026-0195 \
-            --ignore RUSTSEC-2024-0416 \
-            --ignore RUSTSEC-2024-0418 \
-            --ignore RUSTSEC-2024-0420 \
-            --ignore RUSTSEC-2026-0192 \
-            --ignore RUSTSEC-2025-0141 \
-            --ignore RUSTSEC-2026-0097 \
-            --ignore RUSTSEC-2026-0190 \
-            --ignore RUSTSEC-2026-0186 \
-            --ignore RUSTSEC-2024-0436 \
-            --ignore RUSTSEC-2026-0206
+          ignore_ids=$(python3 -c 'import pathlib, tomllib; print(" ".join(tomllib.loads(pathlib.Path(".cargo/audit.toml").read_text())["advisories"]["ignore"]))')
+          read -r -a advisory_ids <<< "$ignore_ids"
+          args=()
+          for id in "${advisory_ids[@]}"; do args+=(--ignore "$id"); done
+          cargo audit --deny warnings "${args[@]}"
 
   # ------------------------------------------------------------------
-  # `unsafe` sweep. We `#![forbid(unsafe_code)]` at every crate root;
-  # this job double-checks that no `unsafe` slipped in via a build-script
-  # or conditional cfg.
+  # Additional scan for unsafe outside the GUI and mobile FFI crates.
   # ------------------------------------------------------------------
   no_unsafe:
-    name: No unsafe code
+    name: No unsafe outside FFI
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -190,13 +176,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Grep for unsafe blocks in Mirage crates
         run: |
-          # `#![forbid(unsafe_code)]` holds for every protocol/crypto crate. Two
-          # crates are excepted because they cross an unavoidable unsafe FFI
-          # boundary: mirage-client-gui (one documented pre_exec PR_SET_PDEATHSIG)
-          # and mirage-mobile-ffi (the JNI + C-ABI surface for Android/iOS). Both
-          # set `#![deny(unsafe_code)]` and scope every `unsafe` block narrowly.
-          # Match real `unsafe` CODE constructs, not the word inside string
-          # literals (e.g. "DNS-unsafe", "private/unsafe next-hop").
+          # The GUI and mobile FFI crates use scoped unsafe for OS interfaces.
           if grep -rnE --include='*.rs' \
                 '\bunsafe[[:space:]]*(\{|fn|impl|trait|extern)' crates/ \
               | grep -v 'crates/client-gui/' \

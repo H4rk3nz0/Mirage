@@ -164,16 +164,12 @@ pub struct CircuitPool<Id: Copy + Eq + Hash + Debug> {
     /// Reverse lookup: id -> class. Lets [`release`] /
     /// [`record_built`] find the entry without scanning every class.
     id_index: HashMap<Id, Class>,
-    /// Counter used to vary jitter across entries deterministically
-    /// in unit tests (and reasonably in production). Each new
-    /// entry's jitter is `(jitter_seq * golden_ratio) mod refresh_jitter`,
-    /// which approximates uniform distribution without an RNG dep.
-    /// Production callers MAY swap in a CSPRNG-backed picker via
-    /// [`CircuitPool::set_jitter_picker`].
+    /// Counter for the injectable deterministic picker used in tests.
+    /// The default production picker draws from the OS CSPRNG.
     jitter_seq: u64,
     /// Jitter picker - produces a `Duration` in `[0, refresh_jitter)`.
-    /// Default is the deterministic golden-ratio mixer; tests pin
-    /// this to zero for reproducibility.
+    /// Default is [`csprng_jitter`]; tests pin this to zero for
+    /// reproducibility.
     jitter_picker: fn(seq: u64, max: Duration) -> Duration,
     policy: PoolPolicy,
 }
@@ -589,22 +585,20 @@ impl<Id: Copy + Eq + Hash + Debug> CircuitPool<Id> {
 
 /// **Default jitter picker** - CSPRNG-backed via `getrandom`.
 ///
-/// Produces a uniform value in `[0, max)` per call. Closes
+/// Produces a value in `[0, max)` per call. Closes
 /// [RT-M1]: pre-fix the default was [`deterministic_jitter`] which
 /// a network-side observer doing fine-grained timing analysis
 /// could in principle reverse-engineer. CSPRNG forecloses that.
 ///
-/// On RNG failure (vanishingly rare; only on a misconfigured
-/// container without `/dev/urandom`) falls back to
-/// [`deterministic_jitter`] rather than panic.
-pub fn csprng_jitter(seq: u64, max: Duration) -> Duration {
+/// On OS CSPRNG failure, abort rather than reveal a deterministic
+/// refresh schedule. This callback cannot return an error through the
+/// current pool API, so the scheduling task panics on entropy failure.
+pub fn csprng_jitter(_seq: u64, max: Duration) -> Duration {
     if max.is_zero() {
         return Duration::ZERO;
     }
     let mut bytes = [0u8; 8];
-    if getrandom::fill(&mut bytes).is_err() {
-        return deterministic_jitter(seq, max);
-    }
+    getrandom::fill(&mut bytes).expect("OS CSPRNG failure: cannot schedule circuit refresh");
     let raw = u64::from_be_bytes(bytes);
     let max_micros = max.as_micros() as u64;
     if max_micros == 0 {
@@ -617,8 +611,7 @@ pub fn csprng_jitter(seq: u64, max: Duration) -> Duration {
 ///
 /// Produces approximately uniform values in `[0, max)` without an
 /// RNG dep. **Not the default** - see [`csprng_jitter`]. Useful
-/// for reproducible test runs and as a fallback when the OS RNG
-/// is unavailable.
+/// for reproducible test runs only.
 pub fn deterministic_jitter(seq: u64, max: Duration) -> Duration {
     if max.is_zero() {
         return Duration::ZERO;

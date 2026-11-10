@@ -1010,22 +1010,28 @@ fn rutube_m3u8(v: &Value) -> Option<Url> {
 
 /// Run an operator's extractor command and take the last URL it prints.
 ///
-/// Deliberately dumb: it runs what it is given through a shell and reads stdout.
-/// The command is operator configuration, exactly like `--url` or `--hls`, and
-/// carries the same trust - anyone who can set it can already run commands.
-/// `yt-dlp -g` prints the video URL and then the audio URL, so the LAST line is
-/// taken; a single-URL extractor is unaffected.
+/// Runs the configured string through the platform shell, so the operator must
+/// trust that command. Some extractors print separate video and audio URLs; the
+/// last HTTP(S) URL on stdout is used.
 fn hls_from_command(cmd: &str) -> io::Result<Url> {
-    let out = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .output()
-        .map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("--hls-cmd could not run (is the extractor installed?): {e}"),
-            )
-        })?;
+    #[cfg(windows)]
+    let mut shell = {
+        let mut shell = std::process::Command::new("cmd.exe");
+        shell.args(["/D", "/C"]);
+        shell
+    };
+    #[cfg(not(windows))]
+    let mut shell = {
+        let mut shell = std::process::Command::new("sh");
+        shell.arg("-c");
+        shell
+    };
+    let out = shell.arg(cmd).output().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("--hls-cmd could not run (is the extractor installed?): {e}"),
+        )
+    })?;
     if !out.status.success() {
         return Err(io::Error::new(
             io::ErrorKind::Other,
@@ -3963,14 +3969,20 @@ mod tests {
     fn an_extractor_command_yields_its_last_url() {
         // `yt-dlp -g` prints the video URL then the audio URL, so the last line
         // is the one to take. Non-URL chatter must not be mistaken for output.
-        let u = hls_from_command(
-            "echo picking best format; echo https://a.test/v.m3u8; echo https://a.test/audio.m3u8",
-        )
-        .expect("command");
+        #[cfg(windows)]
+        let command =
+            "echo picking best format & echo https://a.test/v.m3u8 & echo https://a.test/audio.m3u8";
+        #[cfg(not(windows))]
+        let command =
+            "echo picking best format; echo https://a.test/v.m3u8; echo https://a.test/audio.m3u8";
+        let u = hls_from_command(command).expect("command");
         assert_eq!(u.as_str(), "https://a.test/audio.m3u8");
         // A command that prints nothing usable must fail loudly rather than
         // silently recording from somewhere else.
         assert!(hls_from_command("echo no url here").is_err());
+        #[cfg(windows)]
+        assert!(hls_from_command("exit /b 3").is_err());
+        #[cfg(not(windows))]
         assert!(hls_from_command("exit 3").is_err());
     }
 

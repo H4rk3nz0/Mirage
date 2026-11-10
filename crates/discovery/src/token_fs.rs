@@ -426,10 +426,9 @@ pub fn mint_fs_tokens(
             0u64
         } else {
             let mut jb = [0u8; 8];
-            match getrandom::fill(&mut jb) {
-                Ok(()) => u64::from_le_bytes(jb) % jitter_seconds,
-                Err(_) => 0,
-            }
+            getrandom::fill(&mut jb)
+                .map_err(|_| DiscoveryError::Wire("fs mint: CSPRNG failure"))?;
+            u64::from_le_bytes(jb) % jitter_seconds
         };
         let exp = token_expires_at.saturating_add(jitter);
         out.push(signer.sign_token(tid, bridge_ed25519_pk, exp));

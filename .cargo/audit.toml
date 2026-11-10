@@ -1,11 +1,6 @@
-# cargo-audit configuration - the single source of truth for triaged advisories.
-#
-# Every entry below is an advisory we have assessed as not-actionable for Mirage
-# (unreachable trigger, GUI/build-time-only dep, or an MSRV-blocked fix), with a
-# one-line rationale. cargo-audit auto-discovers this file relative to the CWD,
-# which is brittle across runners/containers, so the CI `audit` job reads this
-# list and passes the IDs as explicit `--ignore` flags (see .github/workflows/ci.yml).
-# A bare local `cargo audit` from the repo root picks them up automatically.
+# Triaged advisory IDs and their rationales. CI reads this list and passes the
+# IDs as explicit --ignore flags; local `cargo audit` discovers this file from
+# the repository root. Review each entry when its dependency or call path changes.
 [advisories]
 ignore = [
     "RUSTSEC-2026-0009",  # time RFC-2822 DoS: patched only in 0.3.47 (needs rustc 1.88 > MSRV); trigger path (RFC 2822 parse of adversary input) is unreachable - we use ASN.1 date parsing, not RFC 2822.

@@ -128,10 +128,13 @@ the FFI surface and each OS's VPN integration, not cross-compilation.
 
 ---
 
-## Reproducible builds (Nix)
+## Nix builds
 
 ```sh
 nix build .#mirage-bridge     # or .#mirage-client, etc.
 ```
 
-The flake pins the same 1.86 toolchain and produces bit-reproducible artifacts.
+The flake selects the Rust 1.86 channel and uses the committed Cargo.lock. This
+archive does not include flake.lock, so Nix inputs can resolve to different
+revisions on different machines. Byte-for-byte reproducibility has not yet been
+demonstrated; commit flake.lock and compare independent builds before relying on it.

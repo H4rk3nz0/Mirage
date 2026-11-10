@@ -122,32 +122,34 @@ repeatedly pushes small ones into deficit without tripping an upward-only guard.
 
 ## Load-bearing measurements
 
-### 1. The capacity statistic is the gap bound
+### 1. Capacity and delay require a service curve
 
-> **High-quantile inter-record gap x offered rate.**
+The earlier claim that a high-quantile inter-record gap times offered rate is the
+decisive capacity statistic was too strong. It measures backlog accumulated in
+*one* silent interval. It cannot establish stability or bound delay. A 900 ms gap
+accumulates ~11 kB at 100 kbps offered and ~340 kB at 3 Mbps, but the subsequent
+service determines whether and when that backlog drains.
 
-Not mean rate, not record-size CV, not duty cycle, not idle fraction. All four rank
-the cover classes differently and all four are wrong.
-
-**Why.** Each rejected proxy summarises the cover's *marginal distribution*. The
-binding constraint is a property of the *tunnel's queue*: during a gap the tunnel
-cannot transmit while the application keeps offering, so by Little's law delay is
-bounded iff the gap is bounded — regardless of rate. Mean rate and idle fraction are
-integrals over a distribution whose tail is the entire story.
-
-The quantity is a **product of two measured values** and no single time constant can
-express it: a 900 ms gap absorbs ~11 kB at 100 kbps offered and ~340 kB at 3 Mbps.
+Measure usable slot bytes cumulatively as `S(t)`. For admitted arrivals `A(t)`,
+the largest positive difference between arrivals and service over any window
+governs backlog: `Q(t) = max(0, sup_{u <= t} [A(t)-A(u) - (S(t)-S(u))])`.
+Long-run offered rate must be below long-run usable service rate; short-window
+service deficits determine completion-time tails. Little's law relates mean
+backlog to mean delay *after* stability is established. Gap quantiles, mean rate,
+duty cycle and size variance are each incomplete summaries. See
+`cover-scheduling.md` for the corrected analysis.
 
 **PROVISIONAL — cover-class numbers.** A 60-cell matrix (5 reps, 2 players, 3 buffer
 settings) gives worst-case gap by class: browse **95.6 ms**, live audio **338.8 ms**,
 segmented video **~10 s**. The gap bound for segmented video is set by segment
 duration and is unchanged by player or buffer depth across six cells. Earlier figures
 in `cover-scheduling.md` were taken with a defective tap and are marked provisional
-pending re-take; the Little's law argument does not depend on them.
+pending re-take. These numbers alone do not establish queueing performance.
 
-**`GAP_QUANTILE = 0.99` is wrong for segmented video** by 3-4 orders of magnitude —
-its gap distribution is bimodal and p99 sits inside the fast mode. Documented at the
-constant. Not fixed.
+**The former `GAP_QUANTILE = 0.99` missed segmented-video stalls** by 3-4 orders
+of magnitude: p99 landed inside the fast mode of a bimodal distribution. The
+runtime now uses the measured maximum as a conservative interim input to its
+bounded receive-buffer control. This does not replace service-curve admission.
 
 ### 2. Cover-host choice is a latency decision
 
@@ -235,23 +237,27 @@ own shortfalls rather than leave them in a document nobody reads next.
 
 ### Structural gaps — the ones that bound what 2.0 can claim
 
-**Constant rate. The square-root law is not addressed.** Under a divergence budget,
-covert capacity grows as `sqrt(2*epsilon*N / I)` while a constant-rate channel accumulates
-evidence *linearly*. A constant-rate covert channel is therefore asymptotically
-detectable by construction, and the correct rate law is `r(t) ∝ 1/sqrt(I*t)` —
-sessions should get quieter as they age. 2.0 replays at the capture's rate for as long
-as the session lasts. **This is a structural property, not a tuning issue**: no amount
-of envelope fidelity fixes it, and it caps how long a single session should be trusted
-to run. Nothing in 2.0 measures or bounds that horizon.
+**Long-session detectability remains unmeasured.** The prior text applied a
+square-root covert-capacity law universally and prescribed `r(t) ∝ 1/sqrt(I*t)`.
+That conclusion does not follow for payload that replaces padding in a schedule
+independent of demand: if the observable cover distribution is identical with
+and without payload, payload adds no wire divergence and positive linear capacity
+is possible. Square-root laws require particular innocent/active channel models.
+Here the unresolved question is whether Mirage's *cover process* (including
+handshake, duration, congestion response and replay) matches genuine traffic.
+An imposed age-dependent rate decay would itself need a real-cover baseline and
+could be a fingerprint. No long-session detection horizon has been measured.
 
-**Repetition is unsolved, and cannot be solved by collecting more traces.** With `n`
-traces and `m` observed flows, collision probability is `1 - exp(-m^2/2n)`; holding it
-under delta requires `n >~ m^2/2delta`, which at m=10³ and delta=0.01 is **5x10⁷ traces**. No
-achievable library reaches that. The intended fix is to make the replay distribution
-*continuous* by kernel-smoothing the empirical measure with the cover's own measured
-jitter — replaying structure verbatim while smoothing only continuous parameters. 2.0
-does verbatim replay with **no smoothing at all**, so a sufficiently patient observer
-sees the same trace twice.
+**Repetition is unsolved.** If `m` flows draw independently *with replacement*
+from `n` traces, their approximate collision probability is
+`1 - exp(-m(m-1)/(2n))`; at `m=10^3` and a 0.01 collision target this needs about
+`5x10^7` traces. Sampling *without* replacement avoids exact collisions until
+the pool is exhausted, so the quadratic figure is not a universal lower bound.
+It does not solve long-running operation or make a small empirical pool match a
+real population. The intended research path is to test whether smoothing
+continuous parameters by measured natural jitter preserves the joint cover
+distribution. 2.0 still replays a finite library verbatim, so repeated traces
+remain a cross-session signal.
 
 **The intrinsic dimension of the trace manifold was never estimated, and it decides
 whether smoothing can work at all.** The smoothing bandwidth is bounded above by
@@ -262,13 +268,15 @@ smoothed replay cannot work for any achievable library — which would mean aban
 this architecture for a structural generative model. **That measurement has not been
 made, so it is not known whether the repetition fix above is even available.**
 
-**The model-error floor `D0` is unbounded.** Total evidence is `N*(D0 + D_payload)`
-where `D0` is irreducible mismatch — recorder artefacts, staleness, protocol-version
-differences. `D0` does not shrink with pool size, smoothing, or rate reduction, and
-once it dominates, detection time is set by model error alone and the entire shaping
-apparatus is irrelevant. 2.0 improves several contributors to `D0` (real browser
-captures, a capture-derived fingerprint, joint direction sourcing) without ever
-measuring the floor, so there is no evidence about whether shaping is the binding
+**The model-error floor is unmeasured.** Recorder artefacts, staleness, and
+protocol-version differences can persist even when payload demand does not
+affect the schedule. For a sequence of observations, total KL divergence is
+the sum of *conditional* divergences given the preceding observations; it is
+not generally `N*(D0 + D_payload)`. Replay dependencies can make the joint
+test stronger or weaker than an independent-window extrapolation. 2.0 improves
+several possible contributors (real browser captures, a capture-derived
+fingerprint, joint direction sourcing) without measuring the real-versus-tunnel
+joint distribution, so there is no evidence that shaping is the binding
 constraint.
 
 ### Workstream status against the plan
@@ -314,8 +322,7 @@ table above, at n=5 from one network position.
 
 **Implemented but off.** Deficit permutation, pending the `W` sweep.
 
-**Known wrong, not fixed.** `GAP_QUANTILE` for bimodal classes, documented at the
-constant. Cover-host RTT proximity is a recommendation with no startup check.
+**Known wrong, not fixed.** Cover-host RTT proximity is a recommendation with no startup check.
 `CYCLE_GAP = 0.05` in `refill_replay` is a hand-picked timing value inserted at the
 replay wrap — the same defect class as the inter-flow gap removed from `from_csv`
 this release, flagged at the site and tracked for 2.1 because changing replay timing

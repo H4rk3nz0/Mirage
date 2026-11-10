@@ -167,7 +167,7 @@ impl Rfc2136Publisher {
             .set_query_type(RecordType::SOA);
 
         let mut msg = Message::new();
-        msg.set_id(rand_u16())
+        msg.set_id(rand_u16()?)
             .set_message_type(MessageType::Query)
             .set_op_code(OpCode::Update)
             .set_recursion_desired(false);
@@ -251,10 +251,12 @@ impl Rfc2136Publisher {
 }
 
 /// A message ID that does not depend on the `rand` crate's presence here.
-fn rand_u16() -> u16 {
+/// Never publish with a predictable ID if the OS CSPRNG is unavailable.
+fn rand_u16() -> Result<u16, Rfc2136Error> {
     let mut b = [0u8; 2];
-    getrandom::fill(&mut b).unwrap_or(());
-    u16::from_le_bytes(b)
+    getrandom::fill(&mut b)
+        .map_err(|_| Rfc2136Error::Proto("DNS update ID entropy unavailable".into()))?;
+    Ok(u16::from_le_bytes(b))
 }
 
 #[async_trait]

@@ -56,21 +56,23 @@ replay set; clients honour signed **revocations** and drop revoked bridges.
 
 ## Carrier layer
 
-A carrier's only job is to move an opaque byte stream while looking like
-something else on the wire. The contract is the `ClientTransport` trait (dial ->
-duplex stream); the session layer rides inside.
+A carrier moves an opaque byte stream under a chosen wire protocol. The
+current contract is the `ClientTransport` trait (dial -> duplex stream); the
+session layer rides inside. That abstraction also hides independent QUIC
+stream progress, which limits a future high-throughput H3 carrier.
 
-- **Reality** performs a *real* TLS 1.3 handshake to a *real* cover site: a
-  browser-accurate ClientHello (matching JA3/JA4, a cipher-suite set where every
-  offered ECDHE suite is also negotiable, and a 0.5-RTT NewSessionTicket like a
-  genuine server issues), a real ServerHello/Certificate/Finished flight
-  size-matched to the cover. An unauthenticated prober is transparently
-  forwarded to the cover and sees exactly the cover's TLS.
-- **WebSocket** is a browser-accurate Upgrade; the pre-session auth token rides
+- **Reality** sends a TLS-shaped handshake using a captured Firefox JA3 and
+  a corrected production extension order. Its full ClientHello and JA4 have
+  not been validated against a current browser capture. The bridge uses an
+  invite-key verification branch and a cover-matched response flight. An
+  unauthenticated prober can be forwarded to the cover, but measured timing
+  and connection-lifecycle differences remain.
+- **WebSocket** uses an HTTP Upgrade; the pre-session auth token rides
   in a `Cookie` (where a long opaque value is ordinary), not in a Mirage-shaped
   subprotocol.
-- **QUIC carriers** (Hysteria2, MASQUE/H3) obfuscate datagrams to pass as
-  ordinary QUIC.
+- **QUIC carriers** (Hysteria2, MASQUE/H3) use QUIC transport paths, with
+  optional datagram obfuscation. An obfuscated datagram is not thereby a
+  valid ordinary QUIC packet; native QUIC cover needs separate validation.
 - **meek / DoH** domain-front through a CDN. **dnstt** tunnels over DNS.
 - **obfs-tcp** is the lightest carrier: uniform-random bytes, no cover (see the
   security model's note on entropy blocking).
@@ -106,9 +108,10 @@ the destination.
 
 ## What Mirage changes vs. the protocols it borrows
 
-- **Reality** (vs. the original): browser-accurate ClientHello *and* a matching
-  negotiable cipher set and session-ticket behaviour, plus an epoch-ratcheted
-  anti-probe MAC so a leaked public key doesn't enable bridge enumeration.
+- **Reality** (vs. the original): additional ClientHello templating,
+  cipher-set and session-ticket handling, plus an epoch-ratcheted anti-probe
+  MAC. Full browser fidelity and real-cover probe equivalence remain open
+  measurement questions.
 - **Discovery** (vs. Tor bridges / static lists): no directory; per-epoch,
   salt-gated, key-blinded rendezvous across three independent channels.
 - **Session** (vs. a plain Noise tunnel): ML-KEM hybrid, time-ratcheted frames,

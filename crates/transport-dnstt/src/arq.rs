@@ -61,15 +61,11 @@ pub struct Packet {
 
 impl Packet {
     /// Serialize to raw bytes (used verbatim for downstream TXT payloads).
-    pub fn encode(&self) -> Vec<u8> {
+    /// Returns `None` if the OS CSPRNG cannot provide a fresh header nonce.
+    pub fn encode(&self) -> Option<Vec<u8>> {
         // Random per-packet nonce (breaks the fixed base32 run at handshake time).
         let mut nonce = [0u8; HEADER_NONCE_LEN];
-        // A failed CSPRNG must not send a predictable-nonce packet: fall back to a
-        // best-effort seed from the mutable header so at least seq/ack vary it.
-        if getrandom::fill(&mut nonce).is_err() {
-            let s = self.seq ^ self.ack ^ self.session;
-            nonce.copy_from_slice(&s.to_be_bytes()[..HEADER_NONCE_LEN]);
-        }
+        getrandom::fill(&mut nonce).ok()?;
         let ks = header_keystream(&nonce);
 
         // Plaintext 13-byte header, then XOR with the keystream.
@@ -87,7 +83,7 @@ impl Packet {
         out.extend_from_slice(&hdr);
         // `data` carries the already-encrypted Mirage session bytes (high entropy).
         out.extend_from_slice(&self.data);
-        out
+        Some(out)
     }
 
     /// Parse from raw bytes. Returns `None` if shorter than the header.
@@ -116,9 +112,9 @@ impl Packet {
     /// Pack an upstream packet into a DNS query name under `tunnel_domain`:
     /// `base32(packet)` split into <=63-char labels, then the domain. Returns
     /// `None` if the resulting name would exceed the 255-byte DNS limit (caller
-    /// must send less `data`).
+    /// must send less `data`) or the OS CSPRNG cannot fill the header nonce.
     pub fn to_query_name(&self, tunnel_domain: &str) -> Option<String> {
-        let b32 = base32_encode(&self.encode());
+        let b32 = base32_encode(&self.encode()?);
         let mut name = String::with_capacity(b32.len() + 1 + tunnel_domain.len() + 4);
         // Split the base32 blob into <=63-char labels.
         let bytes = b32.as_bytes();
@@ -178,7 +174,7 @@ mod tests {
             flags: FLAG_SYN,
             data: b"hello dns tunnel".to_vec(),
         };
-        assert_eq!(Packet::decode(&p.encode()).unwrap(), p);
+        assert_eq!(Packet::decode(&p.encode().unwrap()).unwrap(), p);
     }
 
     #[test]
@@ -190,7 +186,7 @@ mod tests {
             flags: 0,
             data: Vec::new(),
         };
-        let d = Packet::decode(&p.encode()).unwrap();
+        let d = Packet::decode(&p.encode().unwrap()).unwrap();
         assert_eq!(d, p);
         assert!(d.data.is_empty());
     }

@@ -185,6 +185,7 @@ mod tests {
     }
 
     // The C ABI version string must be NUL-terminated and match the crate.
+    #[cfg(unix)]
     #[test]
     fn cabi_version_matches() {
         let ptr = super::cabi::mirage_vpn_version();

@@ -7,16 +7,11 @@ use std::time::Duration;
 /// `WINDOW_UPDATE`. 64 KiB matches HTTP/2's default.
 pub const DEFAULT_INITIAL_WINDOW: u32 = 65536;
 
-/// Default cap on concurrent open streams per direction. A
-/// well-behaved client opens 6-32 streams in normal browsing; the
-/// 256 default leaves generous headroom while bounding the
-/// per-connection state cost (each stream has a small ring buffer
-/// + state machine).
+/// Default cap on concurrent open streams per connection.
 pub const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 256;
 
-/// Default per-stream idle timeout. A stream with no DATA flowing
-/// in either direction for this duration is RESET to free the
-/// state.
+/// Reserved per-stream idle timeout. The connection driver does not currently
+/// enforce this value.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Default cap on the per-connection outbound frame queue. The
@@ -24,33 +19,16 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// driver to drain; without a cap, a peer that sends many
 /// `Begin`s while the driver stalls (or a local app that calls
 /// `send_data` far faster than the wire can flush) would let the
-/// queue grow unboundedly. 1024 frames at 4 KiB body cap is
-/// ~4 MiB worst case - enough headroom for normal bursts, small
-/// enough to enforce backpressure long before the process OOMs.
+/// queue grow unboundedly. 1024 frames at the 16 KiB frame cap is
+/// ~16 MiB per connection at worst; pooled connections multiply that
+/// bound. The cap enforces backpressure before the queue grows further.
 pub const DEFAULT_MAX_PENDING_OUTBOUND: usize = 1024;
 
-/// Bytes of credit each stream gets per deficit-round-robin round when the
-/// outbound queue is drained.
-///
-/// The outbound queue used to be drained strictly FIFO, so a bulk transfer that
-/// enqueued a run of full-size frames put every interactive stream behind all of
-/// them. Under a paced carrier the service rate is fixed by the cover envelope,
-/// so that head-of-line delay is not absorbed by a fast link - it is the
-/// difference between a usable tunnel and one where a page load stalls behind a
-/// download.
-///
-/// **This is free on the wire.** Which stream's bytes fill a frame is inside the
-/// AEAD; the emitted record sizes and timings are byte-identical either way. It
-/// is one of the few changes available that costs exactly zero divergence.
-///
-/// 4 KiB matches the frame body cap, so a stream sending full-size frames makes
-/// one frame of progress per round and small interactive writes interleave
-/// between them.
+/// Bytes of credit per stream per deficit-round-robin round. A full 16 KiB
+/// frame needs four rounds; a small frame can pass in the first.
 pub const DEFAULT_DRR_QUANTUM_BYTES: usize = 4096;
 
-/// Configurable per-mux-connection policy. Apply via
-/// [`crate::stream::StreamId::new`] consumers and the connection
-/// driver (v0.2 will host the driver).
+/// Configurable per-mux-connection policy.
 #[derive(Debug, Clone)]
 pub struct MuxPolicy {
     /// Initial flow-control credit per stream direction. Both
@@ -60,8 +38,7 @@ pub struct MuxPolicy {
     /// Maximum concurrent open streams. Requests over the cap
     /// receive a `RESET` with error code `0x02` (resource-exhausted).
     pub max_concurrent_streams: u32,
-    /// Per-stream idle timeout. Implementations track last-DATA
-    /// time and reset on overrun.
+    /// Reserved; the current connection driver does not enforce idle timeouts.
     pub stream_idle_timeout: Duration,
     /// Max pending outbound frames before the state machine
     /// applies backpressure. See [`DEFAULT_MAX_PENDING_OUTBOUND`].

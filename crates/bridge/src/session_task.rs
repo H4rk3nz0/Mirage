@@ -302,8 +302,17 @@ where
 {
     /// Construct.
     pub fn new(session: SessionStream<S>, executor: Arc<E>, config: SessionTaskConfig) -> Self {
-        let state = BridgeCircuitState::new(config.policy.clone());
-        Self {
+        Self::try_new(session, executor, config).expect("OS CSPRNG required for circuit IDs")
+    }
+
+    /// Construct, returning an error if the circuit ID seed cannot be drawn.
+    pub fn try_new(
+        session: SessionStream<S>,
+        executor: Arc<E>,
+        config: SessionTaskConfig,
+    ) -> Result<Self, getrandom::Error> {
+        let state = BridgeCircuitState::try_new(config.policy.clone())?;
+        Ok(Self {
             state,
             session,
             executor,
@@ -315,7 +324,7 @@ where
             rv_handle: 0,
             rv_rx: None,
             rv_circuits: std::collections::HashSet::new(),
-        }
+        })
     }
 
     /// Attach hidden-service rendezvous routing to this session.

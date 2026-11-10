@@ -427,10 +427,10 @@ impl RecordShaper {
     /// Production split: draws CSPRNG entropy and returns the sub-record lengths.
     /// Draws a generous seed so the CDF sampler has independent entropy per
     /// sub-record (the fixed policy uses only the first few bytes).
-    pub fn split_plan(&mut self, pt_len: usize) -> Vec<usize> {
+    pub fn split_plan(&mut self, pt_len: usize) -> Result<Vec<usize>, getrandom::Error> {
         let mut buf = [0u8; 32];
-        let _ = getrandom::fill(&mut buf);
-        self.split_plan_with_entropy(pt_len, &buf)
+        getrandom::fill(&mut buf)?;
+        Ok(self.split_plan_with_entropy(pt_len, &buf))
     }
 
     /// Stateful split with caller-supplied `entropy` (the deterministic core of
@@ -1107,7 +1107,7 @@ mod tests {
         // record-size run isn't reset every write.
         let mut s = RecordShaper::from_markov_profile(&MarkovProfile::browser_https());
         // Bulk write leaves state on the max bucket.
-        let _ = s.split_plan(40_000);
+        let _ = s.split_plan(40_000).unwrap();
         assert!(
             s.markov_state.is_some(),
             "state persists after a Markov split"

@@ -40,28 +40,10 @@ use crate::target::{MuxTarget, TargetError};
 use std::collections::{HashMap, VecDeque};
 use thiserror::Error;
 
-/// Interleave queued frames fairly across streams, deficit round-robin.
-///
-/// WHY
-///
-/// The outbound queue is a single FIFO, so a bulk transfer that enqueues a run of
-/// full-size frames puts every other stream behind all of them. On an ordinary
-/// link the delay is absorbed; under a PACED carrier the service rate is fixed by
-/// the cover envelope, so head-of-line blocking is the difference between a
-/// usable tunnel and one where a page load stalls behind a download.
-///
-/// This is one of the very few changes that costs **exactly zero divergence**:
-/// which stream's bytes fill a frame is inside the AEAD, so the emitted record
-/// sizes and timings are byte-identical either way. Only the choice of which
-/// queued byte fills a given token changes.
-///
-/// INVARIANT: order WITHIN a stream is preserved exactly. Reordering across
-/// streams is free, but `Begin` must precede that stream's `Data` and `EndLocal`
-/// must follow it - so frames are grouped per stream, each group stays in queue
-/// order, and only the interleaving of groups changes.
-///
-/// Control frames (empty body) are charged 1 byte rather than 0 so a stream
-/// cannot emit an unbounded run of them within one round.
+/// Interleave queued frames across streams without changing order within each
+/// stream. Control frames cost one byte of deficit so they cannot form an
+/// unbounded zero-cost run. On paced carriers, this reduces bulk head-of-line
+/// blocking before frames enter the pacer FIFO.
 fn deficit_round_robin(frames: Vec<MuxFrame>, quantum: usize) -> Vec<MuxFrame> {
     // quantum 0 restores strict FIFO; <2 frames has no ordering to change.
     if quantum == 0 || frames.len() < 2 {
@@ -221,6 +203,11 @@ pub struct MuxState {
     streams: HashMap<u32, Stream>,
     id_allocator: StreamIdAllocator,
     outbound: VecDeque<MuxFrame>,
+    /// Frame counts per stream still waiting in `outbound`. A newly arriving
+    /// stream marks the retained queue for another DRR pass; repeated drains of
+    /// an unchanged bulk queue can then pop from the front in O(1) per frame.
+    outbound_counts: HashMap<u32, usize>,
+    outbound_order_dirty: bool,
     /// Count of streams currently in any non-Closed state.
     open_count: u32,
 }
@@ -234,6 +221,8 @@ impl MuxState {
             policy,
             streams: HashMap::new(),
             outbound: VecDeque::new(),
+            outbound_counts: HashMap::new(),
+            outbound_order_dirty: false,
             open_count: 0,
         }
     }
@@ -248,6 +237,10 @@ impl MuxState {
                 self.policy.max_pending_outbound,
             ));
         }
+        if !self.outbound.is_empty() && !self.outbound_counts.contains_key(&frame.stream_id) {
+            self.outbound_order_dirty = true;
+        }
+        *self.outbound_counts.entry(frame.stream_id).or_default() += 1;
         self.outbound.push_back(frame);
         Ok(())
     }
@@ -607,7 +600,38 @@ impl MuxState {
     /// inner session.
     pub fn pending_outbound(&mut self) -> Vec<MuxFrame> {
         let drained: Vec<MuxFrame> = self.outbound.drain(..).collect();
+        self.outbound_counts.clear();
+        self.outbound_order_dirty = false;
         deficit_round_robin(drained, self.policy.drr_quantum_bytes)
+    }
+
+    /// Drain at most `max_bytes` of complete frames, leaving the rest eligible
+    /// for another fairness pass when new streams arrive. One oversized frame is
+    /// still returned to guarantee progress.
+    pub fn pending_outbound_bounded(&mut self, max_bytes: usize) -> Vec<MuxFrame> {
+        if self.outbound_order_dirty {
+            let drained: Vec<MuxFrame> = self.outbound.drain(..).collect();
+            self.outbound = deficit_round_robin(drained, self.policy.drr_quantum_bytes).into();
+            self.outbound_order_dirty = false;
+        }
+        let mut selected = Vec::new();
+        let mut used = 0usize;
+        while let Some(front) = self.outbound.front() {
+            let size = front.wire_size();
+            if !selected.is_empty() && used.saturating_add(size) > max_bytes {
+                break;
+            }
+            let frame = self.outbound.pop_front().expect("front exists");
+            used += size;
+            if let Some(count) = self.outbound_counts.get_mut(&frame.stream_id) {
+                *count -= 1;
+                if *count == 0 {
+                    self.outbound_counts.remove(&frame.stream_id);
+                }
+            }
+            selected.push(frame);
+        }
+        selected
     }
 
     /// Number of frames currently waiting in the outbound queue.
@@ -744,6 +768,27 @@ mod tests {
         // The small stream goes first - it fits inside one quantum while the
         // large one is still accumulating.
         assert_eq!(out[0].stream_id, 3);
+    }
+
+    #[test]
+    fn late_interactive_frame_overtakes_retained_bulk() {
+        let mut state = MuxState::new(StreamRole::Initiator, MuxPolicy::default());
+        let bulk_body = MAX_MUX_FRAME_LEN - MUX_HEADER_LEN;
+        for _ in 0..4 {
+            state.enqueue(data(1, bulk_body)).unwrap();
+        }
+
+        let first = state.pending_outbound_bounded(MAX_MUX_FRAME_LEN);
+        assert_eq!(first.len(), 1, "only one full bulk frame is committed");
+        assert_eq!(state.outbound.len(), 3);
+
+        // This frame did not exist during the first drain. Re-run DRR over the
+        // retained queue, so it can use the next batch before the bulk tail.
+        state.enqueue(data(3, 40)).unwrap();
+        let second = state.pending_outbound_bounded(MAX_MUX_FRAME_LEN);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].stream_id, 3);
+        assert_eq!(state.outbound.len(), 3, "bulk frames remain queued");
     }
 
     /// A single stream must come back untouched - no cost, no reordering.

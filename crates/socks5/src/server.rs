@@ -364,13 +364,6 @@ where
     // req_hdr[2] is RSV, ignored per spec.
     let atyp = req_hdr[3];
 
-    if cmd != CMD_CONNECT {
-        send_reply(stream, REP_CMD_NOT_SUPPORTED, &anywhere())
-            .await
-            .ok();
-        return Err(Socks5Error::UnsupportedCommand(cmd));
-    }
-
     let target = match atyp {
         ATYP_IPV4 => {
             let mut a = [0u8; 4];
@@ -413,6 +406,15 @@ where
             return Err(Socks5Error::UnsupportedAddressType(atyp));
         }
     };
+    // Consume a complete request before closing on an unsupported command.
+    // Dropping a TCP socket with unread address bytes can reset the connection
+    // and discard this reply on Windows.
+    if cmd != CMD_CONNECT {
+        send_reply(stream, REP_CMD_NOT_SUPPORTED, &anywhere())
+            .await
+            .ok();
+        return Err(Socks5Error::UnsupportedCommand(cmd));
+    }
     Ok(target)
 }
 
@@ -696,9 +698,25 @@ mod tests {
         c.write_all(&[VERSION, CMD_BIND, 0, ATYP_IPV4, 127, 0, 0, 1, 0x00, 0x50])
             .await
             .unwrap();
-        let mut r = [0u8; 4];
+        let mut r = [0u8; 10];
         c.read_exact(&mut r).await.unwrap();
-        assert_eq!(r[1], REP_CMD_NOT_SUPPORTED);
+        assert_eq!(
+            r,
+            [
+                VERSION,
+                REP_CMD_NOT_SUPPORTED,
+                0,
+                ATYP_IPV4,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+            ]
+        );
+        let mut tail = [0u8; 1];
+        assert_eq!(c.read(&mut tail).await.unwrap(), 0);
     }
 
     #[tokio::test]

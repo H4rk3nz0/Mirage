@@ -556,10 +556,23 @@ async fn write_pump(
         }
         let deadline = base + Duration::from_secs_f64(tok.t.max(0.0));
         if deadline > Instant::now() {
-            // A close nudge interrupts the sleep so shutdown flushes promptly.
-            tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => {}
-                _ = notify.notified() => {}
+            // Shutdown may stop an already-drained carrier promptly, but must
+            // never advance a token that still has queued application bytes.
+            // Otherwise the application's close time changes the wire schedule.
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    _ = notify.notified() => {
+                        let drained_and_closed = {
+                            let s = shared.lock().unwrap();
+                            s.closed && s.buf.is_empty()
+                        };
+                        if drained_and_closed {
+                            let _ = wh.shutdown().await;
+                            return;
+                        }
+                    }
+                }
             }
         }
 
@@ -645,28 +658,8 @@ pub struct PacedChannel {
 }
 
 impl PacedChannel {
-    /// Wrap `inner` (the carrier stream, with record passthrough enabled so one
-    /// frame maps to one record) and spawn the write pump driven by `stream` (a
-    /// generative or replay [`ScheduleStream`]). `dir` is this side's write direction
-    /// (client -> `Up`, bridge -> `Down`). `carrier` names the framing `inner` adds
-    /// per record, which is what the pump sizes its frames against.
-    /// Wrap `inner` and drive it from ONE carrier of a heterogeneous set.
-    ///
-    /// This is the live-path entry point for the multi-carrier work. The caller
-    /// holds the [`HeteroCarrierSet`](crate::pacer::HeteroCarrierSet) for the
-    /// session, asks it for the carriers serving a stream's class, and spawns one
-    /// `PacedChannel` per carrier.
-    ///
-    /// Every contract the carrier model pins survives this call, because the
-    /// schedule is passed as DATA and the channel adds no inputs of its own:
-    ///
-    /// - no ambient clock enters here - the write pump paces off the schedule's
-    ///   own instants, exactly as it does for any other `ScheduleStream`;
-    /// - backpressure on `inner` cannot reach the schedule, because the schedule
-    ///   is fully determined before the first byte moves;
-    /// - the carrier is chosen by the stream's class, which
-    ///   [`ClassifiedStream`](crate::pacer::ClassifiedStream) fixes at accept and
-    ///   offers no way to change.
+    /// Wrap one carrier stream using its captured schedule. Callers must choose
+    /// the carrier and schedule independently of application queue depth.
     pub fn spawn_for_carrier<S>(
         inner: S,
         schedule: &crate::pacer::CarrierSchedule,
@@ -690,8 +683,7 @@ impl PacedChannel {
     ///
     /// `dir` is this side's write direction (client -> `Up`, bridge -> `Down`).
     /// `carrier` names the framing `inner` adds per record, which is what the pump
-    /// sizes its frames against. For the multi-carrier path use
-    /// [`Self::spawn_for_carrier`], which supplies the stream from a capture.
+    /// sizes its frames against.
     pub fn spawn<S>(inner: S, stream: ScheduleStream, dir: Dir, carrier: Carrier) -> Self
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -873,11 +865,15 @@ impl AsyncWrite for PacedChannel {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        {
+        let newly_closed = {
             let mut s = this.shared.lock().unwrap();
+            let was_open = !s.closed;
             s.closed = true;
+            was_open
+        };
+        if newly_closed {
+            this.notify.notify_one();
         }
-        this.notify.notify_one();
         // Await the pump: it flushes the residual on-schedule, then closes the
         // carrier write half.
         match this.pump.as_mut() {
@@ -1450,17 +1446,15 @@ pub fn tiled_direction(csv: &str) -> Option<(bool, usize)> {
     None
 }
 
-/// The configured cover's sustainable UPSTREAM rate, bytes/sec.
+/// The configured cover's scheduled UPSTREAM wire rate, bytes/sec.
 ///
-/// This is `μ` — the service rate the tunnel actually has, fixed by the envelope
-/// rather than by the link. Exposed as a value for the same reason
-/// [`crate::pacer::ScheduleStream::replay_position`] is: a caller that needs the
-/// rate must read the schedule's real one, not a config constant. The two agree
-/// right up until the trace varies, which is exactly when the number matters.
+/// This is the sum of captured record sizes over the replay span, not the exact
+/// service rate for application payload. Carrier, pacer, session, and mux framing
+/// consume part of each slot, and a stalled carrier can drop slots.
 ///
-/// Callers should throttle to `ρ_max · μ`, not `μ`. Queue delay is `ρ/(μ(1−ρ))`:
-/// at ρ=0.85 that is ~5.7/μ, at ρ=0.95 it is ~19/μ and climbing. The last 15% of
-/// nominal capacity costs roughly 3× the latency and cannot be sustained anyway.
+/// Callers use a conservative fraction of this as an admission heuristic. Replay
+/// is bursty, so a mean rate or an M/M/1 formula cannot bound its queue delay;
+/// short-window deficits against the usable service curve determine backlog.
 #[must_use]
 pub fn cover_upstream_bps() -> Option<f64> {
     let (mode, profile, profile_up) = pace_settings();
@@ -1476,17 +1470,12 @@ pub fn cover_upstream_bps() -> Option<f64> {
 
 /// The configured cover's UPSTREAM inter-record gap at a quantile, in seconds.
 ///
-/// This is the statistic that actually bounds a tunnel's queue delay, and it is
-/// the only one of five candidates that survived measurement. Record-size CV,
-/// mean rate, duty cycle and idle fraction were each measured across four real
-/// cover classes and each ranked them differently - see
-/// `docs/proteus-2.0.md`. They are all statements about the cover's
-/// DISTRIBUTION; the gap bound is a statement about the tunnel's QUEUE, which is
-/// what a user experiences. Buffered video and segmented HLS have similar idle
-/// fractions (94% vs 81%) and worst gaps of 15 s versus 0.9 s.
-///
-/// Quantile rather than max: the maximum is one observation and would size every
-/// buffer for an outlier.
+/// This describes one feature of the recorded schedule. A gap alone cannot
+/// bound backlog or delay: the service available after the gap determines when
+/// queued bytes drain. The client currently requests the maximum (quantile
+/// 1.0) as a conservative, bounded receive-buffer heuristic because p99 misses
+/// rare periodic pauses in segmented video. See `docs/proteus-2.0.md` for the
+/// full service-deficit model needed to reason about capacity and delay.
 #[must_use]
 pub fn cover_gap_secs(quantile: f64) -> Option<f64> {
     let (mode, profile, profile_up) = pace_settings();
@@ -1496,9 +1485,15 @@ pub fn cover_gap_secs(quantile: f64) -> Option<f64> {
         Some(up) => merge_directional(&down, &up),
         None => down,
     };
+    upstream_gap_secs(&csv, quantile)
+}
+
+/// Pure gap extractor so the rare, long pauses in a bimodal trace can be
+/// tested without mutating process-global pacing settings.
+fn upstream_gap_secs(csv: &str, quantile: f64) -> Option<f64> {
     // Concatenated: the raw chain restarts t at every trace boundary, so a seam
     // would read as a negative gap and the whole chain as one trace's span.
-    let rows = concat_flows(parse_rows(&csv));
+    let rows = concat_flows(parse_rows(csv));
     let mut gaps: Vec<f64> = Vec::new();
     let mut prev: Option<f64> = None;
     for &(t, _, _) in rows.iter().filter(|(_, _, d)| *d < 0) {
@@ -2023,6 +2018,20 @@ where
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn maximum_gap_detects_rare_periodic_video_pause() {
+        // More than 99% of gaps lie inside the fast burst. The pause between
+        // segments is rare in the sample but repeats throughout real playback.
+        let mut csv = String::from("t,size,dir\n");
+        for i in 0..1000 {
+            csv.push_str(&format!("{:.3},1200,-1\n", f64::from(i) * 0.001));
+        }
+        csv.push_str("11.000,1200,-1\n");
+
+        assert!(upstream_gap_secs(&csv, 0.99).unwrap() < 0.01);
+        assert!(upstream_gap_secs(&csv, 1.0).unwrap() > 10.0);
+    }
 
     #[test]
     fn a_library_root_of_class_dirs_still_yields_a_schedule() {
@@ -3422,5 +3431,46 @@ mod tests {
         bridge.read_to_end(&mut got).await.unwrap();
         writer.await.unwrap();
         assert_eq!(got, expect);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_with_residual_waits_for_replay_deadline() {
+        // The first slot is pure cover. Close after queuing data for the second
+        // slot: the close notification must not make that slot fire early.
+        let profile = std::sync::Arc::new(
+            crate::pacer::MeasuredProfile::from_csv("t,size,dir\n0.0,32,1\n1.0,32,1\n")
+                .expect("replay profile"),
+        );
+        let (carrier, mut peer) = tokio::io::duplex(128);
+        let mut paced = PacedChannel::spawn(
+            carrier,
+            ScheduleStream::replay(profile, 0),
+            Dir::Down,
+            Carrier::raw(),
+        );
+        let mut first = [0u8; 32];
+        peer.read_exact(&mut first).await.expect("first cover slot");
+        assert_eq!(u16::from_be_bytes([first[0], first[1]]), 0);
+
+        paced.write_all(b"hello").await.expect("queue payload");
+        let shutdown = tokio::spawn(async move { paced.shutdown().await.expect("shutdown") });
+        tokio::task::yield_now().await;
+
+        let mut second = [0u8; 32];
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), peer.read_exact(&mut second))
+                .await
+                .is_err(),
+            "shutdown advanced the second slot before its captured deadline"
+        );
+
+        tokio::time::advance(Duration::from_millis(500)).await;
+        peer.read_exact(&mut second)
+            .await
+            .expect("scheduled payload slot");
+        assert_eq!(u16::from_be_bytes([second[0], second[1]]), 5);
+        assert_eq!(&second[2..7], b"hello");
+        shutdown.await.expect("shutdown task");
     }
 }

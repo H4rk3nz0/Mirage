@@ -1,34 +1,28 @@
 //! In-process operator admin UI, opt-in via `--admin-ui` (defaults to
 //! `127.0.0.1:3825`; pass `--admin-ui <host:port>` to override).
 //!
-//! A tiny hand-rolled HTTP/1.1 server (same style as [`crate::metrics`]) that
-//! serves a self-contained single-page app plus a small JSON control API to
-//! read the live counter set, view/edit the bridge's JSON config, and restart
-//! the service. No framework, no new dependency - tokio + serde_json only.
+//! A small HTTP/1.1 server for metrics, config editing, and service restart.
 //!
 //! # Security posture (this is a privileged, config-writing surface)
 //!
-//! - **Loopback only.** The server refuses to serve unless the request's `Host`
-//!   header is a loopback literal (DNS-rebinding defense), and a non-loopback
-//!   *bind* is warned about loudly at startup. Keep it on `127.0.0.1`.
+//! - The listener defaults to loopback. An explicit public bind is allowed with
+//!   a warning; requests still require a loopback `Host` header.
 //! - **Bearer token.** Every `/api/*` call requires `Authorization: Bearer
 //!   <token>`, compared in constant time. The token is random per start and
-//!   printed to the operator console; it is delivered to the browser via the URL
-//!   fragment (never sent to the server, never logged). A local process that
-//!   cannot read the console cannot drive the API, and a cross-origin page cannot
-//!   set the `Authorization` header - so CSRF is structurally blocked.
+//!   written to a secret access-URL file in `STATE_DIRECTORY` when systemd
+//!   provides one, or beside the bridge config otherwise. On Unix it has mode
+//!   `0600`; on Windows it inherits the directory ACL. The operator opens that
+//!   URL; its fragment passes the token to the browser.
 //! - **No CORS, strict CSP, no framing.** The page is self-hosted; responses set a
 //!   strict `Content-Security-Policy` (incl. `frame-ancestors 'none'`), `X-Frame-Options:
 //!   DENY` (anti-clickjacking), and `nosniff`, and never emit `Access-Control-Allow-Origin`.
-//! - **Token never logged.** The access token is printed to the operator's console only,
-//!   never included in the structured (`info!`) log that a collector might ship off-box.
-//! - **Secrets never leave the box.** Long-term key material in the config
-//!   (`*_sk_hex`, `*_secret_hex`, `*_psk_hex`, salt, relay token) is masked
-//!   before the config is sent to the browser and restored from disk on write,
-//!   so the UI can never read or clobber a secret it never saw.
+//! - The access token is omitted from structured tracing logs.
+//! - Known secret config fields are masked before sending the config to the
+//!   browser and restored from disk when an unchanged value is saved.
 //! - **Atomic 0600 writes.** Config is written via the same secure-file path the
 //!   provisioning tools use.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -51,6 +45,7 @@ const SECRET_KEYS: &[&str] = &[
     "derived_port_shared_salt_hex",
     "cohort_claim_tag_key_hex",
     "quic_obfs_secret_hex",
+    "quic_obfs_password",
     "relay_token",
 ];
 /// Sentinel the UI echoes back for an unchanged secret field.
@@ -72,13 +67,12 @@ pub struct AdminState {
     pub service_name: String,
 }
 
-/// Generate a fresh 128-bit hex token for this run.
-pub fn gen_token() -> String {
+/// Generate a fresh 128-bit hex token for this run. Never enable the admin API
+/// with a predictable credential if the operating system RNG fails.
+pub fn gen_token() -> Result<String, getrandom::Error> {
     let mut b = [0u8; 16];
-    // Failure here is catastrophic RNG failure; fall back to time-free zeros only
-    // to avoid a panic, but such a bridge has bigger problems.
-    let _ = getrandom::fill(&mut b);
-    hex::encode(b)
+    getrandom::fill(&mut b)?;
+    Ok(hex::encode(b))
 }
 
 /// Serve the admin UI until the listener errors fatally. Mirrors
@@ -144,13 +138,17 @@ async fn read_request(sock: &mut TcpStream) -> Option<Request> {
     let path = raw_path.split('?').next().unwrap_or(raw_path).to_string();
 
     let mut host_ok = false;
+    let mut host_count = 0usize;
     let mut bearer = None;
     let mut content_len = 0usize;
     for line in lines {
         if let Some((name, val)) = line.split_once(':') {
             let val = val.trim();
             match name.trim().to_ascii_lowercase().as_str() {
-                "host" => host_ok = host_is_loopback(val),
+                "host" => {
+                    host_ok = host_count == 0 && host_is_loopback(val);
+                    host_count += 1;
+                }
                 "authorization" => {
                     bearer = val.strip_prefix("Bearer ").map(|s| s.trim().to_string())
                 }
@@ -294,6 +292,21 @@ fn read_masked_config(path: &str) -> Result<serde_json::Value, String> {
             }
         }
     }
+    // Relay credentials live inside an array, unlike the top-level secrets.
+    // The raw JSON editor sends this array back, so it must never receive the
+    // outbound capability tokens in cleartext.
+    if let Some(peers) = cfg
+        .get_mut("relay_peers")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for peer in peers {
+            if let Some(token) = peer.get_mut("relay_token") {
+                if token.as_str().is_some_and(|s| !s.is_empty()) {
+                    *token = serde_json::Value::String(SECRET_MASK.into());
+                }
+            }
+        }
+    }
     Ok(serde_json::json!({ "config": cfg, "secrets": secrets, "path": path }))
 }
 
@@ -306,10 +319,10 @@ fn write_config(path: &str, body: &[u8]) -> Result<(), String> {
 
     // Restore any masked/omitted secret from the CURRENT on-disk config so the UI
     // can neither read nor accidentally erase key material.
-    let original: serde_json::Value = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
+    let original_text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read current config for secret restoration: {e}"))?;
+    let original: serde_json::Value = serde_json::from_str(&original_text)
+        .map_err(|e| format!("cannot parse current config for secret restoration: {e}"))?;
     if let (Some(e), Some(o)) = (edited.as_object_mut(), original.as_object()) {
         for k in SECRET_KEYS {
             let is_mask = e.get(*k).and_then(|v| v.as_str()) == Some(SECRET_MASK);
@@ -323,6 +336,52 @@ fn write_config(path: &str, body: &[u8]) -> Result<(), String> {
                         e.remove(*k);
                     }
                 }
+            }
+        }
+    }
+
+    // Match relay peers by public key, not array position: the operator may
+    // reorder peers in the JSON editor. A mask on an unknown peer is invalid;
+    // accepting it would persist the sentinel as a purported token.
+    if let Some(edited_peers) = edited
+        .get_mut("relay_peers")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        let original_peers = original
+            .get("relay_peers")
+            .and_then(serde_json::Value::as_array);
+        for peer in edited_peers {
+            let Some(peer_obj) = peer.as_object_mut() else {
+                continue; // Real config validation below reports the malformed peer.
+            };
+            let Some(pk) = peer_obj
+                .get("bridge_x25519_pk")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let masked = peer_obj
+                .get("relay_token")
+                .and_then(serde_json::Value::as_str)
+                == Some(SECRET_MASK);
+            if !masked && peer_obj.contains_key("relay_token") {
+                continue;
+            }
+            let prior = original_peers.and_then(|peers| {
+                peers.iter().find(|old| {
+                    old.get("bridge_x25519_pk")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(pk)
+                })
+            });
+            match prior.and_then(|p| p.get("relay_token")) {
+                Some(token) => {
+                    peer_obj.insert("relay_token".into(), token.clone());
+                }
+                None if masked => {
+                    return Err("masked relay token has no matching on-disk peer".into());
+                }
+                None => {} // New inbound-only peer; serde supplies an empty token.
             }
         }
     }
@@ -435,16 +494,29 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// True if a `Host:` header value points at loopback (`127.0.0.0/8`, `::1`, or
-/// `localhost`), ignoring any `:port` suffix.
+/// True if a `Host:` value is a loopback name or address with an optional port.
 fn host_is_loopback(host: &str) -> bool {
     let h = host.trim();
-    // Strip an optional port suffix. Bracketed `[::1]:p` -> `::1`; a single-colon
-    // `host:p` -> `host`; a bare multi-colon IPv6 (`::1`) is left intact.
     let bare = if let Some(rest) = h.strip_prefix('[') {
-        rest.split(']').next().unwrap_or(rest)
-    } else if h.matches(':').count() == 1 {
-        h.split(':').next().unwrap_or(h)
+        let Some((addr, suffix)) = rest.split_once(']') else {
+            return false;
+        };
+        if !suffix.is_empty() {
+            let Some(port) = suffix.strip_prefix(':') else {
+                return false;
+            };
+            if port.parse::<u16>().is_err() {
+                return false;
+            }
+        }
+        addr
+    } else if h.parse::<std::net::IpAddr>().is_ok() {
+        h
+    } else if let Some((addr, port)) = h.rsplit_once(':') {
+        if addr.contains(':') || port.parse::<u16>().is_err() {
+            return false;
+        }
+        addr
     } else {
         h
     };
@@ -470,13 +542,50 @@ pub fn warn_if_public(bind: &str) {
     }
 }
 
-/// Print the one-time access URL to the operator console. The token is deliberately
-/// kept OUT of the structured log (`info!`) - a log aggregator or a shipped log file
-/// would otherwise leak a live credential. It goes only to the direct stdout print,
-/// the operator's intended channel.
-pub fn log_access_url(bind: &str, token: &str) {
-    info!(bind = %bind, "admin UI listening; access URL with token printed to console");
-    println!("\n  Mirage bridge admin UI:  http://{bind}/#t={token}\n");
+/// Save the access URL without putting its bearer token in service logs.
+/// systemd's `STATE_DIRECTORY` is writable even with `ProtectSystem=strict`.
+pub fn write_access_url(config_path: &str, bind: &str, token: &str) -> std::io::Result<PathBuf> {
+    let state_dir = std::env::var_os("STATE_DIRECTORY").filter(|p| !p.is_empty());
+    write_access_url_in(
+        config_path,
+        bind,
+        token,
+        state_dir.as_deref().map(Path::new),
+    )
+}
+
+fn write_access_url_in(
+    config_path: &str,
+    bind: &str,
+    token: &str,
+    state_dir: Option<&Path>,
+) -> std::io::Result<PathBuf> {
+    let config_path = std::fs::canonicalize(config_path)?;
+    let path = if let Some(state_dir) = state_dir {
+        if !state_dir.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "STATE_DIRECTORY must be absolute",
+            ));
+        }
+        let file_name = config_path.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "config has no file name")
+        })?;
+        let mut name = file_name.to_os_string();
+        name.push(".admin-url");
+        state_dir.join(name)
+    } else {
+        let mut name = config_path.as_os_str().to_os_string();
+        name.push(".admin-url");
+        PathBuf::from(name)
+    };
+    mirage_common::secure_file::write_secret(&path, format!("http://{bind}/#t={token}\n"))?;
+    Ok(path)
+}
+
+/// Log only the location of the access file, never its contents.
+pub fn log_access_file(bind: &str, path: &Path) {
+    info!(bind = %bind, access_file = %path.display(), "admin UI listening; read access URL from file");
 }
 
 #[cfg(test)]
@@ -515,6 +624,9 @@ mod tests {
         assert!(host_is_loopback("localhost:3825"));
         assert!(host_is_loopback("[::1]:3825"));
         assert!(host_is_loopback("::1"));
+        assert!(!host_is_loopback("[::1]evil.example"));
+        assert!(!host_is_loopback("[::1]:invalid"));
+        assert!(!host_is_loopback("127.0.0.1:invalid"));
         assert!(!host_is_loopback("evil.example.com"));
         assert!(!host_is_loopback("10.0.0.5:3825"));
         assert!(!host_is_loopback("0.0.0.0"));
@@ -525,6 +637,72 @@ mod tests {
         assert!(ct_eq(b"abc123", b"abc123"));
         assert!(!ct_eq(b"abc123", b"abc124"));
         assert!(!ct_eq(b"abc", b"abcd"));
+    }
+
+    #[test]
+    fn access_url_is_saved_beside_config() {
+        let config = tmp_cfg("{}");
+        let config_path = config.to_str().unwrap();
+        let access =
+            write_access_url_in(config_path, "127.0.0.1:3825", "first-token", None).unwrap();
+        assert!(access.is_absolute());
+        assert_eq!(
+            std::fs::read_to_string(&access).unwrap(),
+            "http://127.0.0.1:3825/#t=first-token\n"
+        );
+
+        write_access_url_in(config_path, "127.0.0.1:3825", "next-token", None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&access).unwrap(),
+            "http://127.0.0.1:3825/#t=next-token\n"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&access).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        std::fs::remove_file(access).unwrap();
+        std::fs::remove_file(config).unwrap();
+    }
+
+    #[test]
+    fn access_url_requires_existing_config() {
+        let config = tmp_cfg("{}");
+        std::fs::remove_file(&config).unwrap();
+        assert!(
+            write_access_url_in(config.to_str().unwrap(), "127.0.0.1:3825", "token", None).is_err()
+        );
+    }
+
+    #[test]
+    fn access_url_uses_state_directory_when_provided() {
+        let config = tmp_cfg("{}");
+        let state_dir = config.with_extension("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        let access = write_access_url_in(
+            config.to_str().unwrap(),
+            "127.0.0.1:3825",
+            "state-token",
+            Some(&state_dir),
+        )
+        .unwrap();
+        assert_eq!(
+            access,
+            state_dir.join(format!(
+                "{}.admin-url",
+                config.file_name().unwrap().to_string_lossy()
+            ))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&access).unwrap(),
+            "http://127.0.0.1:3825/#t=state-token\n"
+        );
+        std::fs::remove_file(access).unwrap();
+        std::fs::remove_dir(state_dir).unwrap();
+        std::fs::remove_file(config).unwrap();
     }
 
     #[test]
@@ -563,6 +741,40 @@ mod tests {
     }
 
     #[test]
+    fn relay_tokens_and_quic_password_stay_masked_when_peers_reorder() {
+        let mut cfg: serde_json::Value = serde_json::from_str(&valid_config(50, "x")).unwrap();
+        cfg["quic_obfs_password"] = "shared QUIC secret".into();
+        cfg["relay_peers"] = serde_json::json!([
+            { "bridge_x25519_pk": "aa".repeat(32), "relay_token": "token-for-a" },
+            { "bridge_x25519_pk": "bb".repeat(32), "relay_token": "token-for-b" }
+        ]);
+        let p = tmp_cfg(&cfg.to_string());
+        let path = p.to_str().unwrap();
+
+        let mut masked = read_masked_config(path).unwrap()["config"].clone();
+        let wire = masked.to_string();
+        assert!(!wire.contains("shared QUIC secret"));
+        assert!(!wire.contains("token-for-a"));
+        assert!(!wire.contains("token-for-b"));
+        assert_eq!(masked["quic_obfs_password"], SECRET_MASK);
+        assert_eq!(masked["relay_peers"][0]["relay_token"], SECRET_MASK);
+        assert_eq!(masked["relay_peers"][1]["relay_token"], SECRET_MASK);
+
+        masked["relay_peers"].as_array_mut().unwrap().reverse();
+        write_config(path, masked.to_string().as_bytes()).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(saved["quic_obfs_password"], "shared QUIC secret");
+        assert_eq!(saved["relay_peers"][0]["relay_token"], "token-for-b");
+        assert_eq!(saved["relay_peers"][1]["relay_token"], "token-for-a");
+
+        let mut unknown = masked;
+        unknown["relay_peers"][0]["bridge_x25519_pk"] = "cc".repeat(32).into();
+        assert!(write_config(path, unknown.to_string().as_bytes()).is_err());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
     fn write_rejects_invalid_config() {
         let p = tmp_cfg(&valid_config(50, "x"));
         // Missing required `bind` -> validation must reject, file unchanged.
@@ -575,6 +787,19 @@ mod tests {
             "rejected write leaves file intact"
         );
         std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn write_refuses_when_current_config_cannot_be_read() {
+        let p = tmp_cfg(&valid_config(50, "secret"));
+        std::fs::remove_file(&p).unwrap();
+        let edited =
+            serde_json::from_str::<serde_json::Value>(&valid_config(60, SECRET_MASK)).unwrap();
+        assert!(write_config(p.to_str().unwrap(), edited.to_string().as_bytes()).is_err());
+        assert!(
+            !p.exists(),
+            "must not replace the missing config with masked fields"
+        );
     }
 
     async fn raw_http(addr: &str, req: &str) -> String {
@@ -641,6 +866,12 @@ mod tests {
         // Non-loopback Host -> 403 (DNS-rebinding defense).
         let rebind = raw_http(&addr, "GET /api/status HTTP/1.1\r\nHost: evil.example.com\r\nAuthorization: Bearer testtoken123\r\nConnection: close\r\n\r\n").await;
         assert!(rebind.contains("403"), "rebinding host must 403: {rebind}");
+
+        let duplicate = raw_http(&addr, &format!("GET /api/status HTTP/1.1\r\nHost: evil.example.com\r\nHost: {addr}\r\nAuthorization: Bearer testtoken123\r\nConnection: close\r\n\r\n")).await;
+        assert!(
+            duplicate.contains("403"),
+            "duplicate Host must 403: {duplicate}"
+        );
 
         // /api/config with token -> secret masked on the wire.
         let cfg = raw_http(&addr, &format!("GET /api/config HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer testtoken123\r\nConnection: close\r\n\r\n")).await;
