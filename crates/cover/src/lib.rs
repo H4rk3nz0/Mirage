@@ -389,7 +389,7 @@ impl Fetcher {
             }
             return Ok((status, body));
         }
-        Err(io::Error::new(io::ErrorKind::Other, "too many redirects"))
+        Err(io::Error::other("too many redirects"))
     }
 
     /// One request/response (no redirect handling), reusing the per-host connection.
@@ -755,10 +755,7 @@ async fn peertube_hls(f: &mut Fetcher, instance: &str) -> io::Result<Url> {
     .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad instance"))?;
     let (st, body) = f.get(&list).await?;
     if st != 200 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("list HTTP {st}"),
-        ));
+        return Err(io::Error::other(format!("list HTTP {st}")));
     }
     let v: Value =
         serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -785,7 +782,7 @@ async fn peertube_hls(f: &mut Fetcher, instance: &str) -> io::Result<Url> {
             }
         }
     }
-    Err(io::Error::new(io::ErrorKind::Other, "no HLS video found"))
+    Err(io::Error::other("no HLS video found"))
 }
 
 /// Undo the escaping a manifest URL picks up on its way into a page.
@@ -898,10 +895,7 @@ async fn is_playlist(f: &mut Fetcher, u: &Url) -> bool {
 async fn embedded_hls(f: &mut Fetcher, start: &Url, video_path: Option<&str>) -> io::Result<Url> {
     let (st, body) = f.get(start).await?;
     if st != 200 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("start page HTTP {st}"),
-        ));
+        return Err(io::Error::other(format!("start page HTTP {st}")));
     }
     let text = String::from_utf8_lossy(&body).into_owned();
 
@@ -913,18 +907,12 @@ async fn embedded_hls(f: &mut Fetcher, start: &Url, video_path: Option<&str>) ->
         }
     }
     let Some(needle) = video_path else {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "no HLS manifest on page",
-        ));
+        return Err(io::Error::other("no HLS manifest on page"));
     };
 
     let pages = links_containing(&unescape_embedded(&text), start, needle);
     if pages.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("no links matching {needle}"),
-        ));
+        return Err(io::Error::other(format!("no links matching {needle}")));
     }
     for i in shuffled(pages.len()).into_iter().take(EMBEDDED_PAGE_TRIES) {
         let page = &pages[i];
@@ -937,10 +925,7 @@ async fn embedded_hls(f: &mut Fetcher, start: &Url, video_path: Option<&str>) ->
             }
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        "no HLS manifest on any video page",
-    ))
+    Err(io::Error::other("no HLS manifest on any video page"))
 }
 
 /// Rutube video IDs are 32 lowercase hex characters under `/video/`.
@@ -973,14 +958,11 @@ async fn rutube_hls(f: &mut Fetcher) -> io::Result<Url> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
     let (st, body) = f.get(&home).await?;
     if st != 200 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("rutube home HTTP {st}"),
-        ));
+        return Err(io::Error::other(format!("rutube home HTTP {st}")));
     }
     let ids = rutube_ids(&String::from_utf8_lossy(&body));
     if ids.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::Other, "no video ids on page"));
+        return Err(io::Error::other("no video ids on page"));
     }
     for i in shuffled(ids.len()).into_iter().take(EMBEDDED_PAGE_TRIES) {
         let Ok(opts) = Url::parse(&format!(
@@ -999,7 +981,7 @@ async fn rutube_hls(f: &mut Fetcher) -> io::Result<Url> {
             return Ok(u);
         }
     }
-    Err(io::Error::new(io::ErrorKind::Other, "no HLS video found"))
+    Err(io::Error::other("no HLS video found"))
 }
 
 /// The master-playlist URL in a Rutube play-options object.
@@ -1033,14 +1015,11 @@ fn hls_from_command(cmd: &str) -> io::Result<Url> {
         )
     })?;
     if !out.status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "--hls-cmd exited {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-        ));
+        return Err(io::Error::other(format!(
+            "--hls-cmd exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let last = stdout
@@ -1215,15 +1194,12 @@ async fn aparat_hash(f: &mut Fetcher) -> io::Result<String> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
     let (st, body) = f.get(&list).await?;
     if st != 200 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("aparat list HTTP {st}"),
-        ));
+        return Err(io::Error::other(format!("aparat list HTTP {st}")));
     }
     let text = String::from_utf8_lossy(&body);
     let mut hashes = aparat_hashes(&text);
     if hashes.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::Other, "no video hashes"));
+        return Err(io::Error::other("no video hashes"));
     }
     let i = (rand_u64() as usize) % hashes.len();
     Ok(hashes.swap_remove(i))
@@ -1345,7 +1321,7 @@ async fn aparat_stream_for(f: &mut Fetcher, low_bitrate: bool) -> io::Result<Str
             }
         }
     }
-    Err(io::Error::new(io::ErrorKind::Other, "no playable video"))
+    Err(io::Error::other("no playable video"))
 }
 
 /// Bilibili's CDN requires this on media requests, and its API on `playurl`.
@@ -1397,10 +1373,7 @@ async fn bilibili_stream_for(f: &mut Fetcher, low_bitrate: bool) -> io::Result<S
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
     let (st, body) = f.get(&list).await?;
     if st != 200 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("bilibili popular HTTP {st}"),
-        ));
+        return Err(io::Error::other(format!("bilibili popular HTTP {st}")));
     }
     let v: Value =
         serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1433,7 +1406,7 @@ async fn bilibili_stream_for(f: &mut Fetcher, low_bitrate: bool) -> io::Result<S
             return Ok(s);
         }
     }
-    Err(io::Error::new(io::ErrorKind::Other, "no DASH video found"))
+    Err(io::Error::other("no DASH video found"))
 }
 
 /// The result of probing one video source.
@@ -1584,10 +1557,7 @@ async fn record_stream(master: &Url, rt: RealTime) -> io::Result<Vec<Event>> {
 
     let (st, body) = f.get(master).await?;
     if st != 200 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("master HTTP {st}"),
-        ));
+        return Err(io::Error::other(format!("master HTTP {st}")));
     }
     let text = String::from_utf8_lossy(&body);
     let segs = if text.contains("#EXT-X-STREAM-INF") {
@@ -1609,7 +1579,7 @@ async fn record_stream(master: &Url, rt: RealTime) -> io::Result<Vec<Event>> {
         } else {
             variants.last()
         }
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no variants"))?;
+        .ok_or_else(|| io::Error::other("no variants"))?;
         eprintln!(
             "  variants offered: [{}] -> picked {:.0} kbit/s ({:.2} GB/day if replayed continuously)",
             offered.join(", "),
@@ -1619,17 +1589,14 @@ async fn record_stream(master: &Url, rt: RealTime) -> io::Result<Vec<Event>> {
         let pick = chosen.1.clone();
         let (st2, mbody) = f.get(&pick).await?;
         if st2 != 200 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("media HTTP {st2}"),
-            ));
+            return Err(io::Error::other(format!("media HTTP {st2}")));
         }
         parse_media(&String::from_utf8_lossy(&mbody), &pick)
     } else {
         parse_media(&text, master)
     };
     if segs.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::Other, "no segments"));
+        return Err(io::Error::other("no segments"));
     }
 
     let (max_segs, max_bytes, max_time) = rt.budget();
@@ -1713,10 +1680,9 @@ async fn record_upload(target: &Url, body_bytes: usize, chunks: usize) -> io::Re
             Ok((200..=299, _)) => ok += 1,
             Ok((st, _)) => {
                 if i == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("upload HTTP {st} (does the target accept POST?)"),
-                    ));
+                    return Err(io::Error::other(format!(
+                        "upload HTTP {st} (does the target accept POST?)"
+                    )));
                 }
                 break;
             }
@@ -1730,7 +1696,7 @@ async fn record_upload(target: &Url, body_bytes: usize, chunks: usize) -> io::Re
         tokio::time::sleep(UPLOAD_GAP).await;
     }
     if ok == 0 {
-        return Err(io::Error::new(io::ErrorKind::Other, "no upload succeeded"));
+        return Err(io::Error::other("no upload succeeded"));
     }
     drop(f);
     let events = out.lock().unwrap().clone();
@@ -1873,23 +1839,17 @@ async fn browse_into(f: &mut Fetcher, page: &Url, require_subs: bool) -> io::Res
     let start = Instant::now();
     let (st, body) = f.get(page).await?;
     if st != 200 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("page HTTP {st}"),
-        ));
+        return Err(io::Error::other(format!("page HTTP {st}")));
     }
     let subs = parse_subresources(&String::from_utf8_lossy(&body), page);
     if subs.is_empty() && require_subs {
         // Name the page. Someone debugging their own `--sources` list needs to
         // know WHICH source was unsuitable; a bare "no subresources" repeated
         // three times reads as a bug in the recorder rather than a bad pick.
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "{page} has no subresources, so it cannot produce a browse envelope - \
+        return Err(io::Error::other(format!(
+            "{page} has no subresources, so it cannot produce a browse envelope - \
                  pick a page that loads assets"
-            ),
-        ));
+        )));
     }
 
     let mut bytes = 0usize;
@@ -3057,7 +3017,7 @@ async fn resolve_source(args: &Args, start: Instant) -> io::Result<Stream> {
                     }
                 }
             }
-            Err(io::Error::new(io::ErrorKind::Other, "no source resolved"))
+            Err(io::Error::other("no source resolved"))
         }
     }
 }
@@ -3443,10 +3403,7 @@ pub async fn record_one(args: &Args, dir: &Path) -> io::Result<Cost> {
             Err(e) => eprintln!("  attempt {attempt}: record failed: {e}"),
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        "gave up after 3 attempts",
-    ))
+    Err(io::Error::other("gave up after 3 attempts"))
 }
 
 #[cfg(test)]

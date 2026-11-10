@@ -151,9 +151,9 @@ jobs:
           ref: ${{ needs.validate.outputs.sha }}
 
       # Install the target std into the toolchain selected by rust-toolchain.toml.
-      - name: Install Rust 1.86 with the target std
+      - name: Install Rust 1.87 with the target std
         shell: bash
-        run: rustup toolchain install 1.86 --profile minimal --target ${{ matrix.target }}
+        run: rustup toolchain install 1.87 --profile minimal --target ${{ matrix.target }}
 
       # The musl ARM legs need a C cross-compiler for ring and the target linker.
       - name: Set up musl cross toolchain (musl ARM legs)
@@ -253,8 +253,8 @@ jobs:
         with:
           ref: ${{ needs.validate.outputs.sha }}
 
-      - name: Install Rust 1.86 with the Android targets
-        run: rustup toolchain install 1.86 --profile minimal --target aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - name: Install Rust 1.87 with the Android targets
+        run: rustup toolchain install 1.87 --profile minimal --target aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
 
       # The NDK ships the per-ABI clang that ring's C build needs; ubuntu runners
       # include one. cargo-ndk exports the CC/AR/linker for each ABI.
@@ -314,8 +314,8 @@ jobs:
         with:
           ref: ${{ needs.validate.outputs.sha }}
 
-      - name: Install Rust 1.86 with the iOS targets
-        run: rustup toolchain install 1.86 --profile minimal --target aarch64-apple-ios,aarch64-apple-ios-sim
+      - name: Install Rust 1.87 with the iOS targets
+        run: rustup toolchain install 1.87 --profile minimal --target aarch64-apple-ios,aarch64-apple-ios-sim
 
       - name: Cache cargo registry + target
         uses: actions/cache@v4
@@ -330,8 +330,8 @@ jobs:
 
       - name: Build staticlib (device + simulator)
         run: |
-          cargo +1.86 build --locked --release -p mirage-mobile-ffi --target aarch64-apple-ios
-          cargo +1.86 build --locked --release -p mirage-mobile-ffi --target aarch64-apple-ios-sim
+          cargo +1.87 build --locked --release -p mirage-mobile-ffi --target aarch64-apple-ios
+          cargo +1.87 build --locked --release -p mirage-mobile-ffi --target aarch64-apple-ios-sim
 
       - name: Assemble XCFramework + package
         run: |
@@ -392,9 +392,9 @@ jobs:
         with:
           ref: ${{ needs.validate.outputs.sha }}
 
-      - name: Install Rust 1.86 with the target std
+      - name: Install Rust 1.87 with the target std
         shell: bash
-        run: rustup toolchain install 1.86 --profile minimal --target ${{ matrix.target }}
+        run: rustup toolchain install 1.87 --profile minimal --target ${{ matrix.target }}
 
       - name: Cache cargo registry + target
         uses: actions/cache@v4

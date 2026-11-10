@@ -3323,7 +3323,7 @@ async fn dial_bridge_tcp(addr: &str) -> std::io::Result<TcpStream> {
         return TcpStream::connect(addr).await;
     }
     use tokio::net::TcpSocket;
-    let mut last_err = std::io::Error::new(std::io::ErrorKind::Other, "no address resolved");
+    let mut last_err = std::io::Error::other("no address resolved");
     for sa in tokio::net::lookup_host(addr).await? {
         let socket = if sa.is_ipv4() {
             TcpSocket::new_v4()

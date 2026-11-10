@@ -5,7 +5,7 @@ This page is the reference for **which platforms are supported, how the release 
 each, and how to cross-compile yourself** - including the awkward targets (old routers, MIPS,
 and mobile).
 
-The toolchain is pinned to **Rust 1.86 (stable)** in `rust-toolchain.toml`. Everything below
+The toolchain is pinned to **Rust 1.87 (stable)** in `rust-toolchain.toml`. Everything below
 holds to that pin unless a section explicitly says otherwise.
 
 ```sh
@@ -48,7 +48,7 @@ QUIC and cert generation) ships C + perl-asm and needs a real musl C cross-compi
 job installs one per triple with
 [`taiki-e/setup-cross-toolchain-action`](https://github.com/taiki-e/setup-cross-toolchain-action),
 which exports `CC_<triple>` / `AR_<triple>` / `CARGO_TARGET_<TRIPLE>_LINKER` so a plain
-`cargo build --target <triple>` just works. It only runs `rustup target add` on the pinned 1.86
+`cargo build --target <triple>` just works. It only runs `rustup target add` on the pinned 1.87
 toolchain - never a newer rustc - so the MSRV pin holds.
 
 To reproduce an ARM router build locally you need the matching musl cross toolchain (e.g. from
@@ -84,9 +84,9 @@ devices (ath79, ramips, ...) hit *two* independent blockers:
 
 1. **No standard library on the stable pin.** Every MIPS triple
    (`mips-unknown-linux-musl`, `mipsel-unknown-linux-musl`, `mips64...-muslabi64`) was demoted to
-   Rust **tier 3**. `rustup target add mipsel-unknown-linux-musl` on the 1.86 toolchain returns
+   Rust **tier 3**. `rustup target add mipsel-unknown-linux-musl` on the 1.87 toolchain returns
    `rust-std ... unavailable for download`. Building therefore requires **nightly `-Z build-std`**,
-   which breaks the MSRV-1.86-stable pin the whole project holds.
+   which breaks the stable toolchain pin the project holds.
 2. **`ring` has no MIPS backend.** `ring` reaches the client through QUIC (`quinn-proto` ->
    Hysteria2 + MASQUE), cert generation (`rcgen`), WebRTC (`webrtc` + the vendored
    `webrtc-dtls`), **and** the workspace's pinned `rustls`/`tokio-rustls` `ring` provider (used
@@ -134,7 +134,7 @@ the FFI surface and each OS's VPN integration, not cross-compilation.
 nix build .#mirage-bridge     # or .#mirage-client, etc.
 ```
 
-The flake selects the Rust 1.86 channel and uses the committed Cargo.lock. This
+The flake selects the Rust 1.87 channel and uses the committed Cargo.lock. This
 archive does not include flake.lock, so Nix inputs can resolve to different
 revisions on different machines. Byte-for-byte reproducibility has not yet been
 demonstrated; commit flake.lock and compare independent builds before relying on it.

@@ -442,9 +442,8 @@ impl<D: TunDevice> NetStack<D> {
                 // remote (the recv/sleep branches keep the loop alive + draining
                 // pending_write, which re-opens this branch when it drops below cap).
                 cmd = self.cmd_rx.recv(), if self.pending_write_bytes < self.cfg.pending_write_cap => {
-                    match cmd {
-                        Some(c) => self.apply_cmd(c),
-                        None => {} // all flows dropped their senders; keep serving inbound
+                    if let Some(c) = cmd {
+                        self.apply_cmd(c);
                     }
                 }
                 // UDP replies: drained UNCONDITIONALLY (never gated by the TCP

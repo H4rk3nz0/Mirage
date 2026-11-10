@@ -83,7 +83,7 @@ pub struct TransportBias {
 impl TransportBias {
     /// True iff `transport_name` is in the preferred list.
     pub fn prefers(&self, transport_name: &str) -> bool {
-        self.preferred.iter().any(|&n| n == transport_name)
+        self.preferred.contains(&transport_name)
     }
 }
 

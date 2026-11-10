@@ -4,7 +4,7 @@
 # same toolchain file. Matching versions alone do not make builds bit-identical;
 # target, flags, system libraries, and packaging inputs also matter.
 #
-# `channel = "1.86"` selects the latest 1.86 patch release. The workspace
+# `channel = "1.87"` selects the latest 1.87 patch release. The workspace
 # `rust-version` is the minimum supported compiler version.
 #
 # Bumping the pin:
@@ -14,6 +14,6 @@
 # 4. Run `cargo test --workspace --all-targets` and CI.
 
 [toolchain]
-channel = "1.86"
+channel = "1.87"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

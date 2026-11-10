@@ -44,7 +44,7 @@ may change before a stable release. Test on non-hostile networks first.**
 ## Prerequisites
 
 ```
-# The repo pins its toolchain in rust-toolchain.toml (currently 1.86);
+# The repo pins its toolchain in rust-toolchain.toml (currently 1.87);
 # rustup reads it automatically, so you only need rustup installed.
 cargo build --release             # from repo root
 ```

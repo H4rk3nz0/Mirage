@@ -198,9 +198,9 @@ mod tests {
         let blob: Vec<u8> = (0..800).map(|i| (i % 251) as u8).collect();
         let mut chunks = blob_to_chunks(&blob).unwrap();
         chunks.reverse();
-        match chunks_to_blob(&chunks) {
-            Ok(back) => assert_ne!(back, blob, "reversed order must not reproduce the blob"),
-            Err(_) => {} // also acceptable: reversed base64 is undecodable
+        // Reversed base64 may also fail to decode.
+        if let Ok(back) = chunks_to_blob(&chunks) {
+            assert_ne!(back, blob, "reversed order must not reproduce the blob");
         }
     }
 

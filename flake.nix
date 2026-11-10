@@ -1,5 +1,5 @@
 {
-  # Rust 1.86 build targets for Mirage.
+  # Rust 1.87 build targets for Mirage.
   #
   # The repository does not currently include flake.lock. Nix therefore
   # resolves moving input revisions when this flake is first built. These
@@ -8,12 +8,12 @@
   # commit flake.lock and compare independent builds of the same source.
   # This flake currently:
   #
-  # - Selects the Rust 1.86 channel named in rust-toolchain.toml.
+  # - Selects the Rust 1.87 channel named in rust-toolchain.toml.
   # - Uses the committed Cargo.lock for dependency resolution.
   # - Builds each bin in a Nix derivation.
   #
   # Typical use:
-  #   nix develop            # enter dev shell with the Rust 1.86 channel
+  #   nix develop            # enter dev shell with the Rust 1.87 channel
   #   nix build .#mirage-bridge
   #   nix build .#mirage-client
   #   nix build .#mirage-keygen
@@ -114,7 +114,7 @@
         };
 
         # ------------------------------------------------------------
-        # Development shell with the Rust 1.86 channel and build tools.
+        # Development shell with the Rust 1.87 channel and build tools.
         # ------------------------------------------------------------
         devShells.default = pkgs.mkShell {
           buildInputs = [

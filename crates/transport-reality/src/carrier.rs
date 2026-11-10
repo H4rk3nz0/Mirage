@@ -785,7 +785,7 @@ fn parse_first_cert_pubkey(cert_handshake: &[u8]) -> Option<[u8; 33]> {
             // (also rejects an off-curve / invalid point).
             let vk = VerifyingKey::from_sec1_bytes(point).ok()?;
             let mut out = [0u8; 33];
-            out.copy_from_slice(vk.to_encoded_point(true).as_bytes());
+            out.copy_from_slice(vk.to_sec1_point(true).as_bytes());
             return Some(out);
         }
         start = abs + 1;
@@ -1651,7 +1651,7 @@ fn rand32() -> [u8; 32] {
 }
 
 fn to_io(e: impl std::fmt::Display) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 // RealityStream: AsyncRead + AsyncWrite over the TLS record layer
@@ -2033,17 +2033,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for RealityStream<S> {
                     let nonce = match k.send.next_nonce() {
                         Ok(n) => n,
                         Err(e) => {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                format!("reality: nonce exhausted: {e}"),
-                            )));
+                            return Poll::Ready(Err(io::Error::other(format!(
+                                "reality: nonce exhausted: {e}"
+                            ))));
                         }
                     };
                     let ct = match k.send.cipher.seal(k.send.key.as_ref(), &nonce, &[], slice) {
                         Ok(c) => c,
                         Err(_) => {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::Other,
+                            return Poll::Ready(Err(io::Error::other(
                                 "reality: AEAD encrypt failed",
                             )));
                         }
@@ -2051,20 +2049,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for RealityStream<S> {
                     match wrap_app_data(&ct) {
                         Ok(w) => w,
                         Err(e) => {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                format!("reality: wrap: {e}"),
-                            )));
+                            return Poll::Ready(Err(io::Error::other(format!(
+                                "reality: wrap: {e}"
+                            ))));
                         }
                     }
                 }
                 None => match wrap_app_data(slice) {
                     Ok(w) => w,
                     Err(e) => {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("reality: wrap: {e}"),
-                        )));
+                        return Poll::Ready(Err(io::Error::other(format!("reality: wrap: {e}"))));
                     }
                 },
             };
@@ -2291,7 +2285,7 @@ mod tests {
     /// the invite publishes as `tls_cert_verify_pk`.
     fn p256_compressed_pk(sk: &p256::ecdsa::SigningKey) -> [u8; 33] {
         sk.verifying_key()
-            .to_encoded_point(true)
+            .to_sec1_point(true)
             .as_bytes()
             .try_into()
             .expect("compressed P-256 point is 33 bytes")

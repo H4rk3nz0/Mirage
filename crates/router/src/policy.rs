@@ -159,20 +159,12 @@ impl<T: Copy> PerClass<T> {
 
 /// One-stop config bundle: classifier + pool policy. Future-home
 /// for cross-cutting tunables.
+#[derive(Default)]
 pub struct RouterPolicy {
     /// Classifier used at SOCKS5 ingress.
     pub classifier: Classifier,
     /// Pool tunables.
     pub pool: PoolPolicy,
-}
-
-impl Default for RouterPolicy {
-    fn default() -> Self {
-        Self {
-            classifier: Classifier::standard(),
-            pool: PoolPolicy::default(),
-        }
-    }
 }
 
 #[cfg(test)]

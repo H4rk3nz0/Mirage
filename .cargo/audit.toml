@@ -17,4 +17,9 @@ ignore = [
     "RUSTSEC-2026-0186",  # memmap2 unsound: GUI transitive (font mmap), no attacker-mapped files.
     "RUSTSEC-2024-0436",  # paste unmaintained: Slint GUI transitive (image/exr decode), macro-only, GUI-only.
     "RUSTSEC-2026-0206",  # rustybuzz unmaintained: Slint GUI text-shaping transitive, GUI-only, no network path.
+    "RUSTSEC-2026-0253",  # lru 0.16 via mainline 6.2: mainline never calls LruCache::pop and uses Id keys without a panicking Drop; the advisory trigger is unreachable. Move to mainline 8/lru 0.18 in a tested DHT migration.
+    "RUSTSEC-2026-0370",  # zvariant 4: Linux GUI only, through Slint -> ashpd -> zbus 4. Migration to zbus 6 exceeds the Rust 1.87 MSRV.
+    "RUSTSEC-2026-0371",  # zbus_names 3: same Linux GUI path and migration constraint as zvariant.
+    "RUSTSEC-2026-0372",  # zvariant_derive 4: same Linux GUI path and migration constraint as zvariant.
+    "RUSTSEC-2026-0441",  # pin-utils: unmaintained macro crate via Slint's build tools and webrtc-util/nix; no patched version or reported exploit.
 ]

@@ -101,15 +101,17 @@ version = "0.12"
 version = "0.4"
 
 [dependencies.p256]
-version = "0.13"
+version = "=0.14.0"
 features = [
     "default",
     "ecdh",
     "ecdsa",
+    "getrandom",
 ]
 
 [dependencies.p384]
-version = "0.13"
+version = "=0.14.0"
+features = ["ecdh", "getrandom"]
 
 [dependencies.pem]
 version = "3"

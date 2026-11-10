@@ -359,7 +359,7 @@ fn main() {
     };
     let tls_signing_pk: [u8; 33] = tls_signing_sk
         .verifying_key()
-        .to_encoded_point(true)
+        .to_sec1_point(true)
         .as_bytes()
         .try_into()
         .expect("compressed P-256 point is 33 bytes");

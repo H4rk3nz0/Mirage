@@ -7,6 +7,27 @@ then, pre-releases may make breaking changes between versions.
 
 ## [Unreleased]
 
+### Security
+- Updated Quinn, rustls, WebPKI roots, Tokio, and RustCrypto dependencies for
+  the reported RustSec advisories. Mirage and its vendored WebRTC DTLS code now
+  use P-256, P-384, and k256 0.14 with `crypto-bigint` 0.7.11.
+- Moved the bridge admin access token from service output to a private access
+  file. Secret-file writes now replace the old file atomically.
+- Kept the audit gate strict for new advisories; reviewed warning-only exceptions
+  are documented in `.cargo/audit.toml`.
+
+### Fixed
+- Fixed Windows cover-extractor commands and SOCKS5 error replies.
+- Rejected duplicate or malformed admin `Host` headers and prevented overflow
+  when TLS template weights sum past `u32::MAX`.
+- Pinned AppImage build inputs and corrected prerelease versions in desktop
+  installers.
+
+### Changed
+- Raised the minimum Rust version to 1.87 for the patched cryptography stack.
+- Reworked the README and setup/security docs to describe current behavior,
+  throughput costs, and unvalidated cover claims.
+
 ## [0.1.8-alpha.1] - 2026-08-10
 Measurement-integrity and multi-carrier release. The theme is that several things
 this project believed about itself were untested, testing them changed the answers,

@@ -44,12 +44,10 @@ members = [
 
 [workspace.package]
 version = "0.1.8-alpha.1"
-# MSRV. Must match the pin in rust-toolchain.toml (channel = "1.86"). The true
-# floor is 1.86: edition-2024 transitive deps need 1.85, and several pinned deps
-# (icu 2.x, idna_adapter, time 0.3.45) declare rust-version 1.86. All 39 crates
-# inherit this via `rust-version.workspace = true`.
+# MSRV. Must match rust-toolchain.toml. RustCrypto's patched crypto-bigint
+# requires 1.87; all workspace crates inherit this version.
 edition = "2021"
-rust-version = "1.86"
+rust-version = "1.87"
 license = "AGPL-3.0-or-later"
 authors = ["Mirage contributors"]
 
@@ -65,21 +63,12 @@ missing_docs = "warn"
 unused = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
-# Correctness: any code that triggers these is almost certainly buggy. This is
-# the valuable, KEPT gate - it catches real bugs and is denied on every push.
+# Keep the standard Clippy group as an error in CI.
 all = { level = "deny", priority = -1 }
-# `pedantic` was "warn" but is downgraded to "allow" as of the 1.86 toolchain
-# pin. On 1.86 + CI's `--all-targets` it fires ~130 times, ALL confirmed to be
-# style/cosmetic or test/example/demo noise (float-eq asserts, `let..else` vs
-# `match`, item placement, wide handshake fn signatures, wildcard arms that
-# future-proof enums) - zero real bugs. A "lives at stake" CI gate that is red
-# on every push for cosmetics is worse than useless: it trains people to ignore
-# it and buries the `all`-group correctness signal. Correctness stays denied
-# above; re-enable `pedantic` (or specific members) per-crate once the false-
-# positive burden on that module has been paid down. The specific allows below
-# are retained so a future per-crate `pedantic = "warn"` stays quiet on them.
+# The full pedantic group produces many style warnings in tests and protocol
+# parsers. Enable selected members per crate when they add useful signal.
 pedantic = { level = "allow", priority = -1 }
-# Allow the subset of `pedantic` that's noise for our style:
+# Project-wide style choices:
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
@@ -91,11 +80,7 @@ cast_sign_loss = "allow"
 cast_precision_loss = "allow"
 cast_lossless = "allow"
 cast_possible_wrap = "allow"
-# Pure-STYLE members of `pedantic` that the 1.86 clippy update newly (and
-# heavily) flags but that are preference, not correctness - allowed so CI is not
-# red on style churn. The *fixable* pedantic lints (needless_pass_by_value,
-# unnecessary_wraps, type_complexity, match_same_arms, return_self_not_must_use,
-# unused_async, ...) stay on and are fixed in the code.
+# These are left to local review rather than the workspace gate.
 manual_let_else = "allow"       # `let..else` vs `match` is a style call
 items_after_statements = "allow" # nested item placement, cosmetic
 uninlined_format_args = "allow"  # `{}`+arg vs inline `{x}` - cosmetic
@@ -103,44 +88,22 @@ unreadable_literal = "allow"     # digit-group separators - cosmetic
 too_many_arguments = "allow"     # some wire/handshake fns are inherently wide
 match_wildcard_for_single_variants = "allow" # `_` future-proofs added variants
 float_cmp = "allow"             # exact-equality float asserts in tests
-# Specific security-adjacent lints. `unwrap_used`/`expect_used` were meant for
-# NON-TEST code, but `[workspace.lints]` cannot scope to non-test and CI lints
-# `--all-targets`, so they flagged ~1300 `.unwrap()` calls in TEST code (the
-# documented "unwrap-in-tests" gate gotcha). Allowed rather than sprinkle
-# `#![cfg_attr(test, allow(...))]` across ~38 crates; production unwrap discipline
-# is maintained by review, and the correctness group (`all = deny`, kept) still
-# catches the genuinely-buggy patterns. Re-enable per-crate on any module where
-# you want the stricter posture.
+# These restriction lints also apply to tests under `--all-targets`. Production
+# uses of unwrap and expect require review; the workspace gate does not reject
+# them automatically.
 unwrap_used = "allow"
 expect_used = "allow"
 panic_in_result_fn = "warn"
-# `indexing_slicing`/`integer_division`/`float_arithmetic` were also "warn", but
-# they are downgraded to "allow" as of the 1.86 toolchain pin. Rationale (honest
-# tradeoff, not a silent relaxation): the 1.86 clippy update made `indexing_slicing`
-# flag ~266 PRODUCTION sites - overwhelmingly bounds-checked wire-parser slicing
-# (`buf[a..b]` after an explicit length check) that older clippy proved safe.
-# A restriction lint that fires 266 times on reviewed parsers is decorative: it
-# buries the genuinely dangerous `unwrap_used` signal it was meant to sit beside,
-# and it made a "lives at stake" CI gate red on every push. `integer_division`
-# and `float_arithmetic` are numeric-style lints, not memory-safety, and add pure
-# noise. The bounds-safety intent is now carried by (a) `unwrap_used` +
-# `panic_in_result_fn` (kept strict), and (b) coverage-guided FUZZING of the wire
-# parsers (circuit cell / mux frame / transport headers) - which actually FINDS
-# the out-of-bounds bugs this lint only gestures at. Re-enable per-crate on any
-# module where you want the stricter posture and have paid down the false hits.
+# `indexing_slicing` flags checked slices throughout the wire parsers. Bounds
+# checks remain a code-review and parser-test responsibility. The arithmetic
+# restriction lints are not useful as workspace-wide gates here.
 indexing_slicing = "allow"
 integer_division = "allow"
 float_arithmetic = "allow"
 
 [workspace.dependencies]
-# Crypto primitives - all from audited upstream crates. No hand-rolled crypto.
-# These are non-negotiables.
-#
-# VERSIONS ARE EXACT-PINNED.
-# Roadmap R14/R18: test vectors in `tests/vectors.rs` are sensitive to
-# upstream primitive byte-level output. A `2` -> `2.1` bump (let alone
-# `2` -> `3`) can silently change outputs. Every crypto-adjacent crate is
-# pinned to the exact patch version.
+# Pin cryptographic dependencies. Review vectors and interoperability tests
+# when changing versions, especially across major releases.
 snow = "=0.9.6"
 ml-kem = { version = "=0.3.0-rc.0", features = ["getrandom", "zeroize"] }
 ed25519-dalek = { version = "=2.2.0", features = ["rand_core", "zeroize"] }
@@ -166,7 +129,7 @@ subtle = "=2.6.1"
 rlimit = "=0.11.0"
 
 # Nostr (discovery channel adapter).
-k256 = { version = "=0.13.4", features = ["schnorr"] }
+k256 = { version = "=0.14.0", features = ["schnorr"] }
 base64 = "=0.22.1"
 bytes = "1"
 hex = "=0.4.3"
@@ -191,7 +154,7 @@ smoltcp = { version = "0.12", default-features = false, features = [
 tun = { version = "0.7", features = ["async"] }
 async-trait = "=0.1.83"
 tokio-tungstenite = { version = "=0.29.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
-rustls = { version = "=0.23.39", default-features = false, features = ["std", "tls12", "ring"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "tls12", "ring"] }
 tokio-rustls = { version = "=0.26", default-features = false, features = ["tls12", "ring"] }
 rustls-pki-types = "=1"
 quinn = "0.11"

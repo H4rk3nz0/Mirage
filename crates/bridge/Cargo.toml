@@ -42,7 +42,7 @@ mirage-cover = { workspace = true }
 mirage-crypto = { workspace = true }
 # ECDSA P-256 for the Reality TLS-signing identity (keygen generates it, the
 # daemon loads it) - the browser-realistic CertVerify scheme (0x0403).
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa", "std"] }
 mirage-discovery = { workspace = true }
 mirage-discovery-nostr = { workspace = true }
 mirage-discovery-dht = { workspace = true }

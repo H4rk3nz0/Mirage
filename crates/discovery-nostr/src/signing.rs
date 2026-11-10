@@ -33,7 +33,7 @@ impl NostrSigningKey {
     /// The seed must be cryptographically random. Callers in tests use
     /// fixed seeds for deterministic vectors.
     pub fn from_seed(seed: &[u8; 32]) -> Result<Self, &'static str> {
-        let inner = SigningKey::from_bytes(seed).map_err(|_| "invalid schnorr seed")?;
+        let inner = SigningKey::from_slice(seed).map_err(|_| "invalid schnorr seed")?;
         Ok(Self { inner })
     }
 
@@ -109,8 +109,8 @@ pub fn verify_schnorr(
     msg: &[u8],
     sig: &[u8; NOSTR_SIG_LEN],
 ) -> Result<(), SchnorrVerifyFailed> {
-    let vk = VerifyingKey::from_bytes(pubkey).map_err(|_| SchnorrVerifyFailed)?;
-    let sig = Signature::try_from(sig.as_slice()).map_err(|_| SchnorrVerifyFailed)?;
+    let vk = VerifyingKey::from_slice(pubkey).map_err(|_| SchnorrVerifyFailed)?;
+    let sig = Signature::from_slice(sig).map_err(|_| SchnorrVerifyFailed)?;
     vk.verify(msg, &sig).map_err(|_| SchnorrVerifyFailed)
 }
 

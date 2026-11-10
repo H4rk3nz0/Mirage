@@ -348,10 +348,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SessionStream<S> {
         if self.ratchet_secs > 0 {
             let target = self.ratchet_start.elapsed().as_secs() / self.ratchet_secs;
             if let Err(e) = self.framer.maybe_advance(target) {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("session ratchet advance failed: {e}"),
-                )));
+                return Poll::Ready(Err(io::Error::other(format!(
+                    "session ratchet advance failed: {e}"
+                ))));
             }
         }
 
@@ -361,10 +360,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SessionStream<S> {
         let wire = match self.framer.send(&buf[..take]) {
             Ok(w) => w,
             Err(e) => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("session framer send failed: {e}"),
-                )));
+                return Poll::Ready(Err(io::Error::other(format!(
+                    "session framer send failed: {e}"
+                ))));
             }
         };
         self.tx_state = TxState::Draining {

@@ -77,7 +77,7 @@ const SPKI_ALGO_ID_EC_P256_DER: &[u8] = &[
 /// ECDSA signature.
 pub fn build_self_signed_ecdsa_p256(signing_key: &P256SigningKey, subject_cn: &str) -> Vec<u8> {
     // SubjectPublicKey = uncompressed SEC1 point (0x04 || X(32) || Y(32)), 65 B.
-    let point = signing_key.verifying_key().to_encoded_point(false);
+    let point = signing_key.verifying_key().to_sec1_point(false);
     let tbs = build_tbs_ecdsa(point.as_bytes(), subject_cn);
 
     // ECDSA over SHA-256(tbs); TLS/X.509 carry the DER (SEQUENCE{r,s}) form.
@@ -233,11 +233,11 @@ mod tests {
 
         // The self-signature over the TBS must verify under the embedded key.
         // Re-derive the TBS + signature the same way the builder does and check.
-        let point = sk.verifying_key().to_encoded_point(false);
+        let point = sk.verifying_key().to_sec1_point(false);
         let tbs = build_tbs_ecdsa(point.as_bytes(), "mirage.test");
         // The TBS is the first inner SEQUENCE of the cert; verify the builder's
         // own signature round-trips via the verifying key.
-        let vk = VerifyingKey::from_encoded_point(&point).unwrap();
+        let vk = VerifyingKey::from_sec1_point(&point).unwrap();
         let sig: Signature = sk.sign(&tbs);
         vk.verify(&tbs, &sig).expect("self-signature verifies");
         // Uncompressed SEC1 point is 65 bytes and present in the cert DER.

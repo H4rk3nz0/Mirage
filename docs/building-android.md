@@ -28,7 +28,7 @@ The pieces:
 
 ## Prerequisites
 
-- The pinned Rust 1.86 toolchain with the Android targets:
+- The pinned Rust 1.87 toolchain with the Android targets:
   ```sh
   rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
   ```
